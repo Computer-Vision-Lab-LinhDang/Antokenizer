@@ -5,6 +5,7 @@ from .gram import GramLoss
 from .lpips import LPIPSLoss
 from .clip_perc import CLIPPerceptualLoss
 from .distill import DistillationLoss
+from .mavt_loss import LossWeights, MAVTLoss
 
 __all__ = [
     "ReconstructionLoss",
@@ -12,4 +13,6 @@ __all__ = [
     "LPIPSLoss",
     "CLIPPerceptualLoss",
     "DistillationLoss",
+    "LossWeights",
+    "MAVTLoss",
 ]
