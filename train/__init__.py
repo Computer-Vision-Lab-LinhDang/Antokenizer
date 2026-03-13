@@ -26,6 +26,20 @@ from .packing import PackedSequence, compute_token_count, compute_video_token_co
 from .navit_dataset import NaViTCollator, MultiResImageDataset, VideoClipDataset, SyntheticDataset, build_image_dataloader, build_mixed_dataloader
 from .curriculum import StageConfig, STAGE1, STAGE2, STAGE3, STAGES, apply_stage
 
+# New stage-to-stage training components
+from .datasets_modality import ImageDataset as ImageDatasetModality, VideoDataset as VideoDatasetModality, Object3DDataset
+from .converter_4d import Unified4DConverter
+from .packing_enhanced import (
+    PackedBatch,
+    EnhancedNaViTPacker,
+    build_attention_mask,
+    build_graph_mask,
+    build_mamba_boundaries,
+    collate_4d_batch,
+)
+from .sampler_weighted import ModalityWeightedSampler, StageDatasetFactory
+from .stage_trainer import StageTrainer
+
 __all__ = [
     # Training loop
     "Trainer",
@@ -72,4 +86,18 @@ __all__ = [
     "STAGE3",
     "STAGES",
     "apply_stage",
+    # Stage-to-stage training (NEW)
+    "ImageDatasetModality",
+    "VideoDatasetModality",
+    "Object3DDataset",
+    "Unified4DConverter",
+    "PackedBatch",
+    "EnhancedNaViTPacker",
+    "build_attention_mask",
+    "build_graph_mask",
+    "build_mamba_boundaries",
+    "collate_4d_batch",
+    "ModalityWeightedSampler",
+    "StageDatasetFactory",
+    "StageTrainer",
 ]
