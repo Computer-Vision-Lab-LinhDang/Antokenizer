@@ -12,16 +12,14 @@ dependencies = [
     # Core deep learning
     "torch>=2.1.0",
     "torchvision>=0.16.0",
-
     # Vision backbone (SigLIP2)
     "transformers>=4.38.0",
     "huggingface-hub>=0.20.0",
-
     # Image processing
     "Pillow>=10.0.0",
-
     # Numerics / utils (stdlib-only in this repo, but common research deps)
     "numpy>=1.24.0",
+    "lightning>=2.6.1",
 ]
 
 [project.optional-dependencies]

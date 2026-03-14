@@ -32,9 +32,9 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import torch
 torch.set_float32_matmul_precision("high")  # Use Tensor Cores on A100
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.strategies import DDPStrategy
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.strategies import DDPStrategy
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
