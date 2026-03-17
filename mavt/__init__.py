@@ -31,6 +31,7 @@ from .module5_encoder import ChebyshevGraphConv, MAVTEncoder, MambaVisionMixer, 
 from .module6_latent import ContinuousLatentProjection, VariationalProjection
 from .module7_decoder import AsymmetricDecoder, PixelShuffleUpsample
 from .tokenizer import MAVTokenizer
+from .mavt_cls import MAVTClassifier
 from .types import (
     DecoderOutput,
     EncoderOutput,
@@ -45,6 +46,7 @@ from .types import (
 __all__ = [
     # Tokenizer (entry point)
     "MAVTokenizer",
+    "MAVTClassifier",
     # Config
     "MAVTConfig",
     "PatchifyConfig",
