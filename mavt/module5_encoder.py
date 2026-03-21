@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from atoken.core.rope4d import apply_rope_4d
+from core.rope4d import apply_rope_4d
 
 from .config import EncoderConfig
 from .types import EncoderOutput, GraphOutput, PatchifyOutput, PosEncOutput
