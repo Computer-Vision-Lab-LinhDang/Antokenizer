@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antokenizer"
+version = "0.1.0"
+description = "MAVT tokenizer and downstream framework"
+authors = [
+    { name = "" }
+]
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "pytest>=9.0.2",
+    "torch",
+    "torchvision",
+    "transformers>=5.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "isort"
+]
+
+# ─────────────────────────────────────────
+# PACKAGE DISCOVERY (FIXED HERE)
+# ─────────────────────────────────────────
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "mavt*",
+    "core*",
+    "losses*",
+    "train*",
+    "tests"
+]
+
+# ─────────────────────────────────────────
+# PYTEST CONFIG
+# ─────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+pythonpath = ["."]
