@@ -1,6 +1,9 @@
-"""Module 5: MAVT Encoder.
+"""DDT Encoder: Transformer + 4D RoPE on dual-domain enriched tokens.
 
-Pre-norm Transformer encoder with 4D RoPE.
+Stripped from mavt/module5_encoder.py:
+  - Removed ChebyshevGraphConv, MambaVisionMixer, TitansMemory stubs
+  - Input is WaveletOutput (enriched features + positions) instead of
+    PatchifyOutput + PosEncOutput + GraphOutput
 """
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ import torch.nn as nn
 from atoken.core.rope4d import apply_rope_4d
 
 from .config import EncoderConfig
-from .types import EncoderOutput, PatchifyOutput
+from .types import EncoderOutput, WaveletOutput
 
 
 class _TransformerBlock(nn.Module):
@@ -42,7 +45,6 @@ class _TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, D = x.shape
         r = x
@@ -58,8 +60,6 @@ class _TransformerBlock(nn.Module):
         v = v.transpose(1, 2)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn = attn.masked_fill(~mask[:, None, None, :], float("-inf"))
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -70,8 +70,13 @@ class _TransformerBlock(nn.Module):
         return x
 
 
-class MAVTEncoder(nn.Module):
-    """Transformer encoder with 4D RoPE. No graph, no stubs."""
+class DDTEncoder(nn.Module):
+    """Pure Transformer encoder with 4D RoPE.
+
+    Input: dual-domain enriched tokens (variable length N').
+    4D RoPE handles content-dynamics interaction naturally:
+      content (t=0) <-> dynamics (t>0, x, y) based on 4D proximity.
+    """
 
     def __init__(self, cfg: Optional[EncoderConfig] = None) -> None:
         super().__init__()
@@ -81,17 +86,15 @@ class MAVTEncoder(nn.Module):
         while self.cfg.d_model % n_heads != 0:
             n_heads -= 1
 
-        n_total = self.cfg.n_blocks_stage3 + self.cfg.n_blocks_stage4
-
         self.blocks = nn.ModuleList([
-            _TransformerBlock(self.cfg.d_model, n_heads)
-            for _ in range(n_total)
+            _TransformerBlock(self.cfg.d_model, n_heads, self.cfg.dropout)
+            for _ in range(self.cfg.n_blocks)
         ])
         self.norm_out = nn.LayerNorm(self.cfg.d_model)
 
-    def forward(self, patch_out: PatchifyOutput) -> EncoderOutput:
-        x = patch_out.f_spatial
-        positions = patch_out.positions
+    def forward(self, wav_out: WaveletOutput) -> EncoderOutput:
+        x = wav_out.features       # (B, N', d_model)
+        positions = wav_out.positions  # (B, N', 4)
 
         for block in self.blocks:
             x = block(x, positions=positions)
@@ -100,4 +103,4 @@ class MAVTEncoder(nn.Module):
         return EncoderOutput(encoded=x, positions_out=positions)
 
 
-__all__ = ["MAVTEncoder"]
+__all__ = ["DDTEncoder"]
