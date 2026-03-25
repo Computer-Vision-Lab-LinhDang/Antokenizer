@@ -27,10 +27,12 @@ from .types import (
     Modality,
     PatchifyOutput,
 )
+from .mavt_cls import MAVTClassifier
 
 __all__ = [
     "MAVTokenizer",
     "MAVTConfig",
+    "MAVTClassifier",
     "PatchifyConfig",
     "EncoderConfig",
     "LatentConfig",
