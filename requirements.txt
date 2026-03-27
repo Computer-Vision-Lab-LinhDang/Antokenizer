@@ -1,0 +1,35 @@
+# MAVT — pip install -r requirements.txt
+#
+# For CUDA support, install PyTorch from the official index first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Then install the remaining deps:
+#   pip install -r requirements.txt
+#
+# Or install everything at once (CPU):
+#   pip install -r requirements.txt
+
+# ─── Core ─────────────────────────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ─── Vision backbone ──────────────────────────────────────────────────────────
+transformers>=4.38.0
+huggingface-hub>=0.20.0
+
+# ─── Image / video processing ─────────────────────────────────────────────────
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# ─── Optional: perceptual loss ────────────────────────────────────────────────
+# lpips>=0.1.4
+
+# ─── Optional: distributed training ──────────────────────────────────────────
+# accelerate>=0.26.0
+
+# ─── Optional: experiment tracking ───────────────────────────────────────────
+# wandb>=0.16.0
+# tensorboard>=2.15.0
+
+# ─── Dev / testing ────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-cov>=4.0.0

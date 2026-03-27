@@ -16,10 +16,10 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from atoken.losses.mavt_loss import LossWeights, MAVTLoss
-from atoken.mavt.config import MAVTConfig
-from atoken.mavt.tokenizer import MAVTokenizer
-from atoken.mavt.types import Modality
+from losses.mavt_loss import LossWeights, MAVTLoss
+from mavt.config import MAVTConfig
+from mavt.tokenizer import MAVTokenizer
+from mavt.types import Modality
 
 logger = logging.getLogger(__name__)
 

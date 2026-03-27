@@ -1,48 +1,75 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "antokenizer"
 version = "0.1.0"
-description = "MAVT tokenizer and downstream framework"
-authors = [
-    { name = "" }
-]
-readme = "README.md"
-requires-python = ">=3.12"
+description = "MAVT: Memory-Augmented Vision Tokenizer"
+requires-python = ">=3.10"
 
 dependencies = [
-    "pytest>=9.0.2",
-    "torch",
-    "torchvision",
-    "transformers>=5.3.0",
+    # Core deep learning
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    # Vision backbone (SigLIP2)
+    "transformers>=4.38.0",
+    "huggingface-hub>=0.20.0",
+    # Image processing
+    "Pillow>=10.0.0",
+    # Numerics / utils (stdlib-only in this repo, but common research deps)
+    "numpy>=1.24.0",
+    "lightning>=2.6.1",
 ]
 
 [project.optional-dependencies]
+# Perceptual loss (optional — only needed when use_lpips=True)
+lpips = [
+    "lpips>=0.1.4",
+]
+
+# Distributed training
+dist = [
+    "accelerate>=0.26.0",
+]
+
+# Experiment tracking
+logging = [
+    "wandb>=0.16.0",
+    "tensorboard>=2.15.0",
+]
+
+# Development & testing
 dev = [
-    "pytest",
-    "black",
-    "isort"
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
 ]
 
-# ─────────────────────────────────────────
-# PACKAGE DISCOVERY (FIXED HERE)
-# ─────────────────────────────────────────
-[tool.setuptools.packages.find]
-where = ["."]
-include = [
-    "mavt*",
-    "core*",
-    "losses*",
-    "train*",
-    "tests"
+# All optional extras
+all = [
+    "atoken[lpips,dist,logging,dev]",
 ]
 
-# ─────────────────────────────────────────
-# PYTEST CONFIG
-# ─────────────────────────────────────────
+[tool.hatch.build.targets.wheel]
+packages = ["atoken"]
+
+# ─── uv settings ──────────────────────────────────────────────────────────────
+
+[tool.uv]
+# PyTorch from the official index (CPU by default; see below for CUDA)
+index-url = "https://pypi.org/simple"
+
+# CUDA variants — uncomment the one matching your driver:
+# extra-index-url = "https://download.pytorch.org/whl/cu121"   # CUDA 12.1
+# extra-index-url = "https://download.pytorch.org/whl/cu118"   # CUDA 11.8
+# extra-index-url = "https://download.pytorch.org/whl/cpu"     # CPU only
+
+# ─── pytest ───────────────────────────────────────────────────────────────────
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v"
-pythonpath = ["."]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
