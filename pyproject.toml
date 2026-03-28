@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "antokenizer"
+name = "atoken"
 version = "0.1.0"
 description = "MAVT: Memory-Augmented Vision Tokenizer"
 requires-python = ">=3.10"

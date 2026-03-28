@@ -34,6 +34,7 @@ import torch
 torch.set_float32_matmul_precision("high")  # Use Tensor Cores on A100
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -55,7 +56,7 @@ from train.distributed import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-DATA_ROOT = Path("data/ready/images")
+DATA_ROOT = Path("datasets/ready/images")
 CKPT_DIR = Path("checkpoints")
 
 
@@ -93,7 +94,7 @@ class MAVTLitModule(pl.LightningModule):
         lr: float = 1e-4,
         warmup_steps: int = 2000,
         total_steps: int = 200_000,
-        kl_weight: float = 1e-4,
+        kl_weight: float = 1e-2,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -299,11 +300,14 @@ def main():
     parser.add_argument("--global-token-budget", type=int, default=DEFAULT_GLOBAL_TOKEN_BUDGET)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--val-every", type=int, default=2000)
-    parser.add_argument("--save-every", type=int, default=10000)
+    parser.add_argument("--save-every", type=int, default=2000)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    pl.seed_everything(args.seed, workers=True)
 
     n_gpus = args.gpus or torch.cuda.device_count() or 1
 
@@ -355,6 +359,8 @@ def main():
     precision = "32" if args.no_amp else "16-mixed"
     strategy = "auto" if n_gpus <= 1 else DDPStrategy(find_unused_parameters=True)
 
+    tb_logger = TensorBoardLogger(save_dir=str(CKPT_DIR), name="stage1_logs")
+
     trainer = pl.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=n_gpus,
@@ -367,6 +373,7 @@ def main():
         val_check_interval=args.val_every,
         check_val_every_n_epoch=None,
         callbacks=callbacks,
+        logger=tb_logger,
         enable_progress_bar=True,
         default_root_dir=str(CKPT_DIR),
     )
