@@ -80,7 +80,7 @@ class MAVTClassifier(nn.Module):
         decoder_out: DecoderOutput,
         latent_out: LatentOutput,
         cls_out,
-        cls_target, # (B,)
+        cls_target,
         cls_weight: float = 1e-4,
         kl_weight: float = 1e-4,
     ) -> dict[str, torch.Tensor]:
@@ -94,8 +94,14 @@ class MAVTClassifier(nn.Module):
 
         recon_loss = torch.nn.functional.l1_loss(recon, target)
         kl_loss = self.latent.kl_loss(latent_out)
-        cls_loss = torch.nn.functional.cross_entropy(cls_out, cls_target)
-        total = recon_loss + kl_weight * kl_loss + cls_weight * cls_loss
+
+        # Multi-label (float target) vs single-label (long target)
+        if cls_target.dtype == torch.float32:
+            cls_loss = torch.nn.functional.binary_cross_entropy_with_logits(cls_out, cls_target)
+        else:
+            cls_loss = torch.nn.functional.cross_entropy(cls_out, cls_target)
+
+        total = (recon_loss + kl_weight * kl_loss) * 0.5 + cls_weight * cls_loss
 
         return {
             "recon_loss": recon_loss,

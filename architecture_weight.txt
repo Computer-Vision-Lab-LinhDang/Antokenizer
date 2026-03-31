@@ -1,0 +1,81 @@
+MultiModalLitModule(
+  (model): MAVTokenizer(
+    (patchify): Unified4DPatchify(
+      (siglip2): SigLIP2PatchEmbed(
+        (patch_proj): Conv2d(3, 1152, kernel_size=(16, 16), stride=(16, 16), padding=valid)
+      )
+      (mod_embed): Embedding(3, 1152)
+    )
+    (encoder): MAVTEncoder(
+      (blocks): ModuleList(
+        (0-11): 12 x _TransformerBlock(
+          (norm1): LayerNorm((1152,), eps=1e-05, elementwise_affine=True)
+          (qkv): Linear(in_features=1152, out_features=3456, bias=True)
+          (proj): Linear(in_features=1152, out_features=1152, bias=True)
+          (attn_drop): Dropout(p=0.0, inplace=False)
+          (norm2): LayerNorm((1152,), eps=1e-05, elementwise_affine=True)
+          (ffn): Sequential(
+            (0): Linear(in_features=1152, out_features=4608, bias=True)
+            (1): GELU(approximate='none')
+            (2): Linear(in_features=4608, out_features=1152, bias=True)
+            (3): Dropout(p=0.0, inplace=False)
+          )
+        )
+      )
+      (norm_out): LayerNorm((1152,), eps=1e-05, elementwise_affine=True)
+    )
+    (latent): ContinuousLatentProjection(
+      (norm): LayerNorm((1152,), eps=1e-05, elementwise_affine=True)
+      (var_proj): VariationalProjection(
+        (mu_proj): Linear(in_features=1152, out_features=32, bias=True)
+        (logvar_proj): Linear(in_features=1152, out_features=32, bias=True)
+      )
+      (understand_attn): MultiheadAttention(
+        (out_proj): NonDynamicallyQuantizableLinear(in_features=1152, out_features=1152, bias=True)
+      )
+      (understand_proj): Linear(in_features=1152, out_features=768, bias=True)
+      (understand_norm): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+    )
+    (decoder): AsymmetricDecoder(
+      (input_proj): Linear(in_features=32, out_features=768, bias=True)
+      (input_norm): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+      (attn_blocks): ModuleList(
+        (0-3): 4 x MultiheadAttention(
+          (out_proj): NonDynamicallyQuantizableLinear(in_features=768, out_features=768, bias=True)
+        )
+      )
+      (attn_norms): ModuleList(
+        (0-3): 4 x LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+      )
+      (cnn_up): Sequential(
+        (0): PixelShuffleUpsample(
+          (conv): Conv2d(768, 2048, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (ps): PixelShuffle(upscale_factor=2)
+          (norm): GroupNorm(32, 512, eps=1e-05, affine=True)
+          (act): GELU(approximate='none')
+        )
+        (1): PixelShuffleUpsample(
+          (conv): Conv2d(512, 1024, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (ps): PixelShuffle(upscale_factor=2)
+          (norm): GroupNorm(32, 256, eps=1e-05, affine=True)
+          (act): GELU(approximate='none')
+        )
+        (2): PixelShuffleUpsample(
+          (conv): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (ps): PixelShuffle(upscale_factor=2)
+          (norm): GroupNorm(32, 128, eps=1e-05, affine=True)
+          (act): GELU(approximate='none')
+        )
+        (3): PixelShuffleUpsample(
+          (conv): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+          (ps): PixelShuffle(upscale_factor=2)
+          (norm): GroupNorm(32, 64, eps=1e-05, affine=True)
+          (act): GELU(approximate='none')
+        )
+      )
+      (output_head): Conv2d(64, 3, kernel_size=(1, 1), stride=(1, 1))
+      (norm_out): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+    )
+  )
+  (loss_fn): MAVTLoss()
+)
