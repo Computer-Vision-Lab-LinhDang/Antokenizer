@@ -570,8 +570,8 @@ def main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpus", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--val-every", type=int, default=1000)
-    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--val-every", type=int, default=25000)
+    parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
@@ -612,14 +612,14 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath=str(CKPT_DIR),
-            filename="multimodal-{step}",
+            filename="multimodal-1-{step}",
             every_n_train_steps=args.save_every,
             save_top_k=-1,
             save_last=True,
         ),
         ModelCheckpoint(
             dirpath=str(CKPT_DIR),
-            filename="multimodal-best",
+            filename="multimodal-1-best",
             monitor="val/loss",
             mode="min",
             save_top_k=1,
@@ -630,7 +630,7 @@ def main():
     # Trainer
     precision = "32" if args.no_amp else "16-mixed"
     strategy = "auto" if n_gpus <= 1 else DDPStrategy(find_unused_parameters=True)
-    tb_logger = TensorBoardLogger(save_dir=str(CKPT_DIR), name="multimodal_logs")
+    tb_logger = TensorBoardLogger(save_dir=str(CKPT_DIR), name="multimodal_logs_1")
 
     trainer = pl.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",

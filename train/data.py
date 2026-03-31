@@ -98,6 +98,70 @@ class COCOMultiLabelDataset(datasets.CocoDetection):
         return image, multi_hot
 
 
+class OpenImagesDataset(Dataset):
+    """Open Images V7 multi-label classification dataset.
+
+    Reads images from a flat directory and labels from the OIDv7 CSV annotation.
+    Only images that exist on disk AND have at least one positive label are kept.
+    """
+
+    def __init__(
+        self,
+        image_dir: str,
+        annotation_csv: str,
+        transform=None,
+        label_to_idx: Optional[Dict[str, int]] = None,
+    ) -> None:
+        import csv
+        from pathlib import Path
+
+        self.image_dir = Path(image_dir)
+        self.transform = transform
+
+        # Parse CSV: collect positive labels per image
+        image_labels: Dict[str, List[str]] = {}
+        all_labels: set = set()
+        with open(annotation_csv, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if float(row["Confidence"]) >= 1.0:
+                    img_id = row["ImageID"]
+                    label = row["LabelName"]
+                    image_labels.setdefault(img_id, []).append(label)
+                    all_labels.add(label)
+
+        # Build or reuse label vocabulary
+        if label_to_idx is not None:
+            self.label_to_idx = label_to_idx
+        else:
+            self.label_to_idx = {l: i for i, l in enumerate(sorted(all_labels))}
+        self.num_classes = len(self.label_to_idx)
+
+        # Keep only images that exist on disk
+        self.samples: List[tuple] = []  # (image_path, list_of_label_indices)
+        for img_id, labels in image_labels.items():
+            img_path = self.image_dir / f"{img_id}.jpg"
+            if img_path.exists():
+                indices = [self.label_to_idx[l] for l in labels if l in self.label_to_idx]
+                if indices:
+                    self.samples.append((img_path, indices))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple:
+        from PIL import Image
+
+        img_path, label_indices = self.samples[index]
+        image = Image.open(img_path).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
+        for idx in label_indices:
+            target[idx] = 1.0
+        return image, target
+
+
 @dataclass
 class DataConfig:
     name: str
