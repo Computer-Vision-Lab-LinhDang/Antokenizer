@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 
 @dataclass
@@ -41,6 +41,23 @@ class DecoderConfig:
 
 
 @dataclass
+class ContentDynamicsConfig:
+    """Unified Content-Detail Split configuration (all modalities)."""
+    enabled: bool = True
+    d_model: int = 1152
+    n_heads: int = 16
+    content_ratio: float = 0.25    # fraction of tokens kept as content
+    detail_ratio: float = 0.10     # fraction compressed as detail
+    min_tokens: int = 12           # minimum content / detail tokens
+    max_content_queries: int = 256  # query bank size
+    n_pooler_layers: int = 2
+    # Decoder expander
+    expander_d_model: int = 768
+    expander_n_heads: int = 12
+    n_expander_layers: int = 2
+
+
+@dataclass
 class MAVTConfig:
     modality: Literal["image", "video", "3d", "auto"] = "auto"
 
@@ -48,6 +65,7 @@ class MAVTConfig:
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
     latent: LatentConfig = field(default_factory=LatentConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    content_dynamics: Optional[ContentDynamicsConfig] = None
 
     use_ema: bool = True
     gradient_checkpointing: bool = False
@@ -63,4 +81,5 @@ __all__ = [
     "EncoderConfig",
     "LatentConfig",
     "DecoderConfig",
+    "ContentDynamicsConfig",
 ]

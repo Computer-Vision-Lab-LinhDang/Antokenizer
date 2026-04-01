@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"echo \\\"=== Images ===\\\" && find /home/sagemaker-user/ws/Antoken/datasets/datasets/ready/images -type f 2>/dev/null | head -3 && ls -la /home/sagemaker-user/ws/Antoken/datasets/datasets/rea...",
+  "error": "Exit code 127\n=== Images ===\ntotal 541283248\ndrwxr-xr-x. 2 sagemaker-user users 67104768 Mar 11 06:24 .\ndrwxr-xr-x. 5 sagemaker-user users       49 Mar 11 05:07 ..\n-rw-r--r--. 1 sagemaker-user users   223609 Jul 10  2018 000002b66c9c498e.jpg\n-rw-r--r--. 1 sagemaker-user users   321651 Jul 10  2018 000002b97e5471a0.jpg\n=== Symlinks? ===",
+  "timestamp": "2026-03-31T19:03:37.963Z",
+  "retry_count": 1
+}

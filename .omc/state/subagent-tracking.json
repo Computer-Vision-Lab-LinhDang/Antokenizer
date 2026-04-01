@@ -1,0 +1,29 @@
+{
+  "agents": [
+    {
+      "agent_id": "ae0d4cc11ead2b916",
+      "agent_type": "oh-my-claudecode:tracer",
+      "started_at": "2026-04-01T03:02:26.952Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "a68a11c60eaf1fe90",
+      "agent_type": "Explore",
+      "started_at": "2026-04-01T11:14:45.098Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "a7b9c2a92f0618604",
+      "agent_type": "Explore",
+      "started_at": "2026-04-01T11:14:45.155Z",
+      "parent_mode": "none",
+      "status": "running"
+    }
+  ],
+  "total_spawned": 2,
+  "total_completed": 0,
+  "total_failed": 0,
+  "last_updated": "2026-04-01T11:14:45.259Z"
+}

@@ -1,7 +1,7 @@
 """MAVTokenizer: MAVT pipeline orchestrator.
 
-Simplified pipeline (graph, STF, spectral PE removed):
-  Input → Patchify → Encoder (Transformer + 4D RoPE) → Latent → Decoder
+Pipeline:
+  Input → Patchify → [UnifiedContentDetailSplit] → Encoder → Latent → Decoder
 """
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from .module6_latent import ContinuousLatentProjection
 from .module7_decoder import AsymmetricDecoder
 from .types import (
     DecoderOutput,
-    EncoderOutput,
     LatentOutput,
     Modality,
     PatchifyOutput,
@@ -27,10 +26,9 @@ from .types import (
 class MAVTokenizer(nn.Module):
     """Memory-Augmented Vision Tokenizer.
 
-    Usage:
-        model = MAVTokenizer()
-        latent = model.encode(image)
-        recon  = model(image).reconstruction
+    When ``content_dynamics`` is set in the config, the unified
+    Content-Detail Split is applied to **all** modalities — no
+    modality-specific branching.
     """
 
     def __init__(self, cfg: Optional[MAVTConfig] = None) -> None:
@@ -40,22 +38,39 @@ class MAVTokenizer(nn.Module):
         self.patchify = Unified4DPatchify(self.cfg.patchify)
         self.encoder = MAVTEncoder(self.cfg.encoder)
         self.latent = ContinuousLatentProjection(self.cfg.latent)
-        self.decoder = AsymmetricDecoder(self.cfg.decoder)
+
+        # Unified Content-Detail Split (optional — active for ALL modalities).
+        cd_cfg = self.cfg.content_dynamics
+        self.cd_split = None
+        if cd_cfg is not None and cd_cfg.enabled:
+            from .content_dynamics import UnifiedContentDetailSplit
+
+            self.cd_split = UnifiedContentDetailSplit(cd_cfg)
+
+        self.decoder = AsymmetricDecoder(self.cfg.decoder, cd_cfg=cd_cfg)
+
+    # ── public API ───────────────────────────────────────────────────
 
     def encode(
         self, x: torch.Tensor, modality: Optional[Modality] = None,
     ) -> LatentOutput:
-        patch_out, enc_out = self._run_encoder(x, modality)
-        return self.latent(enc_out)
+        patch_out = self.patchify(x, modality)
+        enc_input = self._maybe_cd_split(patch_out)
+        return self.latent(self.encoder(enc_input))
 
     def forward(
         self, x: torch.Tensor, modality: Optional[Modality] = None,
     ) -> tuple[DecoderOutput, LatentOutput]:
-        patch_out, enc_out = self._run_encoder(x, modality)
+        patch_out = self.patchify(x, modality)
+        mod = modality or patch_out.modality
+
+        enc_input, cd_metadata = self._maybe_cd_split_meta(patch_out)
+        enc_out = self.encoder(enc_input)
         latent_out = self.latent(enc_out)
+
         decoder_out = self.decoder(
             latent_out, enc_out.positions_out,
-            tuple(x.shape), modality or patch_out.modality,
+            tuple(x.shape), mod, cd_metadata=cd_metadata,
         )
         return decoder_out, latent_out
 
@@ -68,9 +83,14 @@ class MAVTokenizer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         recon = decoder_out.reconstruction
         target = x
+
         if target.dim() == 5 and recon.dim() == 5:
-            T_min = min(target.shape[2], recon.shape[2])
-            target, recon = target[:, :, :T_min], recon[:, :, :T_min]
+            T_tgt, T_rec = target.shape[2], recon.shape[2]
+            if T_tgt > T_rec > 0:
+                stride = T_tgt // T_rec
+                target = target[:, :, ::stride][:, :, :T_rec]
+            elif T_rec > T_tgt:
+                recon = recon[:, :, :T_tgt]
         elif target.dim() == 5 and recon.dim() == 4:
             target = target[:, :, 0]
 
@@ -84,12 +104,32 @@ class MAVTokenizer(nn.Module):
             "total_loss": total,
         }
 
-    def _run_encoder(
-        self, x: torch.Tensor, modality: Optional[Modality],
-    ) -> tuple[PatchifyOutput, EncoderOutput]:
-        patch_out = self.patchify(x, modality)
-        enc_out = self.encoder(patch_out)
-        return patch_out, enc_out
+    # ── internal helpers ─────────────────────────────────────────────
+
+    def _maybe_cd_split(self, patch_out):
+        """Apply unified Content-Detail Split when configured."""
+        if self.cd_split is not None:
+            cd_out = self.cd_split(patch_out)
+            return PatchifyOutput(
+                f_spatial=cd_out.tokens,
+                positions=cd_out.positions,
+                modality=patch_out.modality,
+            )
+        return patch_out
+
+    def _maybe_cd_split_meta(self, patch_out):
+        """Like :meth:`_maybe_cd_split` but also returns *cd_metadata*."""
+        if self.cd_split is not None:
+            cd_out = self.cd_split(patch_out)
+            enc_input = PatchifyOutput(
+                f_spatial=cd_out.tokens,
+                positions=cd_out.positions,
+                modality=patch_out.modality,
+            )
+            # Pass-through (small inputs) returns empty cd_metadata → treat as None.
+            meta = cd_out.cd_metadata if cd_out.cd_metadata else None
+            return enc_input, meta
+        return patch_out, None
 
 
 __all__ = ["MAVTokenizer"]

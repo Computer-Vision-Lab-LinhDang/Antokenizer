@@ -1,9 +1,10 @@
 """Module 7: Asymmetric Decoder.
 
-v1: Attention (global) → CNN upsampling → pixel output.
-Full design: Attention → Mamba+GNN → CNN → modality heads.
+Attention (global) → CNN upsampling → pixel output.
 
-For image: latent tokens (B, N, 32) → (B, 3, H, W)
+When *cd_cfg* is provided the decoder instantiates a
+:class:`UnifiedDetailExpander` and routes through a unified
+expand → spatial-decode path for **all** modalities.
 """
 from __future__ import annotations
 
@@ -33,7 +34,11 @@ class PixelShuffleUpsample(nn.Module):
 class AsymmetricDecoder(nn.Module):
     """Asymmetric decoder: Attention → CNN → pixel head."""
 
-    def __init__(self, cfg: Optional[DecoderConfig] = None) -> None:
+    def __init__(
+        self,
+        cfg: Optional[DecoderConfig] = None,
+        cd_cfg=None,
+    ) -> None:
         super().__init__()
         self.cfg = cfg or DecoderConfig()
 
@@ -54,7 +59,7 @@ class AsymmetricDecoder(nn.Module):
             for _ in range(self.cfg.n_attn_blocks)
         ])
 
-        # Stage C: CNN upsampling (each PixelShuffle doubles resolution)
+        # Stage C: CNN upsampling
         cnn_layers = []
         in_ch = self.cfg.d_model
         for out_ch in self.cfg.cnn_channels:
@@ -66,13 +71,30 @@ class AsymmetricDecoder(nn.Module):
         self.output_head = nn.Conv2d(in_ch, self.cfg.out_channels, kernel_size=1)
         self.norm_out = nn.LayerNorm(self.cfg.d_model)
 
+        # Unified detail expander (optional, for C-D decode)
+        self.unified_expander = None
+        if cd_cfg is not None:
+            from .dynamics_expander import UnifiedDetailExpander
+
+            self.unified_expander = UnifiedDetailExpander(
+                d_model=self.cfg.d_model,
+                n_heads=self.cfg.n_attn_heads,
+                n_layers=cd_cfg.n_expander_layers,
+            )
+
     def forward(
         self,
         latent_out: LatentOutput,
         positions: torch.Tensor,
         target_shape: tuple[int, ...],
         modality: Modality = "image",
+        cd_metadata: Optional[dict] = None,
     ) -> DecoderOutput:
+        if cd_metadata is not None and self.unified_expander is not None:
+            return self._decode_unified_cd(
+                latent_out, target_shape, modality, cd_metadata,
+            )
+        # Fallback: no C-D Split.
         if modality == "image":
             return self._decode_image(latent_out, positions, target_shape)
         if modality == "video":
@@ -81,80 +103,121 @@ class AsymmetricDecoder(nn.Module):
             return self._decode_3d(latent_out, positions, target_shape)
         raise ValueError(f"Unknown modality: {modality}")
 
-    def _decode_image(
-        self,
-        latent_out: LatentOutput,
-        positions: torch.Tensor,
-        target_shape: tuple[int, ...],
-    ) -> DecoderOutput:
-        """Decode to (B, 3, H, W)."""
+    # ── unified C-D decode (all modalities) ──────────────────────────
+
+    def _decode_unified_cd(self, latent_out, target_shape, modality, cd_metadata):
+        """Decode from compressed content+detail tokens (any modality)."""
+        # 1. Project + self-attention over compressed tokens.
+        z = self.input_norm(self.input_proj(latent_out.z))
+
+        for attn, norm in zip(self.attn_blocks, self.attn_norms):
+            res = z
+            zn = norm(z)
+            out, _ = attn(zn, zn, zn)
+            z = res + out
+        z = self.norm_out(z)
+
+        # 2. Expand to original grid positions.
+        original_positions = cd_metadata["original_positions"]
+        z_expanded = self.unified_expander(z, original_positions)
+
+        # 3. Spatial decode (modality determines frame/plane grouping).
+        p = self.cfg.patch_size
+        H, W = target_shape[-2], target_shape[-1]
+        n_h, n_w = H // p, W // p
+        N_orig = cd_metadata["n_original"]
+
+        if modality == "image":
+            return DecoderOutput(
+                reconstruction=self._spatial_decode(z_expanded, n_h, n_w),
+            )
+
+        if modality == "video":
+            N_sp = n_h * n_w
+            n_t = N_orig // N_sp
+            frames = [
+                self._spatial_decode(z_expanded[:, ti * N_sp:(ti + 1) * N_sp], n_h, n_w)
+                for ti in range(n_t)
+            ]
+            return DecoderOutput(reconstruction=torch.stack(frames, dim=2))
+
+        if modality == "3d":
+            N_pp = N_orig // 3
+            S = target_shape[-1] if len(target_shape) == 5 else 64
+            n_s = S // p
+            planes = [
+                self._spatial_decode(z_expanded[:, pi * N_pp:(pi + 1) * N_pp], n_s, n_s)
+                for pi in range(3)
+            ]
+            return DecoderOutput(reconstruction=torch.stack(planes, dim=2))
+
+        raise ValueError(f"Unknown modality: {modality}")
+
+    # ── per-modality fallbacks (no C-D Split) ────────────────────────
+
+    def _decode_image(self, latent_out, positions, target_shape):
         B, N, _ = latent_out.z.shape
         p = self.cfg.patch_size
         H, W = target_shape[-2], target_shape[-1]
         n_h, n_w = H // p, W // p
 
-        x = self.input_norm(self.input_proj(latent_out.z))  # (B, N, d_model)
-
-        # Stage A: self-attention
+        x = self.input_norm(self.input_proj(latent_out.z))
         for attn, norm in zip(self.attn_blocks, self.attn_norms):
             res = x
             xn = norm(x)
             out, _ = attn(xn, xn, xn)
             x = res + out
+        x = self.norm_out(x)
+        return DecoderOutput(reconstruction=self._spatial_decode(x, n_h, n_w))
 
-        x = self.norm_out(x)  # (B, N, d_model)
-
-        # Reshape to spatial feature map
-        x = x.permute(0, 2, 1).reshape(B, self.cfg.d_model, n_h, n_w)  # (B, D, n_h, n_w)
-
-        # Stage C: CNN upsample → (B, 64, H, W)
-        x = self.cnn_up(x)
-
-        # Stage D: pixel output
-        reconstruction = self.output_head(x)  # (B, out_channels, H, W)
-        return DecoderOutput(reconstruction=reconstruction)
-
-    def _decode_video(self, latent_out, positions, target_shape) -> DecoderOutput:
-        """v1: decode each temporal chunk as an image, stack back."""
+    def _decode_video(self, latent_out, positions, target_shape):
         B, N, _ = latent_out.z.shape
         p = self.cfg.patch_size
-        T, H, W = target_shape[-3], target_shape[-2], target_shape[-1]
+        H, W = target_shape[-2], target_shape[-1]
         n_h, n_w = H // p, W // p
-        n_t = T // 2  # tau=2
         N_spatial = n_h * n_w
+        n_t = N // N_spatial
 
-        # Process each temporal group
         frames = []
         for ti in range(n_t):
-            z_chunk = latent_out.z[:, ti * N_spatial:(ti + 1) * N_spatial]  # (B, N_sp, D)
-            pos_chunk = positions[:, ti * N_spatial:(ti + 1) * N_spatial]
+            s, e = ti * N_spatial, (ti + 1) * N_spatial
             lat = LatentOutput(
-                z=z_chunk,
+                z=latent_out.z[:, s:e],
                 z_understand=latent_out.z_understand,
-                mu=latent_out.mu[:, ti * N_spatial:(ti + 1) * N_spatial],
-                log_var=latent_out.log_var[:, ti * N_spatial:(ti + 1) * N_spatial],
+                mu=latent_out.mu[:, s:e],
+                log_var=latent_out.log_var[:, s:e],
             )
-            out = self._decode_image(lat, pos_chunk, (B, 3, H, W))
-            frames.append(out.reconstruction)  # (B, 3, H, W)
+            out = self._decode_image(lat, positions[:, s:e], (latent_out.z.shape[0], 3, H, W))
+            frames.append(out.reconstruction)
+        return DecoderOutput(reconstruction=torch.stack(frames, dim=2))
 
-        video = torch.stack(frames, dim=2)  # (B, 3, n_t, H, W)
-        return DecoderOutput(reconstruction=video)
+    def _decode_3d(self, latent_out, positions, target_shape):
+        B = latent_out.z.shape[0]
+        N_pp = latent_out.z.shape[1] // 3
+        S = target_shape[-1] if len(target_shape) == 5 else 64
+        img_shape = (B, 3, S, S)
 
-    def _decode_3d(self, latent_out, positions, target_shape) -> DecoderOutput:
-        """v1: decode as image (triplane reconstruction placeholder)."""
-        if len(target_shape) == 5:
-            S = target_shape[-1]
-            img_shape = (target_shape[0], 3, S, S)
-        else:
-            img_shape = (target_shape[0], 3, 64, 64)
-        N_per_plane = latent_out.z.shape[1] // 3
-        lat = LatentOutput(
-            z=latent_out.z[:, :N_per_plane],
-            z_understand=latent_out.z_understand,
-            mu=latent_out.mu[:, :N_per_plane],
-            log_var=latent_out.log_var[:, :N_per_plane],
-        )
-        return self._decode_image(lat, positions[:, :N_per_plane], img_shape)
+        planes = []
+        for pi in range(3):
+            s, e = pi * N_pp, (pi + 1) * N_pp
+            lat = LatentOutput(
+                z=latent_out.z[:, s:e],
+                z_understand=latent_out.z_understand,
+                mu=latent_out.mu[:, s:e],
+                log_var=latent_out.log_var[:, s:e],
+            )
+            out = self._decode_image(lat, positions[:, s:e], img_shape)
+            planes.append(out.reconstruction)
+        return DecoderOutput(reconstruction=torch.stack(planes, dim=2))
+
+    # ── shared CNN decode ────────────────────────────────────────────
+
+    def _spatial_decode(self, spatial_z, n_h, n_w):
+        """(B, N_sp, d_model) → (B, 3, H, W) via CNN upsample."""
+        B = spatial_z.shape[0]
+        x = spatial_z.permute(0, 2, 1).reshape(B, self.cfg.d_model, n_h, n_w)
+        x = self.cnn_up(x)
+        return self.output_head(x)
 
 
 __all__ = ["PixelShuffleUpsample", "AsymmetricDecoder"]

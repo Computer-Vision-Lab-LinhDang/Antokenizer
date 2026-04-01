@@ -153,67 +153,38 @@ class Unified4DPatchify(nn.Module):
 
         f_spatial = self.siglip2(img) + self.mod_embed.weight[0]  # (B, N, D)
         positions = self._build_positions(B, n_t=1, n_h=n_h, n_w=n_w, device=img.device)
-        raw_patches = self._extract_raw_patches(img, n_h, n_w)     # (B, N, C, p, p)
 
         return PatchifyOutput(
             f_spatial=f_spatial,
             positions=positions,
-            raw_patches=raw_patches,
             modality="image",
         )
 
     def _forward_video(self, video: torch.Tensor) -> PatchifyOutput:
-        """video: (B, C, T, H, W) → PatchifyOutput with temporal raw patches."""
+        """video: (B, C, T, H, W) → PatchifyOutput with per-frame tokens."""
         B, C, T, H, W = video.shape
-        n_t = T // self.tau
         n_h, n_w = H // self.p, W // self.p
         N_spatial = n_h * n_w
-        T_used = n_t * self.tau  # drop trailing frames that don't fill a chunk
 
-        # ── SigLIP2: run on all temporal chunks in one batched call ──────
-        # Average tau frames per chunk to produce a representative frame.
-        # video[:, :, :T_used]: (B, C, T_used, H, W)
-        chunks = (
-            video[:, :, :T_used]
-            .view(B, C, n_t, self.tau, H, W)  # (B, C, n_t, tau, H, W)
-            .mean(dim=3)                        # (B, C, n_t, H, W)
-            .permute(0, 2, 1, 3, 4)            # (B, n_t, C, H, W)
-            .reshape(B * n_t, C, H, W)         # (B*n_t, C, H, W)
+        # Per-frame SigLIP2 encoding — no temporal chunking (tau removed).
+        frames_flat = (
+            video.permute(0, 2, 1, 3, 4)       # (B, T, C, H, W)
+            .reshape(B * T, C, H, W)
         )
-        f = self.siglip2(chunks).contiguous()                       # (B*n_t, N_spatial, D)
+        f = self.siglip2(frames_flat).contiguous()  # (B*T, N_spatial, D)
         f_spatial = (
-            f.reshape(B, n_t * N_spatial, self.cfg.embed_dim)
+            f.reshape(B, T * N_spatial, self.cfg.embed_dim)
             + self.mod_embed.weight[1]
         )
 
-        positions = self._build_positions(B, n_t=n_t, n_h=n_h, n_w=n_w, device=video.device)
-
-        # ── Raw patches: all T_used frames for temporal STFT ─────────────
-        # Reshape all frames to (B*T_used, C, H, W) for batch extraction.
-        frames_flat = (
-            video[:, :, :T_used]
-            .permute(0, 2, 1, 3, 4)  # (B, T_used, C, H, W)
-            .reshape(B * T_used, C, H, W)
-        )
-        all_patches = self._extract_raw_patches(frames_flat, n_h, n_w)  # (B*T, N_sp, C, p, p)
-        all_patches = all_patches.view(B, T_used, N_spatial, C, self.p, self.p)
-        # (B, N_spatial, T_used, C, p, p) — for temporal STFT in Module 2
-        raw_patches_temporal = all_patches.permute(0, 2, 1, 3, 4, 5).contiguous()
-
-        # Representative patch per temporal chunk (first frame) for spatial DWT.
-        # raw_patches_temporal[:, :, ::tau] → (B, N_spatial, n_t, C, p, p)
-        raw_patches = (
-            raw_patches_temporal[:, :, :: self.tau]
-            .contiguous()
-            .view(B, n_t * N_spatial, C, self.p, self.p)
+        positions = self._build_positions(
+            B, n_t=T, n_h=n_h, n_w=n_w, device=video.device,
         )
 
         return PatchifyOutput(
             f_spatial=f_spatial,
             positions=positions,
-            raw_patches=raw_patches,
             modality="video",
-            raw_patches_temporal=raw_patches_temporal,
         )
 
     def _forward_3d(self, triplane: torch.Tensor) -> PatchifyOutput:
@@ -244,43 +215,33 @@ class Unified4DPatchify(nn.Module):
         ga_flat = ga.flatten()   # row indices
         gb_flat = gb.flatten()   # col indices
 
-        f_list, pos_list, patch_list = [], [], []
+        f_list, pos_list = [], []
 
         for plane_idx, x_src, y_src, z_src in plane_configs:
             plane = triplane[:, plane_idx]  # (B, C_tri, S, S)
 
-            # ── SigLIP2 or learned projection ─────────────────────────
             if C_tri == 3:
-                f = self.siglip2(plane)                               # (B, N_per_plane, D)
+                f = self.siglip2(plane)
             else:
                 proj = self._get_triplane_proj(C_tri, triplane.device)
-                raw = self._extract_raw_patches(plane, n_s, n_s)     # (B, N, C_tri, p, p)
+                raw = self._extract_raw_patches(plane, n_s, n_s)
                 raw_flat = raw.view(B, N_per_plane, C_tri * self.p * self.p)
-                f = proj(raw_flat)                                    # (B, N_per_plane, D)
+                f = proj(raw_flat)
             f_list.append(f)
 
-            # ── 4D positions ──────────────────────────────────────────
             pos = torch.zeros(B, N_per_plane, 4, device=triplane.device)
             pos[:, :, 1] = (gb_flat if x_src == "col" else ga_flat if x_src == "row" else float(x_src))
             pos[:, :, 2] = (gb_flat if y_src == "col" else ga_flat if y_src == "row" else float(y_src))
             pos[:, :, 3] = (gb_flat if z_src == "col" else ga_flat if z_src == "row" else float(z_src))
             pos_list.append(pos)
 
-            # ── Raw patches ───────────────────────────────────────────
-            patch_list.append(self._extract_raw_patches(plane, n_s, n_s))
-
         f_spatial = torch.cat(f_list, dim=1) + self.mod_embed.weight[2]
         positions = torch.cat(pos_list, dim=1)
-        raw_patches = torch.cat(patch_list, dim=1)
-
-        depth_signal = self._extract_depth_signal(triplane)
 
         return PatchifyOutput(
             f_spatial=f_spatial,
             positions=positions,
-            raw_patches=raw_patches,
             modality="3d",
-            depth_signal=depth_signal,
         )
 
     # ─── Helpers ─────────────────────────────────────────────────────────

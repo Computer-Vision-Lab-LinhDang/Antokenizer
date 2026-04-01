@@ -141,8 +141,10 @@ class MAVTClsLitModule(pl.LightningModule):
         return self.model(x, modality)
 
     def _step(self, batch, prefix="train"):
+        print(len(batch[0]))
         x = batch["image"].to(self.device)
         target = batch["target"].to(self.device)
+        # x = 
 
         decoder_out, latent_out, cls_out = self.model(x, "image")
 

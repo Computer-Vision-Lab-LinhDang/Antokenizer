@@ -42,10 +42,15 @@ class MAVTLoss(nn.Module):
         mu: torch.Tensor,
         log_var: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        # Align shapes
+        # Align shapes — subsample target at correct stride when temporal
+        # dimensions differ (e.g. encoder uses tau-chunking).
         if target.dim() == 5 and recon.dim() == 5:
-            T = min(target.shape[2], recon.shape[2])
-            target, recon = target[:, :, :T], recon[:, :, :T]
+            T_tgt, T_rec = target.shape[2], recon.shape[2]
+            if T_tgt > T_rec > 0:
+                stride = T_tgt // T_rec
+                target = target[:, :, ::stride][:, :, :T_rec]
+            elif T_rec > T_tgt:
+                recon = recon[:, :, :T_tgt]
         elif target.dim() == 5 and recon.dim() == 4:
             target = target[:, :, 0]
         elif target.dim() == 4 and recon.dim() == 5:

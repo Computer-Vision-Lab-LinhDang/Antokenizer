@@ -1,0 +1,325 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1775012123148,
+  "projectRoot": "/home/sagemaker-user/ws/Antoken",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml",
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1775012123142,
+      "keyFiles": [
+        "__init__.cpython-312.pyc",
+        "__init__.cpython-313.pyc",
+        "train_cls_ddp.cpython-312.pyc",
+        "train_multimodal_ddp.cpython-312.pyc"
+      ]
+    },
+    "benchmarks": {
+      "path": "benchmarks",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775012123142,
+      "keyFiles": [
+        "__init__.py",
+        "token_count.py"
+      ]
+    },
+    "checkpoints": {
+      "path": "checkpoints",
+      "purpose": null,
+      "fileCount": 11,
+      "lastAccessed": 1775012123144,
+      "keyFiles": [
+        "last-v1.ckpt",
+        "last.ckpt",
+        "stage1-best-v1.ckpt",
+        "stage1-best.ckpt",
+        "stage1-step=10000.ckpt"
+      ]
+    },
+    "core": {
+      "path": "core",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775012123145,
+      "keyFiles": [
+        "__init__.py",
+        "rope4d.py"
+      ]
+    },
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 5,
+      "lastAccessed": 1775012123145,
+      "keyFiles": [
+        "build_ready_dataset.py",
+        "cifar-10-python.tar.gz",
+        "download_videos.py",
+        "extract_3d_data.py",
+        "prepare_training_data.py"
+      ]
+    },
+    "ddt": {
+      "path": "ddt",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1775012123145,
+      "keyFiles": [
+        "__init__.py",
+        "config.py",
+        "decoder.py",
+        "encoder.py",
+        "latent.py"
+      ]
+    },
+    "losses": {
+      "path": "losses",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1775012123145,
+      "keyFiles": [
+        "__init__.py",
+        "clip_perc.py",
+        "ddt_loss.py",
+        "distill.py",
+        "gram.py"
+      ]
+    },
+    "mavt": {
+      "path": "mavt",
+      "purpose": null,
+      "fileCount": 12,
+      "lastAccessed": 1775012123145,
+      "keyFiles": [
+        "__init__.py",
+        "config.py",
+        "content_dynamics.py",
+        "dynamics_expander.py",
+        "mavt_cls.py"
+      ]
+    },
+    "outputs": {
+      "path": "outputs",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1775012123145,
+      "keyFiles": [
+        "batch_image_recon.png"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 3,
+      "lastAccessed": 1775012123146,
+      "keyFiles": [
+        "conftest.py",
+        "test_mavt.py",
+        "test_mavt_cls.py"
+      ]
+    },
+    "train": {
+      "path": "train",
+      "purpose": null,
+      "fileCount": 18,
+      "lastAccessed": 1775012123146,
+      "keyFiles": [
+        "__init__.py",
+        "converter_4d.py",
+        "curriculum.py",
+        "data.py",
+        "dataloader.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "train_multimodal_ddp.py",
+      "accessCount": 29,
+      "lastAccessed": 1775030370813,
+      "type": "file"
+    },
+    {
+      "path": "mavt/content_dynamics.py",
+      "accessCount": 4,
+      "lastAccessed": 1775042093807,
+      "type": "file"
+    },
+    {
+      "path": "mavt/tokenizer.py",
+      "accessCount": 4,
+      "lastAccessed": 1775042093879,
+      "type": "file"
+    },
+    {
+      "path": "mavt/config.py",
+      "accessCount": 3,
+      "lastAccessed": 1775042088998,
+      "type": "file"
+    },
+    {
+      "path": "mavt/module6_latent.py",
+      "accessCount": 3,
+      "lastAccessed": 1775042089019,
+      "type": "file"
+    },
+    {
+      "path": "mavt/module7_decoder.py",
+      "accessCount": 3,
+      "lastAccessed": 1775042093822,
+      "type": "file"
+    },
+    {
+      "path": "mavt/types.py",
+      "accessCount": 2,
+      "lastAccessed": 1775042088943,
+      "type": "file"
+    },
+    {
+      "path": "mavt/module1_patchify.py",
+      "accessCount": 2,
+      "lastAccessed": 1775042088964,
+      "type": "file"
+    },
+    {
+      "path": "mavt/module5_encoder.py",
+      "accessCount": 2,
+      "lastAccessed": 1775042089050,
+      "type": "file"
+    },
+    {
+      "path": "mavt/dynamics_expander.py",
+      "accessCount": 2,
+      "lastAccessed": 1775042093770,
+      "type": "file"
+    },
+    {
+      "path": "core/rope4d.py",
+      "accessCount": 2,
+      "lastAccessed": 1775042101222,
+      "type": "file"
+    },
+    {
+      "path": "losses/mavt_loss.py",
+      "accessCount": 2,
+      "lastAccessed": 1775042130570,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 1,
+      "lastAccessed": 1775025370393,
+      "type": "directory"
+    },
+    {
+      "path": "mavt",
+      "accessCount": 1,
+      "lastAccessed": 1775029853030,
+      "type": "directory"
+    },
+    {
+      "path": "train/curriculum.py",
+      "accessCount": 1,
+      "lastAccessed": 1775030397233,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/stage1_logs/version_2/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042099982,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/stage1_logs/version_1/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042099994,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/multimodal/multimodal_logs/version_0/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042100005,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/cls/cls_logs/version_0/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042100015,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/multimodal/multimodal_logs/version_10/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042100023,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/multimodal/multimodal_logs/version_11/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042100057,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/stage1_logs/version_0/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042100081,
+      "type": "file"
+    },
+    {
+      "path": "checkpoints/cls/cls_logs/version_8/hparams.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1775042100113,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

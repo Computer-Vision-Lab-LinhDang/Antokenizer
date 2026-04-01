@@ -15,8 +15,8 @@ class PatchifyOutput:
 
     f_spatial: torch.Tensor       # (B, N, 1152)
     positions: torch.Tensor       # (B, N, 4)
-    raw_patches: torch.Tensor     # (B, N, C, p, p)
     modality: Modality
+    raw_patches: Optional[torch.Tensor] = None
     raw_patches_temporal: Optional[torch.Tensor] = None
     depth_signal: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -28,6 +28,17 @@ class PatchifyOutput:
     @property
     def num_tokens(self) -> int:
         return self.f_spatial.size(1)
+
+
+@dataclass
+class ContentDynamicsOutput:
+    """Output of Content-Dynamics Split."""
+
+    tokens: torch.Tensor          # (B, N_reduced, D)
+    positions: torch.Tensor       # (B, N_reduced, 4)
+    token_types: torch.Tensor     # (B, N_reduced) — 0=content, 1=dynamics
+    modality: Modality
+    cd_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -59,6 +70,7 @@ class DecoderOutput:
 __all__ = [
     "Modality",
     "PatchifyOutput",
+    "ContentDynamicsOutput",
     "EncoderOutput",
     "LatentOutput",
     "DecoderOutput",

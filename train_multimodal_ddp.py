@@ -29,6 +29,7 @@ import math
 import os
 import random
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import functional as TF
 
-from mavt.config import MAVTConfig
+from mavt.config import MAVTConfig, ContentDynamicsConfig
 from mavt.tokenizer import MAVTokenizer
 from losses.mavt_loss import LossWeights, MAVTLoss
 from train.curriculum import STAGE3, apply_stage
@@ -59,7 +60,7 @@ from train.curriculum import STAGE3, apply_stage
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-DATA_ROOT = Path("datasets/datasets/ready_sample_100")
+DATA_ROOT = Path("datasets/datasets/ready")
 CKPT_DIR = Path("checkpoints/multimodal")
 
 _NORM_MEAN = [0.5, 0.5, 0.5]
@@ -256,75 +257,94 @@ class MultiModalLitModule(pl.LightningModule):
         warmup_steps: int = 500,
         total_steps: int = 50_000,
         kl_weight: float = 1e-4,
+        cd_split: bool = False,
+        content_ratio: float = 0.25,
+        detail_ratio: float = 0.10,
+        weight_image: float = 0.222,
+        weight_video: float = 0.556,
+        weight_3d: float = 0.222,
     ):
         super().__init__()
         self.save_hyperparameters()
+        # Normalize so weights sum to 1.
+        w_sum = weight_image + weight_video + weight_3d
+        self.modality_weights = {
+            "image": weight_image / w_sum,
+            "video": weight_video / w_sum,
+            "3d":    weight_3d / w_sum,
+        }
+        self.use_dynamic_weights = True  # auto-balance based on loss magnitude
+        # EMA of per-modality losses (for dynamic weighting from previous steps).
+        self._loss_ema = {"image": 1.0, "video": 1.0, "3d": 1.0}
+        self._ema_decay = 0.99
 
         cfg = MAVTConfig()
+        if cd_split:
+            cfg.content_dynamics = ContentDynamicsConfig(
+                content_ratio=content_ratio,
+                detail_ratio=detail_ratio,
+            )
         self.model = MAVTokenizer(cfg)
         apply_stage(self.model, STAGE3)
 
         self.loss_fn = MAVTLoss(LossWeights(recon=1.0, kl=kl_weight))
-        self.automatic_optimization = False
 
     def forward(self, x, modality=None):
         return self.model(x, modality)
 
     def training_step(self, batch, batch_idx):
-        opt = self.optimizers()
-        sch = self.lr_schedulers()
-        opt.zero_grad()
-
-        total_loss = 0.0
         modality_losses = {}
 
-        # batch is a dict: {"image": tensor, "video": tensor, "3d": tensor}
         modalities = [
             ("image", batch.get("image"), "image"),
             ("video", batch.get("video"), "video"),
             ("3d",    batch.get("3d"),    "3d"),
         ]
 
-        n_valid = sum(1 for _, data, _ in modalities if data is not None)
-        if n_valid == 0:
-            opt.step()
-            sch.step()
-            return
+        valid = [(n, d, m) for n, d, m in modalities if d is not None]
+        if not valid:
+            return None
 
-        for name, data, mod_key in modalities:
-            if data is None:
-                continue
+        # Dynamic weights from EMA of previous losses.
+        if self.use_dynamic_weights:
+            inv = {k: 1.0 / max(self._loss_ema[k], 1e-6) for k, _, _ in valid}
+            inv_sum = sum(inv.values())
+            dyn_w = {k: v / inv_sum for k, v in inv.items()}
+        else:
+            dyn_w = {m: self.modality_weights.get(m, 1.0 / len(valid))
+                     for _, _, m in valid}
 
-            try:
-                dec_out, lat_out = self.model(data, mod_key)
-                result = self.loss_fn(
-                    recon=dec_out.reconstruction,
-                    target=data,
-                    mu=lat_out.mu,
-                    log_var=lat_out.log_var,
-                )
-                # Divide by n_valid so total gradient magnitude is normalized
-                loss = result["loss"] / n_valid
-                self.manual_backward(loss)
+        # All forwards, accumulate weighted loss in one graph.
+        # Lightning handles backward + DDP sync + grad clipping automatically.
+        combined_loss = torch.tensor(0.0, device=self.device)
 
-                modality_losses[name] = result["loss"].detach()
-                total_loss += result["loss"].detach()
+        for name, data, mod_key in valid:
+            dec_out, lat_out = self.model(data, mod_key)
+            result = self.loss_fn(
+                recon=dec_out.reconstruction,
+                target=data,
+                mu=lat_out.mu,
+                log_var=lat_out.log_var,
+            )
+            combined_loss = combined_loss + result["loss"] * dyn_w[mod_key]
 
-            except Exception as e:
-                if self.global_rank == 0:
-                    log.warning("Skip %s: %s", name, e)
-
-        self.clip_gradients(opt, gradient_clip_val=1.0)
-        opt.step()
-        sch.step()
+            raw = result["loss"].detach()
+            modality_losses[name] = raw
+            self._loss_ema[mod_key] = (
+                self._ema_decay * self._loss_ema[mod_key]
+                + (1 - self._ema_decay) * raw.item()
+            )
 
         # Logging
-        if modality_losses:
-            self.log("train/loss", total_loss / max(len(modality_losses), 1),
-                     prog_bar=True, sync_dist=True)
-            for name, val in modality_losses.items():
-                self.log(f"train/{name}_loss", val, prog_bar=True, sync_dist=True)
-        self.log("lr", sch.get_last_lr()[0], prog_bar=True)
+        total_loss = sum(modality_losses.values())
+        self.log("train/loss", total_loss / len(modality_losses),
+                 prog_bar=True, sync_dist=True)
+        for name, val in modality_losses.items():
+            self.log(f"train/{name}_loss", val, prog_bar=True, sync_dist=True)
+        self.log("lr", self.trainer.optimizers[0].param_groups[0]["lr"],
+                 prog_bar=True)
+
+        return combined_loss
 
     def validation_step(self, batch, batch_idx):
         total_loss = 0.0
@@ -333,19 +353,16 @@ class MultiModalLitModule(pl.LightningModule):
             data = batch.get(name)
             if data is None:
                 continue
-            try:
-                dec_out, lat_out = self.model(data, mod_key)
-                result = self.loss_fn(
-                    recon=dec_out.reconstruction,
-                    target=data,
-                    mu=lat_out.mu,
-                    log_var=lat_out.log_var,
-                )
-                self.log(f"val/{name}_loss", result["loss"], sync_dist=True)
-                total_loss += result["loss"]
-                n += 1
-            except Exception:
-                pass
+            dec_out, lat_out = self.model(data, mod_key)
+            result = self.loss_fn(
+                recon=dec_out.reconstruction,
+                target=data,
+                mu=lat_out.mu,
+                log_var=lat_out.log_var,
+            )
+            self.log(f"val/{name}_loss", result["loss"], sync_dist=True)
+            total_loss += result["loss"]
+            n += 1
         if n > 0:
             self.log("val/loss", total_loss / n, prog_bar=True, sync_dist=True)
 
@@ -574,6 +591,17 @@ def main():
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--cd-split", action="store_true",
+                        help="Enable unified Content-Detail Split (all modalities)")
+    parser.add_argument("--content-ratio", type=float, default=0.25,
+                        help="Fraction of tokens kept as content (default 0.25)")
+    parser.add_argument("--detail-ratio", type=float, default=0.10,
+                        help="Fraction of tokens compressed as detail (default 0.10)")
+
+    # Modality loss weights (AToken Stage 3 ratios by default)
+    parser.add_argument("--weight-image", type=float, default=0.222)
+    parser.add_argument("--weight-video", type=float, default=0.556)
+    parser.add_argument("--weight-3d", type=float, default=0.222)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -588,6 +616,12 @@ def main():
         warmup_steps=args.warmup_steps,
         total_steps=args.steps,
         kl_weight=args.kl_weight,
+        cd_split=args.cd_split,
+        content_ratio=args.content_ratio,
+        detail_ratio=args.detail_ratio,
+        weight_image=args.weight_image,
+        weight_video=args.weight_video,
+        weight_3d=args.weight_3d,
     )
 
     if args.compile:
@@ -638,6 +672,7 @@ def main():
         strategy=strategy,
         precision=precision,
         max_steps=args.steps,
+        gradient_clip_val=1.0,
         log_every_n_steps=args.log_every,
         val_check_interval=args.val_every,
         check_val_every_n_epoch=None,
@@ -654,6 +689,16 @@ def main():
     log.info("  Video: %dpx x %d frames, batch=%d",
              args.video_res, args.video_frames, args.batch_video)
     log.info("  3D:    %dpx triplane, batch=%d", args.triplane_res, args.batch_3d)
+    log.info("  Weights: image=%.3f, video=%.3f, 3d=%.3f",
+             args.weight_image, args.weight_video, args.weight_3d)
+    if args.cd_split:
+        for lbl, N in [("image", (args.image_res // 16) ** 2),
+                        ("video", args.video_frames * (args.video_res // 16) ** 2),
+                        ("3d", 3 * (args.triplane_res // 16) ** 2)]:
+            Nc = max(12, int(N * args.content_ratio))
+            Nd = max(12, int(N * args.detail_ratio))
+            log.info("  C-D Split %s: %d → %d+%d = %d tokens (%.1f×)",
+                     lbl, N, Nc, Nd, Nc + Nd, N / (Nc + Nd))
     log.info("  Data root: %s", args.data_root)
     log.info("  Gradient = sum(image_grad + video_grad + 3d_grad) per step")
     log.info("=" * 70)
