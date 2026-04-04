@@ -9,7 +9,7 @@ from mavt import MAVTClassifier
 import torch
 
 
-tokenizer = MAVTClassifier(num_classes=10, classifier_name="fastformer")
+tokenizer = MAVTClassifier(num_classes=10, classifier_name="linear")
 image = torch.randn(1, 3, 224, 224)
 tokenizer.eval()
 with torch.no_grad():

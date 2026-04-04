@@ -38,6 +38,7 @@ class DecoderConfig:
     cnn_channels: Tuple[int, ...] = (512, 256, 128, 64)
     out_channels: int = 3
     patch_size: int = 16
+    dropout: float=0.2
 
 
 @dataclass

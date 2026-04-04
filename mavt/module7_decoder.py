@@ -28,6 +28,22 @@ class PixelShuffleUpsample(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.norm(self.ps(self.conv(x))))
+    
+class FeedForward(nn.Module):
+    """Standard Transformer FFN"""
+
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class AsymmetricDecoder(nn.Module):
@@ -50,6 +66,18 @@ class AsymmetricDecoder(nn.Module):
             for _ in range(self.cfg.n_attn_blocks)
         ])
         self.attn_norms = nn.ModuleList([
+            nn.LayerNorm(self.cfg.d_model)
+            for _ in range(self.cfg.n_attn_blocks)
+        ])
+        self.ffn_blocks = nn.ModuleList([
+            FeedForward(
+                d_model=self.cfg.d_model,
+                hidden_dim=self.cfg.d_model * 4,
+                dropout=self.cfg.dropout,
+            )
+            for _ in range(self.cfg.n_attn_blocks)
+        ])
+        self.ffn_norms = nn.ModuleList([
             nn.LayerNorm(self.cfg.d_model)
             for _ in range(self.cfg.n_attn_blocks)
         ])
@@ -96,11 +124,20 @@ class AsymmetricDecoder(nn.Module):
         x = self.input_norm(self.input_proj(latent_out.z))  # (B, N, d_model)
 
         # Stage A: self-attention
-        for attn, norm in zip(self.attn_blocks, self.attn_norms):
+        for attn, norm, ffn, ffn_norm in zip(
+            self.attn_blocks, 
+            self.attn_norms,
+            self.ffn_blocks,
+            self.ffn_norms
+        ):
             res = x
             xn = norm(x)
             out, _ = attn(xn, xn, xn)
             x = res + out
+
+            res = x
+            xn = ffn_norm(x)
+            x = res + ffn(xn)
 
         x = self.norm_out(x)  # (B, N, d_model)
 
