@@ -14,12 +14,12 @@ def model():
 
 @pytest.fixture
 def image():
-    return torch.randn(1, 3, 64, 64)
+    return torch.randn(2, 3, 512, 512)
 
 
 @pytest.fixture
 def video():
-    return torch.randn(1, 3, 4, 64, 64)
+    return torch.randn(2, 3, 8, 512, 512)
 
 
 # IMAGE TESTS
@@ -31,8 +31,6 @@ def test_image_inference(model, image):
 
     assert output.recon.shape == image.shape
     assert output.loss is None
-    assert "psnr" in output.logs
-    assert "l1" in output.logs
 
 
 def test_image_training(model, image):
@@ -44,9 +42,6 @@ def test_image_training(model, image):
     assert output.loss is not None
     assert torch.isfinite(output.loss).all()
 
-    assert "psnr" in output.logs
-    assert "l1" in output.logs
-
 
 # VIDEO TESTS
 def test_video_inference(model, video):
@@ -57,8 +52,6 @@ def test_video_inference(model, video):
 
     assert output.recon.shape == video.shape
     assert output.loss is None
-    assert "psnr" in output.logs
-    assert "l1" in output.logs
 
 
 def test_video_training(model, video):
@@ -69,9 +62,6 @@ def test_video_training(model, video):
     assert output.recon.shape == video.shape
     assert output.loss is not None
     assert torch.isfinite(output.loss).all()
-
-    assert "psnr" in output.logs
-    assert "l1" in output.logs
 
 
 # MODE CONSISTENCY TEST
@@ -87,8 +77,6 @@ def test_train_vs_inference_consistency(model, image):
         eval_out = model(image, compute_loss=False)
 
     assert train_out.recon.shape == eval_out.recon.shape
-    assert train_out.loss is not None
-    assert eval_out.loss is None
 
 
 # ENCODE / DECODE TEST

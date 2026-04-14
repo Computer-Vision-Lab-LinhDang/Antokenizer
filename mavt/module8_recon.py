@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mavt.types import Modality, LatentOutput, DecoderOutput
 from losses.recon import ReconstructionLoss
 
 
