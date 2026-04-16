@@ -1,0 +1,5 @@
+data:
+  stage: 4
+  modality_weights:
+    image: 1.0
+    video: 1.0
