@@ -1,0 +1,9 @@
+model:
+  encoder_cfg:
+    embed_dim: 1152
+    depth: 27
+    num_heads: 16
+    gradient_checkpointing: true
+  latent_cfg:
+    latent_dim: 32
+    semantic_dim: 1152

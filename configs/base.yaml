@@ -1,0 +1,54 @@
+seed_everything: 42
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: 32-true
+  max_steps: 1000
+  log_every_n_steps: 10
+  default_root_dir: ./outputs
+model:
+  stage: 1
+  encoder_cfg:
+    embed_dim: 256
+    depth: 6
+    num_heads: 8
+    patch_size: 16
+    temporal_patch_size: 2
+    dropout: 0.0
+    gradient_checkpointing: false
+  latent_cfg:
+    latent_dim: 32
+    semantic_dim: 256
+    discrete_type: fsq
+    stage2_latent_dim: 48
+  decoder_cfg:
+    patch_size: 16
+    temporal_patch_size: 2
+    depth: 4
+    num_heads: 8
+  loss_cfg:
+    l1_weight: 1.0
+    lpips_weight: 0.0
+    gram_weight: 0.0
+    temporal_weight: 0.0
+    semantic_weight: 0.0
+    kl_weight: 1.0e-5
+    commitment_weight: 1.0
+  optimizer_cfg:
+    lr: 1.0e-4
+    weight_decay: 0.05
+  scheduler_cfg:
+    T_max: 1000
+    eta_min: 1.0e-6
+data:
+  data_root: ./data
+  stage: 1
+  batch_size: 4
+  num_workers: 4
+  image_size: 256
+  video_size: 256
+  num_video_frames: 16
+  steps_per_epoch: 1000
+  modality_weights:
+    image: 1.0
+    video: 1.0

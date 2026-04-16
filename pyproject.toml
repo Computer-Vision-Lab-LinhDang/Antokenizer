@@ -1,7 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
 [project]
 name = "antoken"
 version = "0.1.0"
-description = "Add your description here"
+description = "A unified visual tokenizer MVP inspired by AToken."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "torch>=2.3",
+  "torchvision>=0.18",
+  "lightning>=2.3",
+  "jsonargparse[signatures]>=4.27",
+  "transformers>=4.45",
+  "einops>=0.8",
+  "decord>=0.6",
+  "lpips>=0.1.4",
+  "torchmetrics[image]>=1.4",
+  "numpy>=1.26",
+  "pillow>=10",
+  "wandb>=0.17",
+  "tensorboard>=2.16",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+antoken-train = "mavt.cli:main"
+antoken-eval = "mavt.eval_cli:main"
+antoken-visualize = "mavt.visualize_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mavt"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

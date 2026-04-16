@@ -1,0 +1,8 @@
+model:
+  encoder_cfg:
+    embed_dim: 256
+    depth: 6
+    num_heads: 8
+  latent_cfg:
+    latent_dim: 32
+    semantic_dim: 256

@@ -1,0 +1,6 @@
+model:
+  stage: 4
+  latent_cfg:
+    discrete_type: fsq
+data:
+  stage: 4

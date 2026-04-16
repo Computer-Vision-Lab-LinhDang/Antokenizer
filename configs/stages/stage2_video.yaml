@@ -1,0 +1,6 @@
+model:
+  stage: 2
+  loss_cfg:
+    temporal_weight: 0.1
+data:
+  stage: 2
