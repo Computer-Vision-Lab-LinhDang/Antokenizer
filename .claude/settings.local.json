@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/vu.nguyen/.claude/plugins/cache/omc/oh-my-claudecode/4.12.1/scripts/lib/config-dir.sh)",
+      "Bash(bash /home/vu.nguyen/.claude/plugins/cache/omc/oh-my-claudecode/4.12.1/scripts/setup-progress.sh resume)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(bash -x /home/vu.nguyen/.claude/plugins/cache/omc/oh-my-claudecode/4.12.1/scripts/setup-progress.sh resume)",
+      "Bash(jq --version)",
+      "Bash(cp /home/vu.nguyen/.claude/plugins/cache/omc/oh-my-claudecode/4.12.1/scripts/lib/hud-wrapper-template.txt __TRACKED_VAR__/.claude/hud/omc-hud.mjs)",
+      "Bash(cp /home/vu.nguyen/.claude/plugins/cache/omc/oh-my-claudecode/4.12.1/scripts/lib/config-dir.mjs __TRACKED_VAR__/.claude/hud/lib/config-dir.mjs)",
+      "Bash(chmod +x __TRACKED_VAR__/.claude/hud/omc-hud.mjs)",
+      "Bash(node -e \"const p=require\\('path'\\),f=require\\('fs'\\),d=process.env.CLAUDE_CONFIG_DIR||p.join\\(require\\('os'\\).homedir\\(\\),'.claude'\\),t=p.join\\(d,'hud','omc-hud.js'\\);try{if\\(f.existsSync\\(t\\)\\){f.unlinkSync\\(t\\);console.log\\('Removed legacy omc-hud.js'\\)}else{console.log\\('No legacy script found'\\)}}catch{}\")",
+      "Bash(node -e ' *)",
+      "Bash(node -e \"const p=require\\('path'\\),f=require\\('fs'\\),h=require\\('os'\\).homedir\\(\\),d=process.env.CLAUDE_CONFIG_DIR||p.join\\(h,'.claude'\\),b=p.join\\(d,'plugins','cache','omc','oh-my-claudecode'\\);try{const v=f.readdirSync\\(b\\).filter\\(x=>/^\\\\d/.test\\(x\\)\\).sort\\(\\(a,c\\)=>a.localeCompare\\(c,void 0,{numeric:true}\\)\\);if\\(v.length<=1\\){console.log\\('Cache is clean'\\);process.exit\\(\\)}v.slice\\(0,-1\\).forEach\\(x=>{f.rmSync\\(p.join\\(b,x\\),{recursive:true,force:true}\\)}\\);console.log\\('Cleared',v.length-1,'stale cache version\\(s\\)'\\)}catch{console.log\\('No cache directory found \\(normal for new installs\\)'\\)}\")",
+      "Bash(claude mcp *)",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"import mavt; from mavt.model.mavt import MAVT; m=MAVT\\(\\); print\\('params:', sum\\(p.numel\\(\\) for p in m.parameters\\(\\)\\)/1e6, 'M'\\)\")"
+    ]
+  }
+}

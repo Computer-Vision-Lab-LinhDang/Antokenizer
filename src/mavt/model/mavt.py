@@ -1,0 +1,186 @@
+"""MAVT: Memory-Augmented Vision Tokenizer.
+
+Unified 7-stage pipeline:
+  1. Patchify (Conv3d, modality-specific)
+  2. Hybrid Transformer-RGAT Backbone (12 blocks)
+  3. Content-Detail Split (slot attention)
+  4. Dual Latent Projection (VAE + Semantic)
+  5. Modality-Specific Decoder
+  6. Losses (handled by LightningModule)
+  7. Outputs
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+from mavt.model.patchify import PatchifyEncoder
+from mavt.model.backbone import HybridBackbone
+from mavt.model.content_detail_split import ContentDetailSplit
+from mavt.model.latent_heads import VAEHead, SemanticHead
+from mavt.model.decoder import AsymmetricDecoder
+
+
+# Compression ratios per modality (content, detail)
+_MODALITY_RATIOS = {
+    'image':  (0.25, 0.10),
+    'video':  (0.25, 0.10),
+    'threed': (0.35, 0.15),
+}
+
+
+@dataclass
+class MAVTOutput:
+    reconstruction: torch.Tensor      # pixel-space reconstruction
+    z: torch.Tensor                    # VAE latent
+    mu: torch.Tensor
+    logvar: torch.Tensor
+    semantic: torch.Tensor             # (B, semantic_dim)
+    loss_kl: torch.Tensor
+    cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
+
+
+class MAVT(nn.Module):
+    """Full MAVT model.
+
+    All hyper-parameters are configurable via YAML (Lightning CLI).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 1152,
+        num_heads: int = 16,
+        num_blocks: int = 12,
+        patch_size: int = 16,
+        t_patch: int = 2,
+        # C-D Split
+        num_slot_heads: int = 8,
+        num_slot_layers: int = 2,
+        # VAE
+        latent_dim: int = 32,
+        kl_weight: float = 1e-4,
+        # Semantic
+        semantic_dim: int = 768,
+        # Decoder
+        dec_dim: int = 768,
+        num_dec_attn_blocks: int = 4,
+        # RGAT
+        r_s: int = 2,
+        r_t: int = 1,
+        # Training
+        use_gradient_checkpointing: bool = False,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.latent_dim = latent_dim
+        self.patch_size = patch_size
+
+        # Stage 1
+        self.patchify = PatchifyEncoder(embed_dim, patch_size, t_patch)
+
+        # Stage 2
+        self.backbone = HybridBackbone(
+            dim=embed_dim, num_heads=num_heads, num_blocks=num_blocks,
+            mlp_ratio=mlp_ratio, dropout=dropout,
+            r_s=r_s, r_t=r_t,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+        )
+
+        # Stage 3
+        self.cd_split = ContentDetailSplit(
+            dim=embed_dim, num_heads=num_slot_heads, num_slot_layers=num_slot_layers)
+
+        # Stage 4
+        self.vae_head      = VAEHead(embed_dim, latent_dim, kl_weight)
+        self.semantic_head = SemanticHead(embed_dim, semantic_dim)
+
+        # Stage 5
+        self.decoder = AsymmetricDecoder(
+            latent_dim=latent_dim, dec_dim=dec_dim,
+            num_attn_blocks=num_dec_attn_blocks, num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _grid_shape(self, modality: str, x: torch.Tensor) -> tuple:
+        """Return (H_grid, W_grid) or (Tp, Hg, Wg) based on input shape."""
+        if modality == 'image':
+            _, _, H, W = x.shape
+            return (H // self.patch_size, W // self.patch_size)
+        elif modality == 'video':
+            _, _, T, H, W = x.shape
+            return (T // 2, H // self.patch_size, W // self.patch_size)
+        elif modality == 'threed':
+            _, _, _, S, _ = x.shape   # (B, 3planes, 3ch, S, S)
+            return (S // self.patch_size, S // self.patch_size)
+        raise ValueError(modality)
+
+    # ------------------------------------------------------------------ #
+    #  Forward                                                             #
+    # ------------------------------------------------------------------ #
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality: str,
+        decode: bool = True,
+    ) -> MAVTOutput:
+        """
+        x : raw input tensor (see patchify.py for shapes per modality)
+        modality : 'image' | 'video' | 'threed'
+        decode : if False, skip decoder (encoder-only mode for downstream tasks)
+        """
+        grid_shape = self._grid_shape(modality, x)
+
+        # Stage 1 — Patchify
+        tokens, positions, plane_ids = self.patchify(x, modality)
+        # tokens: (B, N, D), positions: (N, 4), plane_ids: (N,)
+
+        # Stage 2 — Hybrid backbone
+        features = self.backbone(tokens, positions, plane_ids, modality)
+
+        # Stage 3 — Content-Detail Split
+        content_ratio, detail_ratio = _MODALITY_RATIOS[modality]
+        compressed, cd_metrics = self.cd_split(
+            features, content_ratio, detail_ratio
+        )  # (B, N_c + N_d, D)
+
+        # Stage 4a — VAE head
+        z, mu, logvar, loss_kl = self.vae_head(compressed)
+
+        # Stage 4b — Semantic head
+        semantic = self.semantic_head(compressed)
+
+        # Stage 5 — Decoder
+        if decode:
+            recon = self.decoder(z, positions, modality, grid_shape)
+        else:
+            recon = torch.zeros(1, device=x.device)  # placeholder
+
+        return MAVTOutput(
+            reconstruction=recon,
+            z=z,
+            mu=mu,
+            logvar=logvar,
+            semantic=semantic,
+            loss_kl=loss_kl,
+            cd_metrics=cd_metrics,
+        )
+
+    def encode(self, x: torch.Tensor, modality: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convenience: return (z, semantic) without decoding."""
+        out = self.forward(x, modality, decode=False)
+        return out.z, out.semantic
+
+    def load_siglip2_weights(self, model_name: str = "google/siglip2-base-patch16-224",
+                              freeze_stages: int = 10) -> None:
+        self.backbone.load_siglip2_weights(model_name, freeze_stages)

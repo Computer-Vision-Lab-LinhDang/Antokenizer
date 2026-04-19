@@ -1,0 +1,46 @@
+# Stage 3: Image + Video + 3D, SigLIP2 fully unfrozen, 50K steps
+trainer:
+  max_steps: 50000
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  val_check_interval: 2500
+  enable_checkpointing: true
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage3
+        filename: mavt-stage3-{step:07d}-{val/loss:.4f}
+        save_top_k: 3
+        monitor: val/loss
+        mode: min
+        every_n_train_steps: 2500
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar
+
+model:
+  training_stage: 3
+  init_siglip2: false
+  w_l1: 1.0
+  w_lpips: 0.1
+  w_clip: 0.0
+  w_aux: 0.01
+  use_lpips: true
+  warmup_steps: 500
+  total_steps: 50000
+  weight_decay: 0.01
+
+data:
+  active_modalities:
+    - image
+    - video
+    - threed
+  image_resolution: 256
+  video_frames: 16
+  video_resolution: 256
+  triplane_res: 64
+  batch_size: 16
+  num_workers: 8
+  # threed_root: /path/to/cap3d
