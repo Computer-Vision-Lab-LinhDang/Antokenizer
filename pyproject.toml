@@ -1,0 +1,40 @@
+[project]
+name = "mavt"
+version = "0.1.0"
+description = "Memory-Augmented Vision Tokenizer with 4D RGAT and Content-Detail Split"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "lightning>=2.1.0",
+    "jsonargparse[signatures]>=4.27.0",
+    "lpips>=0.1.4",
+    "transformers>=4.40.0",
+    "einops>=0.2.0",
+    "wandb>=0.16.0",
+    "torchmetrics[image]>=1.3.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "pytest-cov"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mavt"]

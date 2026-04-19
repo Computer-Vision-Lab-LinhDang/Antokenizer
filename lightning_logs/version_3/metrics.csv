@@ -1,5 +1,0 @@
-epoch,step,train/cd_residual_ratio,train/cd_slot_diversity,train/loss_clip_epoch,train/loss_div_epoch,train/loss_epoch,train/loss_kl_epoch,train/loss_l1_epoch,train/loss_lpips_epoch,train/loss_recon_epoch,train/modality_image,val/cd_residual_ratio,val/cd_slot_diversity,val/loss_clip_epoch,val/loss_clip_step,val/loss_div_epoch,val/loss_div_step,val/loss_epoch,val/loss_kl_epoch,val/loss_kl_step,val/loss_l1_epoch,val/loss_l1_step,val/loss_lpips_epoch,val/loss_lpips_step,val/loss_recon_epoch,val/loss_recon_step,val/loss_step,val/modality_image
-,0,,,,,,,,,,,,,,0.0,,0.12548828125,,,2.8409707738319412e-05,,0.7976645231246948,,0.841796875,,0.8818930387496948,0.8890563249588013,
-,1,,,,,,,,,,,,,,0.0,,0.12451171875,,,2.8384507459122688e-05,,0.7976395487785339,,0.845703125,,0.8823563456535339,0.8905092477798462,
-0,0,,,,,,,,,,,1.0022350549697876,0.125,0.0,,0.125,,0.8897827863693237,2.839710759872105e-05,,0.797652006149292,,0.84375,,0.882124662399292,,,1.0
-0,0,1.0080291032791138,0.2412109375,0.0,0.2412109375,0.5855984687805176,3.0012655770406127e-05,0.50147944688797,0.8046875,0.58180171251297,1.0,,,,,,,,,,,,,,,,,
