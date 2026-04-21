@@ -29,14 +29,21 @@ class LPIPSLoss(nn.Module):
             self._available = False
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """pred, target: (B, 3, H, W) in [-1, 1] or [0, 1]."""
+        """pred, target: (B, 3, H, W) or (B, 3, N, H, W) in [-1, 1] or [0, 1].
+
+        5-D inputs (video frames / triplane planes) are merged into the batch
+        dimension so LPIPS always sees (B', 3, H, W).
+        """
         if not self._available:
             return torch.tensor(0.0, device=pred.device)
-        # lpips expects (B, 3, H, W) in [-1, 1]
+        if pred.ndim == 5:
+            # (B, 3, N, H, W) → (B*N, 3, H, W)
+            B, C, N, H, W = pred.shape
+            pred   = pred.permute(0, 2, 1, 3, 4).reshape(B * N, C, H, W)
+            target = target.permute(0, 2, 1, 3, 4).reshape(B * N, C, H, W)
         pred_n   = pred.clamp(-1, 1)
         target_n = target.clamp(-1, 1)
-        loss = self._lpips(pred_n, target_n)
-        return loss.mean()
+        return self._lpips(pred_n, target_n).mean()
 
 
 # --------------------------------------------------------------------------- #

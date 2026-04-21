@@ -180,4 +180,3 @@ class RGAT4DBlock(nn.Module):
         x = residual + self.out_proj(out)
         x = x + self.mlp(self.norm2(x))
         return x
-gitig

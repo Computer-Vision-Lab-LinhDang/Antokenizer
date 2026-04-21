@@ -126,7 +126,7 @@ class MAVTLightningModule(L.LightningModule):
             self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True,
                      sync_dist=True)
         self.log(f'{log_prefix}/modality_{modality}', 1.0,
-                 on_step=False, on_epoch=True, sync_dist=True)
+                 on_step=False, on_epoch=True, sync_dist=False)
 
         return losses['loss']
 
