@@ -14,7 +14,19 @@
       "Bash(node -e \"const p=require\\('path'\\),f=require\\('fs'\\),h=require\\('os'\\).homedir\\(\\),d=process.env.CLAUDE_CONFIG_DIR||p.join\\(h,'.claude'\\),b=p.join\\(d,'plugins','cache','omc','oh-my-claudecode'\\);try{const v=f.readdirSync\\(b\\).filter\\(x=>/^\\\\d/.test\\(x\\)\\).sort\\(\\(a,c\\)=>a.localeCompare\\(c,void 0,{numeric:true}\\)\\);if\\(v.length<=1\\){console.log\\('Cache is clean'\\);process.exit\\(\\)}v.slice\\(0,-1\\).forEach\\(x=>{f.rmSync\\(p.join\\(b,x\\),{recursive:true,force:true}\\)}\\);console.log\\('Cleared',v.length-1,'stale cache version\\(s\\)'\\)}catch{console.log\\('No cache directory found \\(normal for new installs\\)'\\)}\")",
       "Bash(claude mcp *)",
       "Bash(pip install *)",
-      "Bash(python3 -c \"import mavt; from mavt.model.mavt import MAVT; m=MAVT\\(\\); print\\('params:', sum\\(p.numel\\(\\) for p in m.parameters\\(\\)\\)/1e6, 'M'\\)\")"
+      "Bash(python3 -c \"import mavt; from mavt.model.mavt import MAVT; m=MAVT\\(\\); print\\('params:', sum\\(p.numel\\(\\) for p in m.parameters\\(\\)\\)/1e6, 'M'\\)\")",
+      "Bash(omc ask *)",
+      "Bash(codex --approval-mode full-auto \"Write a Python script to read GLB files from .objaverse/hf-objaverse-v1/glbs/ directory tree and render each into a tripplane image \\(three orthographic views: front/side/top rendered side-by-side\\). Use trimesh + pyrender or pyglet-free alternatives. Save output PNGs alongside each GLB or to an output directory.\")",
+      "Bash(codex exec *)",
+      "Bash(python3 -c \"import trimesh; print\\(trimesh.__version__\\)\")",
+      "Bash(python3 -c \"import pyrender; print\\(pyrender.__version__\\)\")",
+      "Bash(python3 -c \"import PIL; print\\(PIL.__version__\\)\")",
+      "Bash(python3 -c \"import numpy; print\\(numpy.__version__\\)\")",
+      "Bash(python3 -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(pip show *)",
+      "Bash(conda env *)",
+      "Bash(uv pip *)",
+      "Bash(python3 *)"
     ]
   }
 }
