@@ -1,0 +1,62 @@
+# Stage 2: Image + Video — SigLIP2 last 4 blocks unfrozen, LR = 5e-5
+#
+# Usage:
+#   python train.py fit --config configs/model/mavt_base.yaml \
+#                       --config configs/train/stage2_universal.yaml \
+#                       --data.universal_data_root data/sample100-1 \
+#                       --ckpt_path checkpoints/stage1/mavt-stage1-best.ckpt
+
+trainer:
+  max_steps: 200000
+  devices: auto
+  precision: bf16-mixed
+  accumulate_grad_batches: 2       # effective batch = batch_size * 2 (compensates smaller batch)
+  log_every_n_steps: 100
+  val_check_interval: 1
+  enable_checkpointing: true
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
+      gradient_as_bucket_view: true
+  use_distributed_sampler: false   # ModalityGroupedBatchSampler handles DDP distribution
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage2
+        filename: mavt-stage2-{step:07d}-{val/loss:.4f}
+        save_top_k: 3
+        monitor: val/loss
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar
+
+model:
+  training_stage: 2
+  init_siglip2: false
+  siglip2_model_name: google/siglip2-base-patch16-224
+  w_l1: 1.0
+  w_lpips: 0.1
+  w_clip: 0.0
+  w_aux: 0.01
+  use_lpips: true
+  use_clip: false
+  warmup_steps: 500
+  total_steps: 200000
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+data:
+  active_modalities:
+    - image
+    - video
+  universal_data_root: data/sample100-1
+  image_resolution: 256
+  video_frames: 16
+  video_resolution: 256
+  batch_size: 16       # reduced vs stage 1 due to video memory cost
+  num_workers: 8
+  pin_memory: true

@@ -1,16 +1,17 @@
 # MAVT base model configuration
-embed_dim: 1152
-num_heads: 16
-num_blocks: 12
-patch_size: 16
-t_patch: 2
-latent_dim: 32
-kl_weight: 1.0e-4
-semantic_dim: 768
-dec_dim: 768
-num_dec_attn_blocks: 4
-r_s: 2
-r_t: 1
-use_gradient_checkpointing: true
-mlp_ratio: 4.0
-dropout: 0.0
+model:
+  embed_dim: 1152
+  num_heads: 16
+  num_blocks: 12
+  patch_size: 16
+  t_patch: 2
+  latent_dim: 32
+  kl_weight: 1.0e-4
+  semantic_dim: 768
+  dec_dim: 768
+  num_dec_attn_blocks: 4
+  r_s: 2
+  r_t: 1
+  use_gradient_checkpointing: true
+  mlp_ratio: 4.0
+  dropout: 0.0
