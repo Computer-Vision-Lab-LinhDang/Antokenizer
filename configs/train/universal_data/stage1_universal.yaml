@@ -51,7 +51,7 @@ model:
 data:
   active_modalities:
     - image
-  universal_data_root: data/sample100-1
+  universal_data_root: datasets/sample100-1
   image_resolution: 256
   batch_size: 32
   num_workers: 8

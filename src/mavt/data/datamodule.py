@@ -11,9 +11,6 @@ import lightning as L
 
 from mavt.data.datasets import (
     SyntheticMultiModalDataset,
-    ImageFolderDataset,
-    VideoDataset,
-    ThreeDDataset,
     UniversalImageDataset,
     UniversalVideoDataset,
     UniversalThreeDDataset,
@@ -120,11 +117,7 @@ class MAVTDataModule(L.LightningDataModule):
         self,
         # Stage control
         active_modalities: List[str] = ('image',),
-        # Paths (None → use synthetic data)
-        image_root: Optional[str] = None,
-        video_root: Optional[str] = None,
-        threed_root: Optional[str] = None,
-        # Universal data root — if set, overrides the three roots above
+        # Data root (None → synthetic smoke-test)
         universal_data_root: Optional[str] = None,
         # Data params
         image_resolution: int = 256,
@@ -152,23 +145,16 @@ class MAVTDataModule(L.LightningDataModule):
                 return UniversalVideoDataset(hp.universal_data_root, hp.video_frames, hp.video_resolution)
             elif modality == 'threed':
                 return UniversalThreeDDataset(hp.universal_data_root, hp.triplane_res)
+            raise ValueError(modality)
+        # Synthetic fallback for smoke-testing
         if modality == 'image':
-            root = hp.image_root
-            return (ImageFolderDataset(root, hp.image_resolution)
-                    if root else
-                    SyntheticMultiModalDataset(hp.synthetic_n, 'image', hp.image_resolution))
+            return SyntheticMultiModalDataset(hp.synthetic_n, 'image', hp.image_resolution)
         elif modality == 'video':
-            root = hp.video_root
-            return (VideoDataset(root, hp.video_frames, hp.video_resolution)
-                    if root else
-                    SyntheticMultiModalDataset(hp.synthetic_n, 'video',
-                                               hp.video_resolution, hp.video_frames))
+            return SyntheticMultiModalDataset(hp.synthetic_n, 'video',
+                                              hp.video_resolution, hp.video_frames)
         elif modality == 'threed':
-            root = hp.threed_root
-            return (ThreeDDataset(root, hp.triplane_res)
-                    if root else
-                    SyntheticMultiModalDataset(hp.synthetic_n, 'threed',
-                                               triplane_res=hp.triplane_res))
+            return SyntheticMultiModalDataset(hp.synthetic_n, 'threed',
+                                              triplane_res=hp.triplane_res)
         raise ValueError(modality)
 
     # ------------------------------------------------------------------ #

@@ -217,7 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-data/
+datasets/
 .objaverse/
 tripplane_images/
 lightning_logs/
