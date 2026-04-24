@@ -77,6 +77,14 @@ class ContentDetailSplit(nn.Module):
 
     Separates tokens into a content channel (semantic, low-frequency) and a
     detail channel (residual, high-frequency) using learned slot attention.
+
+    Note on parameter registration:
+      Slot poolers depend on (N_c, N_d) which depend on (modality, resolution).
+      Call ``prepare_poolers(N_c, N_d)`` for every combo that will appear at
+      training time BEFORE the optimizer is built — otherwise the pooler
+      params are not in any param_group and never receive updates. The lazy
+      fallback in ``_get_poolers`` only exists to keep smoke tests and
+      one-off inference paths functional; it emits a ``RuntimeWarning``.
     """
 
     def __init__(
@@ -94,13 +102,33 @@ class ContentDetailSplit(nn.Module):
         self._num_heads = num_heads
         self._num_slot_layers = num_slot_layers
 
+    def prepare_poolers(self, N_c: int, N_d: int) -> None:
+        """Eagerly create poolers for a known (N_c, N_d) combo.
+
+        Call once per expected combo BEFORE ``configure_optimizers`` runs so
+        that the new params are picked up by the optimizer's param_groups.
+        """
+        key = f"{N_c}_{N_d}"
+        if key in self._content_poolers:
+            return
+        self._content_poolers[key] = SlotPooler(
+            N_c, self.dim, self._num_heads, self._num_slot_layers)
+        self._detail_poolers[key]  = SlotPooler(
+            N_d, self.dim, self._num_heads, self._num_slot_layers)
+
     def _get_poolers(self, N_c: int, N_d: int) -> Tuple[SlotPooler, SlotPooler]:
         key = f"{N_c}_{N_d}"
         if key not in self._content_poolers:
-            self._content_poolers[key] = SlotPooler(
-                N_c, self.dim, self._num_heads, self._num_slot_layers)
-            self._detail_poolers[key] = SlotPooler(
-                N_d, self.dim, self._num_heads, self._num_slot_layers)
+            import warnings
+            warnings.warn(
+                f"ContentDetailSplit: lazy pooler creation for "
+                f"(N_c={N_c}, N_d={N_d}); their params are NOT in the "
+                f"optimizer and will stay at random init. Call "
+                f"prepare_poolers() in setup() before configure_optimizers().",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.prepare_poolers(N_c, N_d)
         return self._content_poolers[key], self._detail_poolers[key]
 
     def forward(

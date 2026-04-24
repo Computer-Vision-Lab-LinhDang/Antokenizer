@@ -11,7 +11,7 @@ trainer:
   precision: bf16-mixed
   accumulate_grad_batches: 1
   log_every_n_steps: 100
-  val_check_interval: 1
+  val_check_interval: 2000   # validate every 2000 train batches (was 1 = every step)
   enable_checkpointing: true
   strategy:
     class_path: lightning.pytorch.strategies.DDPStrategy

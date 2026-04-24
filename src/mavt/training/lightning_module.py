@@ -98,11 +98,44 @@ class MAVTLightningModule(L.LightningModule):
         hp = self.hparams
         if stage != 'fit':
             return
+        # Eager slot pooler creation — must run BEFORE configure_optimizers
+        # so the new params land in the optimizer's param_groups.
+        self._prepare_cd_split_poolers()
         if hp.init_siglip2:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
             self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
         if hp.use_semantic_distill and self.semantic_teacher is None:
             self._load_semantic_teacher(hp.siglip2_model_name)
+
+    def _prepare_cd_split_poolers(self) -> None:
+        """Read active modality + resolution from the attached DataModule and
+        eagerly create every SlotPooler the trainer will need."""
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None or not hasattr(dm, 'hparams'):
+            return
+        dm_hp = dm.hparams
+        active = getattr(dm_hp, 'active_modalities', None) or []
+        specs = []
+        for modality in active:
+            if modality == 'image':
+                specs.append({
+                    'modality': 'image',
+                    'resolution': dm_hp.image_resolution,
+                })
+            elif modality == 'video':
+                specs.append({
+                    'modality': 'video',
+                    'resolution': dm_hp.video_resolution,
+                    'frames':     dm_hp.video_frames,
+                    't_patch':    self.hparams.t_patch,
+                })
+            elif modality == 'threed':
+                specs.append({
+                    'modality': 'threed',
+                    'resolution': dm_hp.triplane_res,
+                })
+        if specs:
+            self.model.prepare_for_modalities(specs)
 
     def _load_semantic_teacher(self, model_name: str) -> None:
         """Load frozen SigLIP2 vision tower as teacher for cosine distillation."""
@@ -138,9 +171,23 @@ class MAVTLightningModule(L.LightningModule):
                 del state[k]
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Teacher is reloaded fresh in setup(); ignore missing keys on load."""
-        # No-op: setup() handles teacher (re)load before state_dict apply.
-        return
+        """Inject the freshly-loaded teacher's params back into the checkpoint
+        state_dict so Lightning's strict load does not fail with missing keys.
+
+        Order at training-resume time:
+          1. setup('fit')               → teacher loaded from HF (deterministic)
+          2. on_load_checkpoint(ckpt)   → we inject teacher keys here
+          3. self.load_state_dict(ckpt) → strict=True now sees a complete dict
+
+        Teacher weights are deterministic from the HF model name, so injecting
+        the current values is equivalent to whatever the checkpoint would have
+        contained — no behavior change, only avoids the strict-load error.
+        """
+        if self.semantic_teacher is None:
+            return
+        sd = checkpoint.setdefault('state_dict', {})
+        for k, v in self.semantic_teacher.state_dict().items():
+            sd.setdefault(f'semantic_teacher.{k}', v)
 
     # ------------------------------------------------------------------ #
     #  Training step                                                       #

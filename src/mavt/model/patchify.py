@@ -36,9 +36,22 @@ class PatchifyEncoder(nn.Module):
 
     A single Conv3d handles all modalities. Images are temporally padded so the
     Conv3d output is numerically equivalent to a Conv2d (causal zero-pad).
+
+    A learned 4D position embedding is added to every token before it leaves
+    this module — without it the downstream self-attention blocks are
+    permutation-invariant and cannot recover spatial / temporal layout.
     """
 
-    def __init__(self, embed_dim: int = 1152, patch_size: int = 16, t_patch: int = 2):
+    def __init__(
+        self,
+        embed_dim: int = 1152,
+        patch_size: int = 16,
+        t_patch: int = 2,
+        max_t: int = 16,
+        max_x: int = 64,
+        max_y: int = 64,
+        max_z: int = 64,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.patch_size = patch_size
@@ -53,6 +66,10 @@ class PatchifyEncoder(nn.Module):
         nn.init.xavier_uniform_(self.proj.weight.reshape(embed_dim, -1).T
                                  .reshape(self.proj.weight.shape))
         nn.init.zeros_(self.proj.bias)
+
+        self.pos_embed = FourDPositionEmbedding(
+            embed_dim, max_t=max_t, max_x=max_x, max_y=max_y, max_z=max_z,
+        )
 
     # ------------------------------------------------------------------ #
     #  Position grid helpers                                               #
@@ -100,6 +117,7 @@ class PatchifyEncoder(nn.Module):
         B, D = out.shape[0], out.shape[1]
         tokens = out.permute(0, 2, 3, 4, 1).reshape(B, Hp * Wp, D)
         pos = self._image_positions(Hp, Wp, x.device)
+        tokens = tokens + self.pos_embed(pos).unsqueeze(0)
         plane_ids = torch.full((Hp * Wp,), -1, dtype=torch.long, device=x.device)
         return tokens, pos, plane_ids
 
@@ -109,6 +127,7 @@ class PatchifyEncoder(nn.Module):
         B, D, Tp, Hp, Wp = out.shape
         tokens = out.permute(0, 2, 3, 4, 1).reshape(B, Tp * Hp * Wp, D)
         pos = self._video_positions(Tp, Hp, Wp, x.device)
+        tokens = tokens + self.pos_embed(pos).unsqueeze(0)
         plane_ids = torch.full((Tp * Hp * Wp,), -1, dtype=torch.long, device=x.device)
         return tokens, pos, plane_ids
 
@@ -152,6 +171,7 @@ class PatchifyEncoder(nn.Module):
         ])  # (3*Np,)
 
         tokens = torch.cat([tok_xy, tok_xz, tok_yz], dim=1)  # (B, 3*Np, D)
+        tokens = tokens + self.pos_embed(positions).unsqueeze(0)
         return tokens, positions, plane_ids
 
     def forward(self, x: torch.Tensor, modality: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -12,7 +12,7 @@ Unified 7-stage pipeline:
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -184,3 +184,46 @@ class MAVT(nn.Module):
     def load_siglip2_weights(self, model_name: str = "google/siglip2-base-patch16-224",
                               freeze_stages: int = 10) -> None:
         self.backbone.load_siglip2_weights(model_name, freeze_stages)
+
+    # ------------------------------------------------------------------ #
+    #  Eager pre-creation of slot poolers                                 #
+    # ------------------------------------------------------------------ #
+
+    def prepare_for_modalities(self, specs: Iterable[Dict[str, Any]]) -> None:
+        """Pre-create every SlotPooler the trainer will need.
+
+        Must be called BEFORE the optimizer is built (e.g. from
+        LightningModule.setup) so the pooler params are picked up by the
+        optimizer's param_groups. Without this, poolers are created lazily
+        in ContentDetailSplit.forward and their parameters never receive
+        gradient updates.
+
+        Each spec dict has key 'modality' plus modality-specific shape keys:
+            image  : {'modality': 'image',  'resolution': H}
+            video  : {'modality': 'video',  'resolution': H, 'frames': T,
+                      't_patch': 2}                # t_patch optional
+            threed : {'modality': 'threed', 'resolution': S}
+        """
+        for spec in specs:
+            modality = spec['modality']
+            if modality == 'image':
+                H = spec['resolution']
+                Hp = H // self.patch_size
+                N  = Hp * Hp
+            elif modality == 'video':
+                H  = spec['resolution']
+                T  = spec['frames']
+                tp = spec.get('t_patch', 2)
+                Tp = T // tp
+                Hp = H // self.patch_size
+                N  = Tp * Hp * Hp
+            elif modality == 'threed':
+                S  = spec['resolution']
+                Sp = S // self.patch_size
+                N  = 3 * Sp * Sp                  # 3 planes
+            else:
+                raise ValueError(f"Unknown modality in spec: {modality!r}")
+            c_r, d_r = _MODALITY_RATIOS[modality]
+            N_c = max(1, int(N * c_r))
+            N_d = max(1, int(N * d_r))
+            self.cd_split.prepare_poolers(N_c, N_d)

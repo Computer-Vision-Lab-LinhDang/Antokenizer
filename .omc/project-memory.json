@@ -85,8 +85,32 @@
   "hotPaths": [
     {
       "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 6,
-      "lastAccessed": 1777019839339,
+      "accessCount": 8,
+      "lastAccessed": 1777022557312,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/patchify.py",
+      "accessCount": 4,
+      "lastAccessed": 1777021897353,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 4,
+      "lastAccessed": 1777022834160,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage2_universal.yaml",
+      "accessCount": 4,
+      "lastAccessed": 1777022851651,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage3_universal.yaml",
+      "accessCount": 4,
+      "lastAccessed": 1777022856642,
       "type": "file"
     },
     {
@@ -96,27 +120,21 @@
       "type": "file"
     },
     {
-      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "path": "src/mavt/model/mavt.py",
       "accessCount": 3,
-      "lastAccessed": 1777019890835,
-      "type": "file"
-    },
-    {
-      "path": "configs/train/universal_data/stage2_universal.yaml",
-      "accessCount": 3,
-      "lastAccessed": 1777019928294,
-      "type": "file"
-    },
-    {
-      "path": "configs/train/universal_data/stage3_universal.yaml",
-      "accessCount": 3,
-      "lastAccessed": 1777019960695,
+      "lastAccessed": 1777022064846,
       "type": "file"
     },
     {
       "path": "README.md",
       "accessCount": 2,
       "lastAccessed": 1777018549894,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/content_detail_split.py",
+      "accessCount": 2,
+      "lastAccessed": 1777021998631,
       "type": "file"
     },
     {
@@ -129,12 +147,6 @@
       "path": "configs/model/mavt_base.yaml",
       "accessCount": 1,
       "lastAccessed": 1777017297301,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/model/mavt.py",
-      "accessCount": 1,
-      "lastAccessed": 1777017301853,
       "type": "file"
     },
     {
@@ -156,12 +168,6 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/model/patchify.py",
-      "accessCount": 1,
-      "lastAccessed": 1777017987553,
-      "type": "file"
-    },
-    {
       "path": "src/mavt/model/decoder.py",
       "accessCount": 1,
       "lastAccessed": 1777017988197,
@@ -171,12 +177,6 @@
       "path": "src/mavt/model/latent_heads.py",
       "accessCount": 1,
       "lastAccessed": 1777017988674,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/model/content_detail_split.py",
-      "accessCount": 1,
-      "lastAccessed": 1777017989034,
       "type": "file"
     },
     {
@@ -201,6 +201,18 @@
       "path": "src/mavt/losses/__init__.py",
       "accessCount": 1,
       "lastAccessed": 1777019528737,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/transformer.py",
+      "accessCount": 1,
+      "lastAccessed": 1777021471186,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/rgat.py",
+      "accessCount": 1,
+      "lastAccessed": 1777021471516,
       "type": "file"
     }
   ],
