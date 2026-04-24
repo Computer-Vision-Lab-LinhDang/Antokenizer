@@ -60,6 +60,7 @@ model:
   siglip2_model_name: google/siglip2-base-patch16-224
   w_l1: 1.0
   w_lpips: 0.1
+  w_kl: 1e-4
   w_clip: 0.0
   w_sem: 0.3
   w_aux: 0.01
