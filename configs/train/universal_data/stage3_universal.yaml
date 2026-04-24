@@ -21,12 +21,31 @@ trainer:
       gradient_as_bucket_view: true
   use_distributed_sampler: false   # ModalityGroupedBatchSampler handles DDP distribution
   callbacks:
+    # Best balanced — total weighted loss (recon + KL + sem + aux)
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: checkpoints/stage3
-        filename: mavt-stage3-{step:07d}-{val/loss:.4f}
-        save_top_k: 3
+        dirpath: checkpoints/stage3/balanced
+        filename: mavt-stage3-balanced-{step:07d}-{val/loss:.4f}
+        save_top_k: 1
         monitor: val/loss
+        mode: min
+        every_n_train_steps: 2500
+    # Best reconstruction — pixel L1 + LPIPS only (no KL / sem)
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage3/recon
+        filename: mavt-stage3-recon-{step:07d}-{val/loss_recon:.4f}
+        save_top_k: 1
+        monitor: val/loss_recon
+        mode: min
+        every_n_train_steps: 2500
+    # Best understanding — cosine distance to frozen vision teacher
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage3/sem
+        filename: mavt-stage3-sem-{step:07d}-{val/loss_sem:.4f}
+        save_top_k: 1
+        monitor: val/loss_sem
         mode: min
         every_n_train_steps: 2500
     - class_path: lightning.pytorch.callbacks.LearningRateMonitor

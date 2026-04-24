@@ -20,8 +20,8 @@ import torch.nn as nn
 from mavt.model.patchify import PatchifyEncoder
 from mavt.model.backbone import HybridBackbone
 from mavt.model.content_detail_split import ContentDetailSplit
-from mavt.model.latent_heads import VAEHead, SemanticHead
-from mavt.model.decoder import AsymmetricDecoder
+from mavt.model.latent_heads import VAEHead
+from mavt.model.decoder import AsymmetricDecoder, UnderstandingDecoder
 
 
 # Compression ratios per modality (content, detail)
@@ -96,14 +96,20 @@ class MAVT(nn.Module):
         self.cd_split = ContentDetailSplit(
             dim=embed_dim, num_heads=num_slot_heads, num_slot_layers=num_slot_layers)
 
-        # Stage 4
-        self.vae_head      = VAEHead(embed_dim, latent_dim, kl_weight)
-        self.semantic_head = SemanticHead(embed_dim, semantic_dim)
+        # Stage 4 — VAE bottleneck only (semantic moved downstream of z)
+        self.vae_head = VAEHead(embed_dim, latent_dim, kl_weight)
 
-        # Stage 5
+        # Stage 5 — two heads decoding from the shared latent z
+        # 5a. Reconstruction head: z → pixel
         self.decoder = AsymmetricDecoder(
             latent_dim=latent_dim, dec_dim=dec_dim,
             num_attn_blocks=num_dec_attn_blocks, num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+        )
+        # 5b. Understanding head: z → semantic vector aligned with vision teacher
+        self.understanding_decoder = UnderstandingDecoder(
+            latent_dim=latent_dim, dec_dim=dec_dim,
+            semantic_dim=semantic_dim, num_heads=8, num_layers=2,
             mlp_ratio=mlp_ratio,
         )
 
@@ -154,13 +160,14 @@ class MAVT(nn.Module):
             features, content_ratio, detail_ratio
         )  # (B, N_c + N_d, D)
 
-        # Stage 4a — VAE head
+        # Stage 4 — VAE bottleneck (semantic now derives from z, not compressed)
         z, mu, logvar, loss_kl = self.vae_head(compressed)
 
-        # Stage 4b — Semantic head
-        semantic = self.semantic_head(compressed)
+        # Stage 5a — Understanding head: z → semantic
+        # Always run (cheap, gives semantic supervision signal even when decode=False)
+        semantic = self.understanding_decoder(z)
 
-        # Stage 5 — Decoder
+        # Stage 5b — Reconstruction head: z → pixel
         if decode:
             recon = self.decoder(z, positions, modality, grid_shape)
         else:

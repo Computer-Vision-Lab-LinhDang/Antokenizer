@@ -1,7 +1,14 @@
-"""Stage 5: Modality-specific decoder.
+"""Stage 5: Two decoder heads on the shared latent z.
 
-UnifiedDetailExpander   — cross-attends from target positions into z
-AsymmetricDecoder       — 4 self-attention blocks + 4-stage PixelShuffle CNN (16×)
+  AsymmetricDecoder     — z → pixel reconstruction (recon head)
+  UnderstandingDecoder  — z → semantic vector aligned with vision teacher
+                          (understanding head)
+
+Both heads sit downstream of z so the latent must preserve enough information
+for pixel-faithful reconstruction AND semantic alignment simultaneously.
+
+UnifiedDetailExpander    — cross-attends from target positions into z
+PixelShuffleCNNDecoder   — 4-stage PixelShuffle CNN (16× spatial upsample)
 """
 
 from __future__ import annotations
@@ -211,3 +218,60 @@ class AsymmetricDecoder(nn.Module):
 
         else:
             raise ValueError(f"Unknown modality: {modality}")
+
+
+# --------------------------------------------------------------------------- #
+#  UnderstandingDecoder                                                         #
+# --------------------------------------------------------------------------- #
+
+class UnderstandingDecoder(nn.Module):
+    """Decode latent z → global semantic vector aligned with vision teacher.
+
+    Mirror of AsymmetricDecoder but for the understanding output. Operating on
+    z (the bottleneck) — not on the encoder's pre-VAE features — forces the
+    latent to preserve enough semantic information to recover a SigLIP-aligned
+    representation. This is the "understanding head" of the unified tokenizer.
+
+    Architecture:
+        z (B, Nz, latent_dim)
+          → Linear(latent_dim → dec_dim) + LayerNorm
+          → N self-attention blocks (refine token interactions)
+          → attention pool with single learnable query → (B, dec_dim)
+          → LayerNorm + Linear(dec_dim → semantic_dim)
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        dec_dim: int = 768,
+        semantic_dim: int = 768,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        self.in_proj = nn.Linear(latent_dim, dec_dim)
+        self.norm_in = nn.LayerNorm(dec_dim)
+
+        self.self_attn_blocks = nn.ModuleList([
+            StandardTransformerBlock(dec_dim, num_heads, mlp_ratio)
+            for _ in range(num_layers)
+        ])
+
+        self.query = nn.Parameter(torch.randn(1, 1, dec_dim) * (dec_dim ** -0.5))
+        self.pool = nn.MultiheadAttention(
+            embed_dim=dec_dim, num_heads=num_heads,
+            batch_first=True, bias=True,
+        )
+        self.norm_out = nn.LayerNorm(dec_dim)
+        self.proj = nn.Linear(dec_dim, semantic_dim)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, Nz, latent_dim) → semantic: (B, semantic_dim)"""
+        x = self.norm_in(self.in_proj(z))
+        for blk in self.self_attn_blocks:
+            x = blk(x)
+        B = x.shape[0]
+        q = self.query.expand(B, 1, -1)
+        pooled, _ = self.pool(q, x, x)
+        return self.proj(self.norm_out(pooled.squeeze(1)))
