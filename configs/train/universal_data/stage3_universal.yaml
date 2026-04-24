@@ -36,11 +36,13 @@ trainer:
 
 model:
   training_stage: 3
-  init_siglip2: false
+  init_siglip2: true
+  use_semantic_distill: true
   siglip2_model_name: google/siglip2-base-patch16-224
   w_l1: 1.0
   w_lpips: 0.1
   w_clip: 0.0
+  w_sem: 0.2
   w_aux: 0.01
   use_lpips: true
   use_clip: false

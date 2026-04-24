@@ -1,0 +1,208 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1777016902795,
+  "projectRoot": "/Users/nguyenbinhan/Workspace/AToken/atoken",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts",
+      "src"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "configs": {
+      "path": "configs",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777016902766,
+      "keyFiles": []
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 2,
+      "lastAccessed": 1777016902767,
+      "keyFiles": [
+        "download_objaverse.py",
+        "glb_to_tripplane.py"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 0,
+      "lastAccessed": 1777016902768,
+      "keyFiles": []
+    },
+    "train": {
+      "path": "train",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777016902781,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/mavt/training/lightning_module.py",
+      "accessCount": 6,
+      "lastAccessed": 1777019839339,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/losses/losses.py",
+      "accessCount": 3,
+      "lastAccessed": 1777019612927,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1777019890835,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage2_universal.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1777019928294,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage3_universal.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1777019960695,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 2,
+      "lastAccessed": 1777018549894,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/stage1_image.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1776874072699,
+      "type": "file"
+    },
+    {
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1777017297301,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/mavt.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017301853,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/data/datamodule.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017302641,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/data/datasets.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017302848,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/backbone.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017987108,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/patchify.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017987553,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/decoder.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017988197,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/latent_heads.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017988674,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/content_detail_split.py",
+      "accessCount": 1,
+      "lastAccessed": 1777017989034,
+      "type": "file"
+    },
+    {
+      "path": "evaluate.py",
+      "accessCount": 1,
+      "lastAccessed": 1777018550243,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1777018551150,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/training/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1777019528228,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/losses/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1777019528737,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"python3 -c \\\"\\nimport ast, sys\\nfor f in [\\n    'src/mavt/losses/losses.py',\\n    'src/mavt/training/lightning_module.py',\\n    'src/mavt/model/mavt.py',\\n]:\\n    src = open(f).read()\\n   ...",
+  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 15, in <module>\n    import yaml\nModuleNotFoundError: No module named 'yaml'\nOK syntax: src/mavt/losses/losses.py\nOK syntax: src/mavt/training/lightning_module.py\nOK syntax: src/mavt/model/mavt.py",
+  "timestamp": "2026-04-24T08:39:40.064Z",
+  "retry_count": 2
+}

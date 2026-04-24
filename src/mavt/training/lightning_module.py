@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import lightning as L
 from lightning.pytorch.utilities import grad_norm
 
@@ -23,6 +24,7 @@ from mavt.losses.losses import MAVTLoss
 
 _STAGE_LR = {1: 1e-4, 2: 5e-5, 3: 2e-5}
 _STAGE_SIGLIP2_FROZEN_BLOCKS = {1: 10, 2: 6, 3: 0}  # number of transformer blocks frozen
+_STAGE_W_SEM = {1: 0.5, 2: 0.3, 3: 0.2}             # default cosine-distill weight per stage
 
 
 class MAVTLightningModule(L.LightningModule):
@@ -49,14 +51,16 @@ class MAVTLightningModule(L.LightningModule):
         # Loss
         w_l1: float = 1.0,
         w_lpips: float = 0.1,
-        w_clip: float = 0.1,
+        w_clip: float = 0.0,
+        w_sem: float = 0.0,
         w_aux: float = 0.01,
         use_lpips: bool = True,
         use_clip: bool = False,
         # Curriculum
         training_stage: int = 1,
         siglip2_model_name: str = "google/siglip2-base-patch16-224",
-        init_siglip2: bool = False,
+        init_siglip2: bool = True,
+        use_semantic_distill: bool = False,
         # Optimiser
         weight_decay: float = 0.01,
         grad_clip: float = 1.0,
@@ -78,9 +82,13 @@ class MAVTLightningModule(L.LightningModule):
 
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=1.0,
-            w_clip=w_clip, w_aux=w_aux,
+            w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
             use_lpips=use_lpips, use_clip=use_clip,
         )
+
+        # Frozen vision teacher (loaded lazily in setup() to keep __init__ light)
+        self.semantic_teacher: Optional[nn.Module] = None
+        self._teacher_image_size: int = 224
 
     # ------------------------------------------------------------------ #
     #  Setup                                                               #
@@ -88,9 +96,51 @@ class MAVTLightningModule(L.LightningModule):
 
     def setup(self, stage: str) -> None:
         hp = self.hparams
-        if hp.init_siglip2 and stage == 'fit':
+        if stage != 'fit':
+            return
+        if hp.init_siglip2:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
             self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
+        if hp.use_semantic_distill and self.semantic_teacher is None:
+            self._load_semantic_teacher(hp.siglip2_model_name)
+
+    def _load_semantic_teacher(self, model_name: str) -> None:
+        """Load frozen SigLIP2 vision tower as teacher for cosine distillation."""
+        try:
+            from transformers import AutoModel
+            siglip = AutoModel.from_pretrained(model_name)
+            teacher = siglip.vision_model
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+            teacher.eval()
+            self.semantic_teacher = teacher
+            try:
+                self._teacher_image_size = int(siglip.config.vision_config.image_size)
+            except AttributeError:
+                self._teacher_image_size = 224
+        except Exception as exc:  # noqa: BLE001
+            print(f"[lightning_module] semantic teacher load failed ({exc}); "
+                  f"distillation disabled this run")
+            self.semantic_teacher = None
+
+    def train(self, mode: bool = True):  # type: ignore[override]
+        """Keep frozen teacher in eval mode regardless of train()/eval() calls."""
+        super().train(mode)
+        if self.semantic_teacher is not None:
+            self.semantic_teacher.eval()
+        return self
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Strip frozen teacher weights from checkpoints to keep them small."""
+        state = checkpoint.get('state_dict', {})
+        for k in list(state.keys()):
+            if k.startswith('semantic_teacher.'):
+                del state[k]
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Teacher is reloaded fresh in setup(); ignore missing keys on load."""
+        # No-op: setup() handles teacher (re)load before state_dict apply.
+        return
 
     # ------------------------------------------------------------------ #
     #  Training step                                                       #
@@ -110,12 +160,21 @@ class MAVTLightningModule(L.LightningModule):
         else:
             target = x  # image and threed pass through as-is
 
+        # Vision-vision distillation: forward x_proxy through frozen teacher.
+        teacher_embed: Optional[torch.Tensor] = None
+        if self.semantic_teacher is not None:
+            with torch.no_grad():
+                proxy = self._make_teacher_input(x, modality, self._teacher_image_size)
+                teacher_embed = self.semantic_teacher(pixel_values=proxy).pooler_output
+
         losses = self.loss_fn(
             pred=out.reconstruction,
             target=target,
             loss_kl=out.loss_kl,
             slot_diversity=out.cd_metrics['slot_diversity'],
             modality=modality,
+            semantic_embed=out.semantic,
+            teacher_embed=teacher_embed,
         )
 
         # Logging
@@ -139,6 +198,37 @@ class MAVTLightningModule(L.LightningModule):
             # Log sample reconstructions to wandb/tensorboard every N steps
             if batch_idx == 0:
                 self._log_images(batch)
+
+    # ------------------------------------------------------------------ #
+    #  Teacher input proxy                                                 #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _make_teacher_input(x: torch.Tensor, modality: str,
+                            target_size: int) -> torch.Tensor:
+        """Project the multi-modal input down to a single (B, 3, S, S) image
+        the SigLIP2 vision teacher can consume.
+
+        image  : x as-is.
+        video  : middle frame.
+        threed : XY plane (front view, closest to natural-image distribution).
+        """
+        if modality == 'image':
+            proxy = x
+        elif modality == 'video':
+            T = x.shape[2]
+            proxy = x[:, :, T // 2]                # (B, 3, H, W)
+        elif modality == 'threed':
+            proxy = x[:, 0]                         # (B, 3, H, W) plane XY
+        else:
+            raise ValueError(f"Unknown modality: {modality}")
+
+        if proxy.shape[-1] != target_size or proxy.shape[-2] != target_size:
+            proxy = F.interpolate(
+                proxy, size=(target_size, target_size),
+                mode='bilinear', align_corners=False,
+            )
+        return proxy
 
     # ------------------------------------------------------------------ #
     #  Visualisation                                                       #

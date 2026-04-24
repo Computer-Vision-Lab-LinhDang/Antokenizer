@@ -47,7 +47,7 @@ class LPIPSLoss(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-#  InfoNCE / SigLIP-style contrastive loss                                     #
+#  InfoNCE / SigLIP-style contrastive loss (kept for optional text alignment)  #
 # --------------------------------------------------------------------------- #
 
 def infonce_loss(
@@ -61,6 +61,20 @@ def infonce_loss(
     labels = torch.arange(logits.size(0), device=a.device)
     loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
     return loss
+
+
+# --------------------------------------------------------------------------- #
+#  Vision-vision cosine distillation loss                                       #
+# --------------------------------------------------------------------------- #
+
+def cosine_distill_loss(
+    student: torch.Tensor,   # (B, D)
+    teacher: torch.Tensor,   # (B, D) — frozen vision teacher (e.g. SigLIP2)
+) -> torch.Tensor:
+    """1 - mean cosine similarity. Teacher is detached (no gradient flows back)."""
+    s = F.normalize(student, dim=-1)
+    t = F.normalize(teacher.detach(), dim=-1)
+    return (1.0 - (s * t).sum(dim=-1)).mean()
 
 
 # --------------------------------------------------------------------------- #
@@ -106,14 +120,21 @@ class ModalityEMAWeighter(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class MAVTLoss(nn.Module):
-    """Combines all losses with configurable weights."""
+    """Combines all losses with configurable weights.
+
+    Default training signal for unified tokenizer:
+        recon (L1 + LPIPS) + KL + vision-vision distillation + slot diversity.
+
+    InfoNCE/text branch is retained but disabled by default (use_clip=False).
+    """
 
     def __init__(
         self,
         w_l1: float   = 1.0,
         w_lpips: float = 0.1,
         w_kl: float   = 1e-4,   # already baked into VAEHead; set 1.0 here
-        w_clip: float = 0.1,
+        w_clip: float = 0.0,    # InfoNCE(visual, text) — off by default
+        w_sem: float  = 0.5,    # cosine distill from frozen vision teacher
         w_aux: float  = 0.01,
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
@@ -123,6 +144,7 @@ class MAVTLoss(nn.Module):
         self.w_lpips = w_lpips
         self.w_kl   = w_kl
         self.w_clip = w_clip
+        self.w_sem  = w_sem
         self.w_aux  = w_aux
         self.use_clip = use_clip
 
@@ -138,6 +160,7 @@ class MAVTLoss(nn.Module):
         modality: str,
         semantic_embed: Optional[torch.Tensor] = None,
         text_embed: Optional[torch.Tensor] = None,
+        teacher_embed: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
 
         # Reconstruction
@@ -149,10 +172,15 @@ class MAVTLoss(nn.Module):
         mod_w = self.ema_weighter.weight(modality).to(pred.device)
         self.ema_weighter.update(modality, l_recon)
 
-        # CLIP contrastive
+        # CLIP contrastive (legacy text path — off by default)
         l_clip = torch.tensor(0.0, device=pred.device)
         if self.use_clip and semantic_embed is not None and text_embed is not None:
             l_clip = infonce_loss(semantic_embed, text_embed)
+
+        # Vision-vision distillation (default semantic supervision)
+        l_sem = torch.tensor(0.0, device=pred.device)
+        if self.w_sem > 0.0 and semantic_embed is not None and teacher_embed is not None:
+            l_sem = cosine_distill_loss(semantic_embed, teacher_embed)
 
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
@@ -161,6 +189,7 @@ class MAVTLoss(nn.Module):
             mod_w * l_recon
             + self.w_kl * loss_kl
             + self.w_clip * l_clip
+            + self.w_sem * l_sem
             + self.w_aux * l_div
         )
 
@@ -171,5 +200,6 @@ class MAVTLoss(nn.Module):
             'loss_lpips': lpips_val,
             'loss_kl':    loss_kl,
             'loss_clip':  l_clip,
+            'loss_sem':   l_sem,
             'loss_div':   l_div,
         }
