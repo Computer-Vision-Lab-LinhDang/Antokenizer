@@ -77,3 +77,5 @@ data:
   batch_size: 32
   num_workers: 8
   pin_memory: true
+  val_split: 0.1
+  test_split: 0.1

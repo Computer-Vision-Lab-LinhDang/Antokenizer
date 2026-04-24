@@ -81,3 +81,5 @@ data:
   batch_size: 16       # reduced vs stage 1 due to video memory cost
   num_workers: 8
   pin_memory: true
+  val_split: 0.1
+  test_split: 0.1

@@ -6,7 +6,7 @@ import random
 from typing import Dict, Iterator, List, Optional
 
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, random_split
 import lightning as L
 
 from mavt.data.datasets import (
@@ -126,6 +126,9 @@ class MAVTDataModule(L.LightningDataModule):
         triplane_res: int = 256,
         # Synthetic (smoke test)
         synthetic_n: int = 64,
+        # Train/val/test split
+        val_split: float = 0.05,
+        test_split: float = 0.0,
         # DataLoader params
         batch_size: int = 8,
         num_workers: int = 4,
@@ -160,16 +163,35 @@ class MAVTDataModule(L.LightningDataModule):
     # ------------------------------------------------------------------ #
 
     def setup(self, stage: Optional[str] = None) -> None:
-        datasets = [self._make_dataset(m) for m in self.hparams.active_modalities]
-        if len(datasets) == 1:
-            self._train_ds: Dataset = datasets[0]
+        hp = self.hparams
+        full_datasets = [self._make_dataset(m) for m in hp.active_modalities]
+
+        train_splits, val_splits, test_splits = [], [], []
+        for ds in full_datasets:
+            n = len(ds)
+            n_val = max(1, int(n * hp.val_split))
+            n_test = max(1, int(n * hp.test_split)) if hp.test_split > 0 else 0
+            n_train = n - n_val - n_test
+            parts = random_split(ds, [n_train, n_val, n_test]) if n_test else random_split(ds, [n_train, n_val])
+            train_splits.append(parts[0])
+            val_splits.append(parts[1])
+            if n_test:
+                test_splits.append(parts[2])
+
+        if len(train_splits) == 1:
+            self._train_ds: Dataset = train_splits[0]
             self._batch_sampler = None
         else:
-            self._train_ds = ConcatDataset(datasets)
+            self._train_ds = ConcatDataset(train_splits)
             self._batch_sampler = ModalityGroupedBatchSampler(
-                self._train_ds, self.hparams.batch_size,
+                self._train_ds, hp.batch_size,
                 drop_last=True, shuffle=True,
             )
+
+        self._val_ds: Dataset = val_splits[0] if len(val_splits) == 1 else ConcatDataset(val_splits)
+        self._test_ds: Optional[Dataset] = (
+            test_splits[0] if len(test_splits) == 1 else ConcatDataset(test_splits)
+        ) if test_splits else None
 
     def train_dataloader(self) -> DataLoader:
         hp = self.hparams
@@ -192,11 +214,19 @@ class MAVTDataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self) -> DataLoader:
-        val_ds = SyntheticMultiModalDataset(
-            16, self.hparams.active_modalities[0],
-            self.hparams.image_resolution,
-        )
+        hp = self.hparams
         return DataLoader(
-            val_ds, batch_size=4, shuffle=False,
-            num_workers=2, collate_fn=_collate,
+            self._val_ds, batch_size=hp.batch_size, shuffle=False,
+            num_workers=hp.num_workers, pin_memory=hp.pin_memory,
+            collate_fn=_collate, drop_last=False,
+        )
+
+    def test_dataloader(self) -> Optional[DataLoader]:
+        if self._test_ds is None:
+            return None
+        hp = self.hparams
+        return DataLoader(
+            self._test_ds, batch_size=hp.batch_size, shuffle=False,
+            num_workers=hp.num_workers, pin_memory=hp.pin_memory,
+            collate_fn=_collate, drop_last=False,
         )
