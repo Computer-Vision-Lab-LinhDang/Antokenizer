@@ -221,3 +221,4 @@ datasets/
 .objaverse/
 tripplane_images/
 lightning_logs/
+dataset/
