@@ -83,3 +83,5 @@ data:
   batch_size: 8        # reduced further due to 3D triplane cost
   num_workers: 8
   pin_memory: true
+  val_split: 0.1
+  test_split: 0.1
