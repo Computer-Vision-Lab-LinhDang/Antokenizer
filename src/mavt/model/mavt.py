@@ -4,15 +4,15 @@ Unified 7-stage pipeline:
   1. Patchify (Conv3d, modality-specific)
   2. Hybrid Transformer-RGAT Backbone (12 blocks)
   3. Content-Detail Split (slot attention)
-  4. Dual Latent Projection (VAE + Semantic)
-  5. Modality-Specific Decoder
+  4. VAE Latent Projection
+  5. Dual Latent Readout (Reconstruction + MRL Understanding)
   6. Losses (handled by LightningModule)
   7. Outputs
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,6 +39,7 @@ class MAVTOutput:
     mu: torch.Tensor
     logvar: torch.Tensor
     semantic: torch.Tensor             # (B, semantic_dim)
+    semantic_mrl: Dict[int, torch.Tensor]  # prefix_dim -> (B, semantic_dim)
     loss_kl: torch.Tensor
     cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
 
@@ -64,6 +65,7 @@ class MAVT(nn.Module):
         kl_weight: float = 1e-4,
         # Semantic
         semantic_dim: int = 768,
+        mrl_prefixes: Optional[Sequence[int]] = None,
         # Decoder
         dec_dim: int = 768,
         num_dec_attn_blocks: int = 4,
@@ -80,6 +82,7 @@ class MAVT(nn.Module):
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
         self.patch_size = patch_size
+        self.mrl_prefixes = self._normalise_mrl_prefixes(mrl_prefixes, latent_dim)
 
         # Stage 1
         self.patchify = PatchifyEncoder(embed_dim, patch_size, t_patch)
@@ -116,6 +119,27 @@ class MAVT(nn.Module):
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _normalise_mrl_prefixes(
+        prefixes: Optional[Sequence[int]],
+        latent_dim: int,
+    ) -> Tuple[int, ...]:
+        """Validate MRL prefixes and always include the full latent width."""
+        if prefixes is None:
+            return (latent_dim,)
+
+        cleaned = sorted({int(p) for p in prefixes})
+        if not cleaned:
+            return (latent_dim,)
+        invalid = [p for p in cleaned if p <= 0 or p > latent_dim]
+        if invalid:
+            raise ValueError(
+                f"mrl_prefixes must be in [1, latent_dim={latent_dim}], got {invalid}"
+            )
+        if latent_dim not in cleaned:
+            cleaned.append(latent_dim)
+        return tuple(cleaned)
 
     def _grid_shape(self, modality: str, x: torch.Tensor) -> tuple:
         """Return (H_grid, W_grid) or (Tp, Hg, Wg) based on input shape."""
@@ -163,9 +187,10 @@ class MAVT(nn.Module):
         # Stage 4 — VAE bottleneck (semantic now derives from z, not compressed)
         z, mu, logvar, loss_kl = self.vae_head(compressed)
 
-        # Stage 5a — Understanding head: z → semantic
+        # Stage 5a — Understanding head: MRL prefixes of z → semantic
         # Always run (cheap, gives semantic supervision signal even when decode=False)
-        semantic = self.understanding_decoder(z)
+        semantic_mrl = self.understanding_decoder.forward_mrl(z, self.mrl_prefixes)
+        semantic = semantic_mrl[self.latent_dim]
 
         # Stage 5b — Reconstruction head: z → pixel
         if decode:
@@ -179,6 +204,7 @@ class MAVT(nn.Module):
             mu=mu,
             logvar=logvar,
             semantic=semantic,
+            semantic_mrl=semantic_mrl,
             loss_kl=loss_kl,
             cd_metrics=cd_metrics,
         )

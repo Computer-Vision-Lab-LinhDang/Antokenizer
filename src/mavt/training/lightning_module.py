@@ -41,6 +41,7 @@ class MAVTLightningModule(L.LightningModule):
         latent_dim: int = 32,
         kl_weight: float = 1e-4,
         semantic_dim: int = 768,
+        mrl_prefixes: Optional[list[int]] = None,
         dec_dim: int = 768,
         num_dec_attn_blocks: int = 4,
         r_s: int = 2,
@@ -75,7 +76,7 @@ class MAVTLightningModule(L.LightningModule):
             embed_dim=embed_dim, num_heads=num_heads, num_blocks=num_blocks,
             patch_size=patch_size, t_patch=t_patch,
             latent_dim=latent_dim, kl_weight=kl_weight,
-            semantic_dim=semantic_dim, dec_dim=dec_dim,
+            semantic_dim=semantic_dim, mrl_prefixes=mrl_prefixes, dec_dim=dec_dim,
             num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
             use_gradient_checkpointing=use_gradient_checkpointing,
             mlp_ratio=mlp_ratio, dropout=dropout,
@@ -222,6 +223,7 @@ class MAVTLightningModule(L.LightningModule):
             slot_diversity=out.cd_metrics['slot_diversity'],
             modality=modality,
             semantic_embed=out.semantic,
+            semantic_embeds=out.semantic_mrl,
             teacher_embed=teacher_embed,
         )
 

@@ -1,7 +1,7 @@
-"""Stage 4: Dual Latent Projection heads.
+"""Stage 4: Latent projection heads.
 
-VAEHead      → μ, logσ², z  (reparameterization, 32-d per token)
-SemanticHead → s ∈ R^768    (attention pooling + projection)
+VAEHead      → μ, logσ², z  (reparameterization, latent_dim per token)
+SemanticHead → legacy pre-VAE semantic projection, currently unused by MAVT
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 
 class VAEHead(nn.Module):
-    """Per-token VAE projection: [C;D] tokens → 32-d latent."""
+    """Per-token VAE projection: [C;D] tokens -> latent_dim latent."""
 
     def __init__(self, in_dim: int = 1152, latent_dim: int = 32, kl_weight: float = 1e-4):
         super().__init__()

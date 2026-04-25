@@ -7,7 +7,7 @@ receive proportionally more gradient.
 """
 
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -178,6 +178,7 @@ class MAVTLoss(nn.Module):
         slot_diversity: torch.Tensor,
         modality: str,
         semantic_embed: Optional[torch.Tensor] = None,
+        semantic_embeds: Optional[Mapping[int, torch.Tensor]] = None,
         text_embed: Optional[torch.Tensor] = None,
         teacher_embed: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -198,8 +199,19 @@ class MAVTLoss(nn.Module):
 
         # Vision-vision distillation (default semantic supervision)
         l_sem = torch.tensor(0.0, device=pred.device)
-        if self.w_sem > 0.0 and semantic_embed is not None and teacher_embed is not None:
-            l_sem = cosine_distill_loss(semantic_embed, teacher_embed)
+        sem_logs: Dict[str, torch.Tensor] = {}
+        if self.w_sem > 0.0 and teacher_embed is not None and (
+            semantic_embeds or semantic_embed is not None
+        ):
+            if semantic_embeds:
+                prefix_losses = []
+                for prefix, embed in sorted(semantic_embeds.items()):
+                    prefix_loss = cosine_distill_loss(embed, teacher_embed)
+                    prefix_losses.append(prefix_loss)
+                    sem_logs[f'loss_sem_{prefix}'] = prefix_loss
+                l_sem = torch.stack(prefix_losses).mean()
+            else:
+                l_sem = cosine_distill_loss(semantic_embed, teacher_embed)
 
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
@@ -212,7 +224,7 @@ class MAVTLoss(nn.Module):
             + self.w_aux * l_div
         )
 
-        return {
+        losses = {
             'loss':       total,
             'loss_recon': l_recon,
             'loss_l1':    l1,
@@ -222,3 +234,5 @@ class MAVTLoss(nn.Module):
             'loss_sem':   l_sem,
             'loss_div':   l_div,
         }
+        losses.update(sem_logs)
+        return losses

@@ -5,9 +5,10 @@ model:
   num_blocks: 12
   patch_size: 16
   t_patch: 2
-  latent_dim: 32
+  latent_dim: 256
   kl_weight: 1.0e-4
   semantic_dim: 768
+  mrl_prefixes: [32, 64, 128, 256]
   dec_dim: 768
   num_dec_attn_blocks: 4
   r_s: 2

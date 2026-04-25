@@ -1,8 +1,8 @@
 """Stage 5: Two decoder heads on the shared latent z.
 
   AsymmetricDecoder     — z → pixel reconstruction (recon head)
-  UnderstandingDecoder  — z → semantic vector aligned with vision teacher
-                          (understanding head)
+  UnderstandingDecoder  — z / MRL prefixes of z → semantic vector aligned
+                          with vision teacher (understanding head)
 
 Both heads sit downstream of z so the latent must preserve enough information
 for pixel-faithful reconstruction AND semantic alignment simultaneously.
@@ -12,7 +12,7 @@ PixelShuffleCNNDecoder   — 4-stage PixelShuffle CNN (16× spatial upsample)
 """
 
 from __future__ import annotations
-from typing import Optional
+from typing import Dict, Sequence
 
 import torch
 import torch.nn as nn
@@ -266,8 +266,8 @@ class UnderstandingDecoder(nn.Module):
         self.norm_out = nn.LayerNorm(dec_dim)
         self.proj = nn.Linear(dec_dim, semantic_dim)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, Nz, latent_dim) → semantic: (B, semantic_dim)"""
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, Nz, latent_dim) -> semantic: (B, semantic_dim)."""
         x = self.norm_in(self.in_proj(z))
         for blk in self.self_attn_blocks:
             x = blk(x)
@@ -275,3 +275,25 @@ class UnderstandingDecoder(nn.Module):
         q = self.query.expand(B, 1, -1)
         pooled, _ = self.pool(q, x, x)
         return self.proj(self.norm_out(pooled.squeeze(1)))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode the full latent token sequence."""
+        return self._decode(z)
+
+    def forward_mrl(self, z: torch.Tensor, prefixes: Sequence[int]) -> Dict[int, torch.Tensor]:
+        """Decode Matryoshka channel prefixes of the same latent sequence.
+
+        Each prefix keeps the first ``p`` latent channels and zeroes the rest,
+        so every output is read through the same projection, transformer blocks,
+        and learned pooling query.
+        """
+        latent_dim = z.shape[-1]
+        outputs: Dict[int, torch.Tensor] = {}
+        for prefix in prefixes:
+            if prefix == latent_dim:
+                z_prefix = z
+            else:
+                keep = torch.arange(latent_dim, device=z.device) < prefix
+                z_prefix = z * keep.to(dtype=z.dtype).view(1, 1, latent_dim)
+            outputs[prefix] = self._decode(z_prefix)
+        return outputs

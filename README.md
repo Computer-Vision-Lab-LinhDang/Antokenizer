@@ -44,15 +44,14 @@ Stage 3: Content-Detail Split
   Output: [C ; D]  (B, N_c+N_d, 1152)      ~2.9x compression
         |
         v
-Stage 4: Dual Latent Projection
-  VAE head:      [C;D] -> mu, logvar -> z in R^32  (per token)
-  Semantic head: [C;D] -> attention pooling -> s in R^768
+Stage 4: VAE Latent Projection
+  VAE head:      [C;D] -> mu, logvar -> z in R^256 (per token)
+  MRL prefixes:  z32, z64, z128, z256 share the same token latent
         |
         v
-Stage 5: Modality-Specific Decoder
-  UnifiedDetailExpander: cross-attn from target positions into z (2 layers)
-  4x self-attention blocks (d=768)
-  4-stage PixelShuffle CNN: 16x spatial upsample
+Stage 5: Dual Latent Readout
+  Reconstruction: UnifiedDetailExpander cross-attends target positions into full z256
+  Understanding:  learned query attention-pools each MRL prefix -> s in R^768
         |
         v
 Outputs: reconstructed pixel tensor  +  semantic embedding
@@ -196,7 +195,8 @@ python3 train.py fit --config configs/train/stage1_image.yaml \
 | `num_heads` | 16 | Attention heads |
 | `num_blocks` | 12 | Backbone depth (RGAT at positions 4, 8) |
 | `patch_size` | 16 | Spatial patch size in pixels |
-| `latent_dim` | 32 | VAE latent dimension per token |
+| `latent_dim` | 256 | Maximum VAE latent dimension per token |
+| `mrl_prefixes` | [32, 64, 128, 256] | Matryoshka channel prefixes supervised for understanding |
 | `r_s` | 2 | RGAT spatial radius (5x5 window) |
 | `r_t` | 1 | RGAT temporal radius (+-1 frame) |
 | `use_gradient_checkpointing` | true | Saves ~30% GPU memory, +15% compute |
@@ -286,8 +286,8 @@ Antoken/
     │   ├── transformer.py        # StandardTransformerBlock (SigLIP2-compatible)
     │   ├── backbone.py           # 12-block hybrid backbone, mask caching
     │   ├── content_detail_split.py  # SlotPooler, ContentDetailSplit
-    │   ├── latent_heads.py       # VAEHead, SemanticHead
-    │   ├── decoder.py            # UnifiedDetailExpander, PixelShuffleCNNDecoder
+    │   ├── latent_heads.py       # VAEHead
+    │   ├── decoder.py            # Reconstruction decoder, MRL UnderstandingDecoder
     │   └── mavt.py               # Full MAVT model
     ├── losses/losses.py          # MAVTLoss, ModalityEMAWeighter, infonce_loss
     ├── data/

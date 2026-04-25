@@ -38,6 +38,7 @@ def make_model(device):
         latent_dim=8,
         kl_weight=1e-4,
         semantic_dim=32,
+        mrl_prefixes=(4, 8),
         dec_dim=32,
         num_dec_attn_blocks=2,
         r_s=2, r_t=1,
@@ -147,6 +148,11 @@ def test_forward(device):
           out.reconstruction.shape == x_img.shape, str(out.reconstruction.shape))
     check('image z last dim == latent_dim', out.z.shape[-1] == 8)
     check('image semantic shape', out.semantic.shape == (2, 32), str(out.semantic.shape))
+    check('image MRL semantic prefixes',
+          sorted(out.semantic_mrl.keys()) == [4, 8],
+          str(sorted(out.semantic_mrl.keys())))
+    check('image MRL semantic shape',
+          out.semantic_mrl[4].shape == (2, 32), str(out.semantic_mrl[4].shape))
     check('image loss_kl is scalar', out.loss_kl.ndim == 0)
 
     # Video: 8 frames, 64x64.
