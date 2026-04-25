@@ -222,7 +222,6 @@ class MAVTLightningModule(L.LightningModule):
             loss_kl=out.loss_kl,
             slot_diversity=out.cd_metrics['slot_diversity'],
             modality=modality,
-            semantic_embed=out.semantic,
             semantic_embeds=out.semantic_mrl,
             teacher_embed=teacher_embed,
         )

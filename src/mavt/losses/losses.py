@@ -1,9 +1,13 @@
 """Stage 6: Loss functions for MAVT training.
 
-L_total = w_recon·(w_l1·L1 + w_lpips·LPIPS) + w_kl·KL + w_clip·CLIP + w_aux·SlotDiv
+L_total = mod_w·(w_l1·L1 + w_lpips·LPIPS)
+        + w_kl·KL
+        + w_clip·CLIP
+        + w_sem·mean_p(MRL_distill_p)
+        + w_aux·SlotDiv
 
-Dynamic per-modality weighting: scale by 1/EMA(L_recon) so harder modalities
-receive proportionally more gradient.
+Dynamic per-modality weighting: scale L_recon by 1/EMA(L_recon) so harder
+modalities receive proportionally more gradient.
 """
 
 from __future__ import annotations
@@ -197,21 +201,18 @@ class MAVTLoss(nn.Module):
         if self.use_clip and semantic_embed is not None and text_embed is not None:
             l_clip = infonce_loss(semantic_embed, text_embed)
 
-        # Vision-vision distillation (default semantic supervision)
+        # Vision-vision distillation (default semantic supervision).
+        # MRL prefixes are preferred; fall back to a single embed for backwards compat.
         l_sem = torch.tensor(0.0, device=pred.device)
         sem_logs: Dict[str, torch.Tensor] = {}
-        if self.w_sem > 0.0 and teacher_embed is not None and (
-            semantic_embeds or semantic_embed is not None
-        ):
-            if semantic_embeds:
-                prefix_losses = []
-                for prefix, embed in sorted(semantic_embeds.items()):
-                    prefix_loss = cosine_distill_loss(embed, teacher_embed)
-                    prefix_losses.append(prefix_loss)
-                    sem_logs[f'loss_sem_{prefix}'] = prefix_loss
-                l_sem = torch.stack(prefix_losses).mean()
-            else:
-                l_sem = cosine_distill_loss(semantic_embed, teacher_embed)
+        if self.w_sem > 0.0 and teacher_embed is not None:
+            embeds = dict(semantic_embeds) if semantic_embeds else (
+                {-1: semantic_embed} if semantic_embed is not None else {}
+            )
+            if embeds:
+                per_prefix = {p: cosine_distill_loss(e, teacher_embed) for p, e in sorted(embeds.items())}
+                l_sem = torch.stack(list(per_prefix.values())).mean()
+                sem_logs = {f'loss_sem_{p}': v for p, v in per_prefix.items() if p >= 0}
 
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)

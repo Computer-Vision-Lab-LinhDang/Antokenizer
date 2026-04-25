@@ -104,21 +104,27 @@
   },
   "hotPaths": [
     {
-      "path": "src/mavt/model/decoder.py",
-      "accessCount": 1,
-      "lastAccessed": 1777114300584,
-      "type": "file"
-    },
-    {
       "path": "src/mavt/model/mavt.py",
-      "accessCount": 1,
-      "lastAccessed": 1777114304393,
+      "accessCount": 5,
+      "lastAccessed": 1777114762987,
       "type": "file"
     },
     {
       "path": "src/mavt/losses/losses.py",
-      "accessCount": 1,
-      "lastAccessed": 1777114308848,
+      "accessCount": 3,
+      "lastAccessed": 1777114855636,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/decoder.py",
+      "accessCount": 2,
+      "lastAccessed": 1777114798331,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/training/lightning_module.py",
+      "accessCount": 2,
+      "lastAccessed": 1777114897875,
       "type": "file"
     },
     {
@@ -131,12 +137,6 @@
       "path": "smoke_test.py",
       "accessCount": 1,
       "lastAccessed": 1777114334614,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 1,
-      "lastAccessed": 1777114335513,
       "type": "file"
     }
   ],

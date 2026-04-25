@@ -283,17 +283,13 @@ class UnderstandingDecoder(nn.Module):
     def forward_mrl(self, z: torch.Tensor, prefixes: Sequence[int]) -> Dict[int, torch.Tensor]:
         """Decode Matryoshka channel prefixes of the same latent sequence.
 
-        Each prefix keeps the first ``p`` latent channels and zeroes the rest,
-        so every output is read through the same projection, transformer blocks,
-        and learned pooling query.
+        Each prefix keeps the first ``p`` latent channels and zero-pads the
+        rest, so every output is read through the same projection, transformer
+        blocks, and learned pooling query.
         """
         latent_dim = z.shape[-1]
         outputs: Dict[int, torch.Tensor] = {}
         for prefix in prefixes:
-            if prefix == latent_dim:
-                z_prefix = z
-            else:
-                keep = torch.arange(latent_dim, device=z.device) < prefix
-                z_prefix = z * keep.to(dtype=z.dtype).view(1, 1, latent_dim)
+            z_prefix = z if prefix == latent_dim else F.pad(z[..., :prefix], (0, latent_dim - prefix))
             outputs[prefix] = self._decode(z_prefix)
         return outputs

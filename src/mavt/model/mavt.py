@@ -34,14 +34,14 @@ _MODALITY_RATIOS = {
 
 @dataclass
 class MAVTOutput:
-    reconstruction: torch.Tensor      # pixel-space reconstruction
-    z: torch.Tensor                    # VAE latent
+    reconstruction: Optional[torch.Tensor]      # pixel-space recon, None when decode=False
+    z: torch.Tensor                              # VAE latent
     mu: torch.Tensor
     logvar: torch.Tensor
-    semantic: torch.Tensor             # (B, semantic_dim)
-    semantic_mrl: Dict[int, torch.Tensor]  # prefix_dim -> (B, semantic_dim)
+    semantic: torch.Tensor                       # (B, semantic_dim) — full prefix
+    semantic_mrl: Dict[int, torch.Tensor]        # prefix_dim -> (B, semantic_dim)
     loss_kl: torch.Tensor
-    cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
+    cd_metrics: Dict[str, torch.Tensor]          # slot_diversity, residual_ratio
 
 
 class MAVT(nn.Module):
@@ -150,7 +150,8 @@ class MAVT(nn.Module):
             _, _, T, H, W = x.shape
             return (T // 2, H // self.patch_size, W // self.patch_size)
         elif modality == 'threed':
-            _, _, _, S, _ = x.shape   # (B, 3planes, 3ch, S, S)
+            # x: (B, 3 planes, 3 channels, S, S)
+            S = x.shape[-1]
             return (S // self.patch_size, S // self.patch_size)
         raise ValueError(modality)
 
@@ -190,13 +191,10 @@ class MAVT(nn.Module):
         # Stage 5a — Understanding head: MRL prefixes of z → semantic
         # Always run (cheap, gives semantic supervision signal even when decode=False)
         semantic_mrl = self.understanding_decoder.forward_mrl(z, self.mrl_prefixes)
-        semantic = semantic_mrl[self.latent_dim]
+        semantic = semantic_mrl[self.mrl_prefixes[-1]]   # full prefix == max
 
         # Stage 5b — Reconstruction head: z → pixel
-        if decode:
-            recon = self.decoder(z, positions, modality, grid_shape)
-        else:
-            recon = torch.zeros(1, device=x.device)  # placeholder
+        recon = self.decoder(z, positions, modality, grid_shape) if decode else None
 
         return MAVTOutput(
             reconstruction=recon,
