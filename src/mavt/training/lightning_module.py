@@ -1,30 +1,35 @@
-"""PyTorch Lightning Module for MAVT training.
+"""PyTorch Lightning Module for MAVT (Matryoshka edition).
 
-Supports 3-stage curriculum via `training_stage` parameter:
+Supports a 3-stage curriculum via ``training_stage``:
   1 — image only,  SigLIP2 fully frozen,  LR = 1e-4
   2 — +video,      SigLIP2 last 4 unfrozen, LR = 5e-5
   3 — +3D,         SigLIP2 fully unfrozen, LR = 2e-5
 
-To move between stages: start training with the next stage config and pass
-`--ckpt_path <prev_stage_checkpoint>` to LightningCLI.
+Matryoshka-specific knobs:
+  matryoshka_dims      — nested prefix widths exposed by the head.
+  matryoshka_alphas    — optional dict {d: α_d} per-prefix coefficients.
+  recon_prefix_policy  — 'all' (default) decodes every prefix every step;
+                         'random' samples ONE prefix per step (MRL-E from
+                         Kusupati et al., reduces decoder cost K×);
+                         'largest' decodes only the full prefix.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, Optional
+import random
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
-from lightning.pytorch.utilities import grad_norm
 
 from mavt.model.mavt import MAVT
 from mavt.losses.losses import MAVTLoss
 
 
 _STAGE_LR = {1: 1e-4, 2: 5e-5, 3: 2e-5}
-_STAGE_SIGLIP2_FROZEN_BLOCKS = {1: 10, 2: 6, 3: 0}  # number of transformer blocks frozen
-_STAGE_W_SEM = {1: 0.5, 2: 0.3, 3: 0.2}             # default cosine-distill weight per stage
+_STAGE_SIGLIP2_FROZEN_BLOCKS = {1: 10, 2: 6, 3: 0}
+_STAGE_W_SEM = {1: 0.5, 2: 0.3, 3: 0.2}
 
 
 class MAVTLightningModule(L.LightningModule):
@@ -39,8 +44,13 @@ class MAVTLightningModule(L.LightningModule):
         patch_size: int = 16,
         t_patch: int = 2,
         latent_dim: int = 32,
-        kl_weight: float = 1e-4,
+        kl_weight: float = 1e-4,           # legacy: KL weighting now lives in MAVTLoss
         semantic_dim: int = 768,
+        retr_dim: int = 512,
+        num_classes: Optional[int] = None,
+        matryoshka_dims: Optional[List[int]] = None,
+        matryoshka_alphas: Optional[Dict[int, float]] = None,
+        recon_prefix_policy: str = 'all',  # {'all', 'random', 'largest'}
         dec_dim: int = 768,
         num_dec_attn_blocks: int = 4,
         r_s: int = 2,
@@ -51,7 +61,7 @@ class MAVTLightningModule(L.LightningModule):
         # Loss
         w_l1: float = 1.0,
         w_lpips: float = 0.1,
-        w_kl: float = 1e-4,
+        w_kl: float = 1.0,
         w_clip: float = 0.0,
         w_sem: float = 0.0,
         w_aux: float = 0.01,
@@ -70,13 +80,22 @@ class MAVTLightningModule(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
+        del kl_weight  # silences "unused var" lint; the value is preserved in self.hparams
+
+        if recon_prefix_policy not in ('all', 'random', 'largest'):
+            raise ValueError(
+                f"recon_prefix_policy must be one of {{'all','random','largest'}}, "
+                f"got {recon_prefix_policy!r}"
+            )
 
         self.model = MAVT(
             embed_dim=embed_dim, num_heads=num_heads, num_blocks=num_blocks,
             patch_size=patch_size, t_patch=t_patch,
-            latent_dim=latent_dim, kl_weight=kl_weight,
-            semantic_dim=semantic_dim, dec_dim=dec_dim,
-            num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
+            matryoshka_dims=matryoshka_dims,
+            latent_dim=latent_dim,
+            semantic_dim=semantic_dim, retr_dim=retr_dim, num_classes=num_classes,
+            dec_dim=dec_dim, num_dec_attn_blocks=num_dec_attn_blocks,
+            r_s=r_s, r_t=r_t,
             use_gradient_checkpointing=use_gradient_checkpointing,
             mlp_ratio=mlp_ratio, dropout=dropout,
         )
@@ -85,6 +104,7 @@ class MAVTLightningModule(L.LightningModule):
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
             use_lpips=use_lpips, use_clip=use_clip,
+            matryoshka_alphas=matryoshka_alphas,
         )
 
         # Frozen vision teacher (loaded lazily in setup() to keep __init__ light)
@@ -99,8 +119,6 @@ class MAVTLightningModule(L.LightningModule):
         hp = self.hparams
         if stage != 'fit':
             return
-        # Eager slot pooler creation — must run BEFORE configure_optimizers
-        # so the new params land in the optimizer's param_groups.
         self._prepare_cd_split_poolers()
         if hp.init_siglip2:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
@@ -109,8 +127,6 @@ class MAVTLightningModule(L.LightningModule):
             self._load_semantic_teacher(hp.siglip2_model_name)
 
     def _prepare_cd_split_poolers(self) -> None:
-        """Read active modality + resolution from the attached DataModule and
-        eagerly create every SlotPooler the trainer will need."""
         dm = getattr(self.trainer, 'datamodule', None)
         if dm is None or not hasattr(dm, 'hparams'):
             return
@@ -139,7 +155,6 @@ class MAVTLightningModule(L.LightningModule):
             self.model.prepare_for_modalities(specs)
 
     def _load_semantic_teacher(self, model_name: str) -> None:
-        """Load frozen SigLIP2 vision tower as teacher for cosine distillation."""
         try:
             from transformers import AutoModel
             siglip = AutoModel.from_pretrained(model_name)
@@ -158,37 +173,37 @@ class MAVTLightningModule(L.LightningModule):
             self.semantic_teacher = None
 
     def train(self, mode: bool = True):  # type: ignore[override]
-        """Keep frozen teacher in eval mode regardless of train()/eval() calls."""
         super().train(mode)
         if self.semantic_teacher is not None:
             self.semantic_teacher.eval()
         return self
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Strip frozen teacher weights from checkpoints to keep them small."""
         state = checkpoint.get('state_dict', {})
         for k in list(state.keys()):
             if k.startswith('semantic_teacher.'):
                 del state[k]
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Inject the freshly-loaded teacher's params back into the checkpoint
-        state_dict so Lightning's strict load does not fail with missing keys.
-
-        Order at training-resume time:
-          1. setup('fit')               → teacher loaded from HF (deterministic)
-          2. on_load_checkpoint(ckpt)   → we inject teacher keys here
-          3. self.load_state_dict(ckpt) → strict=True now sees a complete dict
-
-        Teacher weights are deterministic from the HF model name, so injecting
-        the current values is equivalent to whatever the checkpoint would have
-        contained — no behavior change, only avoids the strict-load error.
-        """
         if self.semantic_teacher is None:
             return
         sd = checkpoint.setdefault('state_dict', {})
         for k, v in self.semantic_teacher.state_dict().items():
             sd.setdefault(f'semantic_teacher.{k}', v)
+
+    # ------------------------------------------------------------------ #
+    #  Prefix sampling                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _select_recon_prefixes(self) -> Optional[Sequence[int]]:
+        """Return the prefixes to decode this step, per ``recon_prefix_policy``."""
+        policy = self.hparams.recon_prefix_policy
+        all_dims = self.model.matryoshka_dims
+        if policy == 'all':
+            return None  # MAVT.forward defaults to all
+        if policy == 'largest':
+            return (all_dims[-1],)
+        return (random.choice(all_dims),)  # 'random' (MRL-E)
 
     # ------------------------------------------------------------------ #
     #  Training step                                                       #
@@ -198,17 +213,19 @@ class MAVTLightningModule(L.LightningModule):
         x       = batch['data']
         modality = batch['modality']
 
-        out = self.model(x, modality, decode=True)
+        out = self.model(
+            x, modality,
+            decode=True,
+            recon_prefixes=self._select_recon_prefixes(),
+        )
 
-        # For video: decoder reconstructs in patch-grid temporal space (Tp = T//t_patch).
-        # Target must match. Use first frame of each temporal patch group.
+        # For video: decoder reconstructs in patch-grid temporal space.
         if modality == 'video':
             t_patch = self.hparams.t_patch
-            target = x[:, :, ::t_patch]  # (B, 3, Tp, H, W)
+            target = x[:, :, ::t_patch]
         else:
-            target = x  # image and threed pass through as-is
+            target = x
 
-        # Vision-vision distillation: forward x_proxy through frozen teacher.
         teacher_embed: Optional[torch.Tensor] = None
         if self.semantic_teacher is not None:
             with torch.no_grad():
@@ -216,16 +233,17 @@ class MAVTLightningModule(L.LightningModule):
                 teacher_embed = self.semantic_teacher(pixel_values=proxy).pooler_output
 
         losses = self.loss_fn(
-            pred=out.reconstruction,
             target=target,
-            loss_kl=out.loss_kl,
-            slot_diversity=out.cd_metrics['slot_diversity'],
             modality=modality,
-            semantic_embed=out.semantic,
+            recon_per_prefix=out.reconstruction,
+            kl_per_prefix=out.loss_kl,
+            sem_per_prefix=out.semantic,
+            all_prefixes=self.model.matryoshka_dims,
+            slot_diversity=out.cd_metrics['slot_diversity'],
             teacher_embed=teacher_embed,
+            retr_per_prefix=out.retrieval,
         )
 
-        # Logging
         for k, v in losses.items():
             self.log(f'{log_prefix}/{k}', v, on_step=True, on_epoch=True,
                      prog_bar=(k == 'loss'), sync_dist=True)
@@ -243,7 +261,6 @@ class MAVTLightningModule(L.LightningModule):
     def validation_step(self, batch: Dict, batch_idx: int) -> None:
         with torch.no_grad():
             self._step(batch, 'val')
-            # Log sample reconstructions to wandb/tensorboard every N steps
             if batch_idx == 0:
                 self._log_images(batch)
 
@@ -254,20 +271,13 @@ class MAVTLightningModule(L.LightningModule):
     @staticmethod
     def _make_teacher_input(x: torch.Tensor, modality: str,
                             target_size: int) -> torch.Tensor:
-        """Project the multi-modal input down to a single (B, 3, S, S) image
-        the SigLIP2 vision teacher can consume.
-
-        image  : x as-is.
-        video  : middle frame.
-        threed : XY plane (front view, closest to natural-image distribution).
-        """
         if modality == 'image':
             proxy = x
         elif modality == 'video':
             T = x.shape[2]
-            proxy = x[:, :, T // 2]                # (B, 3, H, W)
+            proxy = x[:, :, T // 2]
         elif modality == 'threed':
-            proxy = x[:, 0]                         # (B, 3, H, W) plane XY
+            proxy = x[:, 0]
         else:
             raise ValueError(f"Unknown modality: {modality}")
 
@@ -286,19 +296,19 @@ class MAVTLightningModule(L.LightningModule):
         try:
             x       = batch['data'][:n]
             modality = batch['modality']
-            out = self.model(x, modality, decode=True)
+            d_max = self.model.matryoshka_dims[-1]
+            out = self.model(x, modality, decode=True, recon_prefixes=(d_max,))
+            recon = out.reconstruction[d_max]
 
             if modality == 'image':
                 grid_in  = _to_grid(x)
-                grid_out = _to_grid(out.reconstruction)
+                grid_out = _to_grid(recon)
             elif modality == 'video':
-                # Log first frame of each clip
                 grid_in  = _to_grid(x[:, :, 0])
-                grid_out = _to_grid(out.reconstruction[:, :, 0])
+                grid_out = _to_grid(recon[:, :, 0])
             elif modality == 'threed':
-                # Log XY plane (plane index 0)
                 grid_in  = _to_grid(x[:, 0])
-                grid_out = _to_grid(out.reconstruction[:, 0])
+                grid_out = _to_grid(recon[:, 0])
             else:
                 return
 
@@ -318,7 +328,6 @@ class MAVTLightningModule(L.LightningModule):
         hp = self.hparams
         lr = _STAGE_LR[hp.training_stage]
 
-        # Separate RGAT params for potential different LR (currently same LR)
         rgat_params, other_params = [], []
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
@@ -334,7 +343,6 @@ class MAVTLightningModule(L.LightningModule):
 
         optimizer = torch.optim.AdamW(param_groups, weight_decay=hp.weight_decay)
 
-        # Linear warmup + cosine decay
         def lr_lambda(step: int) -> float:
             if step < hp.warmup_steps:
                 return step / max(1, hp.warmup_steps)
@@ -365,9 +373,8 @@ def _to_grid(x: torch.Tensor, nrow: int = 4) -> Any:
     try:
         from torchvision.utils import make_grid
         from PIL import Image
-        import numpy as np
         x = x.detach().cpu().float().clamp(-1, 1)
-        x = (x + 1) / 2                         # [0, 1]
+        x = (x + 1) / 2
         grid = make_grid(x, nrow=nrow, normalize=False)
         arr = (grid.permute(1, 2, 0).numpy() * 255).astype('uint8')
         return Image.fromarray(arr)

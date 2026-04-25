@@ -1,18 +1,19 @@
-"""MAVT: Memory-Augmented Vision Tokenizer.
+"""MAVT: Memory-Augmented Vision Tokenizer with Matryoshka head.
 
-Unified 7-stage pipeline:
-  1. Patchify (Conv3d, modality-specific)
-  2. Hybrid Transformer-RGAT Backbone (12 blocks)
-  3. Content-Detail Split (slot attention)
-  4. Dual Latent Projection (VAE + Semantic)
-  5. Modality-Specific Decoder
-  6. Losses (handled by LightningModule)
-  7. Outputs
+Pipeline:
+  1. Patchify (Conv3d, modality-shared)
+  2. Hybrid Transformer-RGAT backbone (12 blocks)
+  3. Content-Detail Split (slot attention) → compressed (B, N, D_max)
+  4. Matryoshka head: per-prefix VAE + understanding pool over nested
+     channel widths {d_1, …, d_K = D_max}
+  5a. Reconstruction:   per-prefix z_k → shared AsymmetricDecoder → pixels
+  5b. Understanding:    per-prefix global vector g_k + multi-task heads
+  6.  Loss aggregation lives in MAVTLoss (Σ_k α_k · L_task_k).
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -20,8 +21,8 @@ import torch.nn as nn
 from mavt.model.patchify import PatchifyEncoder
 from mavt.model.backbone import HybridBackbone
 from mavt.model.content_detail_split import ContentDetailSplit
-from mavt.model.latent_heads import VAEHead
-from mavt.model.decoder import AsymmetricDecoder, UnderstandingDecoder
+from mavt.model.matryoshka_head import MatryoshkaHead
+from mavt.model.decoder import AsymmetricDecoder
 
 
 # Compression ratios per modality (content, detail)
@@ -34,20 +35,27 @@ _MODALITY_RATIOS = {
 
 @dataclass
 class MAVTOutput:
-    reconstruction: torch.Tensor      # pixel-space reconstruction
-    z: torch.Tensor                    # VAE latent
-    mu: torch.Tensor
-    logvar: torch.Tensor
-    semantic: torch.Tensor             # (B, semantic_dim)
-    loss_kl: torch.Tensor
-    cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
+    """Per-prefix outputs of the Matryoshka head plus shared metrics."""
+
+    # Reconstruction branch — only populated for prefixes in ``recon_prefixes``.
+    reconstruction: Dict[int, torch.Tensor]
+    # Understanding branch — populated for every prefix.
+    z: Dict[int, torch.Tensor]
+    mu: Dict[int, torch.Tensor]
+    logvar: Dict[int, torch.Tensor]
+    loss_kl: Dict[int, torch.Tensor]
+    g: Dict[int, torch.Tensor]
+    semantic: Dict[int, torch.Tensor]
+    retrieval: Dict[int, torch.Tensor]
+    classification: Optional[Dict[int, torch.Tensor]]
+    # Slot diversity / residual ratio metrics from C-D split.
+    cd_metrics: Dict[str, torch.Tensor]
+    # Which prefixes ran the decoder this forward pass.
+    recon_prefixes: Tuple[int, ...]
 
 
 class MAVT(nn.Module):
-    """Full MAVT model.
-
-    All hyper-parameters are configurable via YAML (Lightning CLI).
-    """
+    """Full MAVT model with Matryoshka representation learning."""
 
     def __init__(
         self,
@@ -59,11 +67,12 @@ class MAVT(nn.Module):
         # C-D Split
         num_slot_heads: int = 8,
         num_slot_layers: int = 2,
-        # VAE
+        # Matryoshka
+        matryoshka_dims: Optional[Sequence[int]] = None,
         latent_dim: int = 32,
-        kl_weight: float = 1e-4,
-        # Semantic
         semantic_dim: int = 768,
+        retr_dim: int = 512,
+        num_classes: Optional[int] = None,
         # Decoder
         dec_dim: int = 768,
         num_dec_attn_blocks: int = 4,
@@ -80,6 +89,7 @@ class MAVT(nn.Module):
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
         self.patch_size = patch_size
+        self.matryoshka_dims = self._normalise_mrl_dims(matryoshka_dims, embed_dim)
 
         # Stage 1
         self.patchify = PatchifyEncoder(embed_dim, patch_size, t_patch)
@@ -96,20 +106,20 @@ class MAVT(nn.Module):
         self.cd_split = ContentDetailSplit(
             dim=embed_dim, num_heads=num_slot_heads, num_slot_layers=num_slot_layers)
 
-        # Stage 4 — VAE bottleneck only (semantic moved downstream of z)
-        self.vae_head = VAEHead(embed_dim, latent_dim, kl_weight)
+        # Stage 4 — Matryoshka head (per-prefix VAE + understanding pool)
+        self.matryoshka_head = MatryoshkaHead(
+            dims=self.matryoshka_dims,
+            latent_dim=latent_dim,
+            semantic_dim=semantic_dim,
+            retr_dim=retr_dim,
+            num_classes=num_classes,
+        )
 
-        # Stage 5 — two heads decoding from the shared latent z
-        # 5a. Reconstruction head: z → pixel
+        # Stage 5a — Reconstruction decoder shared across prefixes (input is
+        # always ``latent_dim``-d after the per-prefix VAE).
         self.decoder = AsymmetricDecoder(
             latent_dim=latent_dim, dec_dim=dec_dim,
             num_attn_blocks=num_dec_attn_blocks, num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-        )
-        # 5b. Understanding head: z → semantic vector aligned with vision teacher
-        self.understanding_decoder = UnderstandingDecoder(
-            latent_dim=latent_dim, dec_dim=dec_dim,
-            semantic_dim=semantic_dim, num_heads=8, num_layers=2,
             mlp_ratio=mlp_ratio,
         )
 
@@ -117,18 +127,50 @@ class MAVT(nn.Module):
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _normalise_mrl_dims(
+        dims: Optional[Sequence[int]],
+        embed_dim: int,
+    ) -> Tuple[int, ...]:
+        """Validate the Matryoshka prefix list. Last entry must equal ``embed_dim``."""
+        if dims is None:
+            return (embed_dim,)
+        cleaned = sorted({int(d) for d in dims})
+        if not cleaned:
+            return (embed_dim,)
+        invalid = [d for d in cleaned if d <= 0 or d > embed_dim]
+        if invalid:
+            raise ValueError(
+                f"matryoshka_dims must be in [1, embed_dim={embed_dim}], got {invalid}"
+            )
+        if cleaned[-1] != embed_dim:
+            cleaned.append(embed_dim)
+        return tuple(cleaned)
+
     def _grid_shape(self, modality: str, x: torch.Tensor) -> tuple:
-        """Return (H_grid, W_grid) or (Tp, Hg, Wg) based on input shape."""
         if modality == 'image':
             _, _, H, W = x.shape
             return (H // self.patch_size, W // self.patch_size)
-        elif modality == 'video':
+        if modality == 'video':
             _, _, T, H, W = x.shape
             return (T // 2, H // self.patch_size, W // self.patch_size)
-        elif modality == 'threed':
-            _, _, _, S, _ = x.shape   # (B, 3planes, 3ch, S, S)
+        if modality == 'threed':
+            S = x.shape[-1]
             return (S // self.patch_size, S // self.patch_size)
         raise ValueError(modality)
+
+    def _resolve_recon_prefixes(
+        self, recon_prefixes: Optional[Sequence[int]]
+    ) -> Tuple[int, ...]:
+        if recon_prefixes is None:
+            return self.matryoshka_dims
+        chosen = tuple(int(d) for d in recon_prefixes)
+        unknown = [d for d in chosen if d not in self.matryoshka_dims]
+        if unknown:
+            raise ValueError(
+                f"recon_prefixes {unknown} not in matryoshka_dims={self.matryoshka_dims}"
+            )
+        return chosen
 
     # ------------------------------------------------------------------ #
     #  Forward                                                             #
@@ -139,54 +181,53 @@ class MAVT(nn.Module):
         x: torch.Tensor,
         modality: str,
         decode: bool = True,
+        recon_prefixes: Optional[Sequence[int]] = None,
     ) -> MAVTOutput:
-        """
-        x : raw input tensor (see patchify.py for shapes per modality)
-        modality : 'image' | 'video' | 'threed'
-        decode : if False, skip decoder (encoder-only mode for downstream tasks)
-        """
+        """Run patchify → backbone → C-D split → Matryoshka head, then
+        optionally decode a chosen subset of prefixes (default: all)."""
         grid_shape = self._grid_shape(modality, x)
 
-        # Stage 1 — Patchify
         tokens, positions, plane_ids = self.patchify(x, modality)
-        # tokens: (B, N, D), positions: (N, 4), plane_ids: (N,)
-
-        # Stage 2 — Hybrid backbone
         features = self.backbone(tokens, positions, plane_ids, modality)
 
-        # Stage 3 — Content-Detail Split
         content_ratio, detail_ratio = _MODALITY_RATIOS[modality]
-        compressed, cd_metrics = self.cd_split(
-            features, content_ratio, detail_ratio
-        )  # (B, N_c + N_d, D)
+        compressed, cd_metrics = self.cd_split(features, content_ratio, detail_ratio)
 
-        # Stage 4 — VAE bottleneck (semantic now derives from z, not compressed)
-        z, mu, logvar, loss_kl = self.vae_head(compressed)
+        mrl_out = self.matryoshka_head(compressed)
 
-        # Stage 5a — Understanding head: z → semantic
-        # Always run (cheap, gives semantic supervision signal even when decode=False)
-        semantic = self.understanding_decoder(z)
-
-        # Stage 5b — Reconstruction head: z → pixel
-        if decode:
-            recon = self.decoder(z, positions, modality, grid_shape)
-        else:
-            recon = torch.zeros(1, device=x.device)  # placeholder
+        chosen_prefixes = self._resolve_recon_prefixes(recon_prefixes) if decode else ()
+        recon: Dict[int, torch.Tensor] = {}
+        for d in chosen_prefixes:
+            recon[d] = self.decoder(
+                mrl_out[d]['z'], positions, modality, grid_shape
+            )
 
         return MAVTOutput(
             reconstruction=recon,
-            z=z,
-            mu=mu,
-            logvar=logvar,
-            semantic=semantic,
-            loss_kl=loss_kl,
+            z={d: mrl_out[d]['z']      for d in self.matryoshka_dims},
+            mu={d: mrl_out[d]['mu']     for d in self.matryoshka_dims},
+            logvar={d: mrl_out[d]['logvar'] for d in self.matryoshka_dims},
+            loss_kl={d: mrl_out[d]['kl']    for d in self.matryoshka_dims},
+            g={d: mrl_out[d]['g']      for d in self.matryoshka_dims},
+            semantic={d: mrl_out[d]['sem']    for d in self.matryoshka_dims},
+            retrieval={d: mrl_out[d]['retr']   for d in self.matryoshka_dims},
+            classification=(
+                {d: mrl_out[d]['cls'] for d in self.matryoshka_dims}
+                if self.matryoshka_head.cls_heads is not None else None
+            ),
             cd_metrics=cd_metrics,
+            recon_prefixes=tuple(chosen_prefixes),
         )
 
-    def encode(self, x: torch.Tensor, modality: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convenience: return (z, semantic) without decoding."""
+    def encode(
+        self, x: torch.Tensor, modality: str, prefix: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convenience: return ``(z_d, semantic_d)`` for the requested prefix."""
         out = self.forward(x, modality, decode=False)
-        return out.z, out.semantic
+        d = prefix if prefix is not None else self.matryoshka_dims[-1]
+        if d not in out.z:
+            raise ValueError(f"prefix {d} not in matryoshka_dims={self.matryoshka_dims}")
+        return out.z[d], out.semantic[d]
 
     def load_siglip2_weights(self, model_name: str = "google/siglip2-base-patch16-224",
                               freeze_stages: int = 10) -> None:
@@ -197,20 +238,8 @@ class MAVT(nn.Module):
     # ------------------------------------------------------------------ #
 
     def prepare_for_modalities(self, specs: Iterable[Dict[str, Any]]) -> None:
-        """Pre-create every SlotPooler the trainer will need.
-
-        Must be called BEFORE the optimizer is built (e.g. from
-        LightningModule.setup) so the pooler params are picked up by the
-        optimizer's param_groups. Without this, poolers are created lazily
-        in ContentDetailSplit.forward and their parameters never receive
-        gradient updates.
-
-        Each spec dict has key 'modality' plus modality-specific shape keys:
-            image  : {'modality': 'image',  'resolution': H}
-            video  : {'modality': 'video',  'resolution': H, 'frames': T,
-                      't_patch': 2}                # t_patch optional
-            threed : {'modality': 'threed', 'resolution': S}
-        """
+        """Pre-create every SlotPooler the trainer will need so its params
+        are picked up by ``configure_optimizers``."""
         for spec in specs:
             modality = spec['modality']
             if modality == 'image':
@@ -227,7 +256,7 @@ class MAVT(nn.Module):
             elif modality == 'threed':
                 S  = spec['resolution']
                 Sp = S // self.patch_size
-                N  = 3 * Sp * Sp                  # 3 planes
+                N  = 3 * Sp * Sp
             else:
                 raise ValueError(f"Unknown modality in spec: {modality!r}")
             c_r, d_r = _MODALITY_RATIOS[modality]

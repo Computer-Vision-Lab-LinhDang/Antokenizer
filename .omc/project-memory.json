@@ -85,14 +85,26 @@
   "hotPaths": [
     {
       "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 10,
-      "lastAccessed": 1777094485962,
+      "accessCount": 12,
+      "lastAccessed": 1777131416912,
       "type": "file"
     },
     {
       "path": "configs/train/universal_data/stage1_universal.yaml",
       "accessCount": 8,
       "lastAccessed": 1777101682907,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/mavt.py",
+      "accessCount": 8,
+      "lastAccessed": 1777130976770,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/decoder.py",
+      "accessCount": 8,
+      "lastAccessed": 1777131095988,
       "type": "file"
     },
     {
@@ -108,9 +120,9 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/model/mavt.py",
-      "accessCount": 6,
-      "lastAccessed": 1777024171020,
+      "path": "src/mavt/losses/losses.py",
+      "accessCount": 7,
+      "lastAccessed": 1777131247210,
       "type": "file"
     },
     {
@@ -120,21 +132,9 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/losses/losses.py",
-      "accessCount": 5,
-      "lastAccessed": 1777094586506,
-      "type": "file"
-    },
-    {
       "path": "src/mavt/model/patchify.py",
       "accessCount": 4,
       "lastAccessed": 1777021897353,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/model/decoder.py",
-      "accessCount": 4,
-      "lastAccessed": 1777024134650,
       "type": "file"
     },
     {
@@ -156,6 +156,18 @@
       "type": "file"
     },
     {
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1777131473894,
+      "type": "file"
+    },
+    {
+      "path": "smoke_test.py",
+      "accessCount": 3,
+      "lastAccessed": 1777131897298,
+      "type": "file"
+    },
+    {
       "path": "README.md",
       "accessCount": 2,
       "lastAccessed": 1777018549894,
@@ -165,12 +177,6 @@
       "path": "configs/train/stage1_image.yaml",
       "accessCount": 1,
       "lastAccessed": 1776874072699,
-      "type": "file"
-    },
-    {
-      "path": "configs/model/mavt_base.yaml",
-      "accessCount": 1,
-      "lastAccessed": 1777017297301,
       "type": "file"
     },
     {
@@ -219,6 +225,18 @@
       "path": "src/mavt/model/rgat.py",
       "accessCount": 1,
       "lastAccessed": 1777021471516,
+      "type": "file"
+    },
+    {
+      "path": "quick_train_test.py",
+      "accessCount": 1,
+      "lastAccessed": 1777119161772,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/matryoshka_head.py",
+      "accessCount": 1,
+      "lastAccessed": 1777127838949,
       "type": "file"
     }
   ],
