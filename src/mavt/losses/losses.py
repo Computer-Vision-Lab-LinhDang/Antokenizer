@@ -102,11 +102,18 @@ def slot_diversity_loss(slot_diversity_metric: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 
 class ModalityEMAWeighter(nn.Module):
-    """Maintains a running EMA of L_recon per modality for inverse scaling."""
+    """Maintains a running EMA of L_recon per modality for inverse scaling.
+
+    Normalizes the *coefficients* across modalities to sum to ``num_modalities``
+    (i.e. mean weight = 1.0), instead of normalizing each modality's loss to 1.
+    This keeps relative balancing between modalities while preserving the
+    absolute magnitude of l_recon — so a decreasing l_recon shows up in l_total.
+    """
 
     def __init__(self, modalities=('image', 'video', 'threed'), momentum: float = 0.99):
         super().__init__()
         self.momentum = momentum
+        self.modalities = tuple(modalities)
         for m in modalities:
             self.register_buffer(f'ema_{m}', torch.tensor(1.0))
 
@@ -118,9 +125,13 @@ class ModalityEMAWeighter(nn.Module):
 
     def weight(self, modality: str) -> torch.Tensor:
         attr = f'ema_{modality}'
-        if hasattr(self, attr):
-            return 1.0 / (getattr(self, attr) + 1e-8)
-        return torch.tensor(1.0)
+        if not hasattr(self, attr):
+            return torch.tensor(1.0)
+
+        inv = [1.0 / (getattr(self, f'ema_{m}') + 1e-8) for m in self.modalities]
+        inv_stack = torch.stack(inv)
+        normalizer = inv_stack.sum() / len(self.modalities)  # mean(inv)
+        return (1.0 / (getattr(self, attr) + 1e-8)) / (normalizer + 1e-8)
 
 
 # --------------------------------------------------------------------------- #
