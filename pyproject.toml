@@ -2,7 +2,7 @@
 name = "mavt"
 version = "0.1.0"
 description = "Memory-Augmented Vision Tokenizer with 4D RGAT and Content-Detail Split"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.2.0",
     "torchvision>=0.17.0",

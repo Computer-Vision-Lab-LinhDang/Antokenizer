@@ -222,3 +222,6 @@ datasets/
 tripplane_images/
 lightning_logs/
 dataset/
+logs/
+checkpoints/
+wandb/
