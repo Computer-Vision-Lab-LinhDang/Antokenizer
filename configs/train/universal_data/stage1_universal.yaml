@@ -58,6 +58,7 @@ model:
   use_semantic_distill: true
   siglip2_model_name: google/siglip2-base-patch16-224
   w_l1: 1.0
+  w_kl: 1e-4
   w_lpips: 0.1
   w_kl: 1e-4
   w_clip: 0.0

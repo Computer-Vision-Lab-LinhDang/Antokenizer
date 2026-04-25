@@ -14,8 +14,6 @@ from mavt.data.datasets import (
     UniversalImageDataset,
     UniversalVideoDataset,
     UniversalThreeDDataset,
-    WDSImageDataset,
-    ShardVideoDataset,
 )
 
 
@@ -112,23 +110,15 @@ class MAVTDataModule(L.LightningDataModule):
     Stage 3: image + video + 3D
 
     Set active_modalities to control which modalities are included.
-
-    Data source modes:
-      - universal_data_root: read from sample100-1 directory layout
-      - image_shards_dir / video_shards_dir: read directly from shards
-      - None for both: synthetic smoke-test data
+    For synthetic smoke-testing leave all *_root paths as None.
     """
 
     def __init__(
         self,
         # Stage control
         active_modalities: List[str] = ('image',),
-        # Universal data root (sample100-1 layout)
+        # Data root (None → synthetic smoke-test)
         universal_data_root: Optional[str] = None,
-        # Direct shard paths (alternative to universal root)
-        image_shards_dir: Optional[str] = None,
-        video_shards_dir: Optional[str] = None,
-        video_max_shards: Optional[int] = None,
         # Data params
         image_resolution: int = 256,
         video_frames: int = 16,
@@ -151,40 +141,15 @@ class MAVTDataModule(L.LightningDataModule):
 
     def _make_dataset(self, modality: str) -> Dataset:
         hp = self.hparams
-
-        # Priority 1: Direct shard paths (most efficient for large data)
-        if modality == 'image' and hp.image_shards_dir:
-            ds = WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
-            if len(ds) > 0:
-                return ds
-
-        if modality == 'video' and hp.video_shards_dir:
-            ds = ShardVideoDataset(
-                hp.video_shards_dir, hp.video_frames,
-                hp.video_resolution, hp.video_max_shards,
-            )
-            if len(ds) > 0:
-                return ds
-
-        # Priority 2: Universal data root (sample100-1 layout)
         if hp.universal_data_root:
             if modality == 'image':
-                ds = UniversalImageDataset(hp.universal_data_root, hp.image_resolution)
-                if len(ds) > 0:
-                    return ds
+                return UniversalImageDataset(hp.universal_data_root, hp.image_resolution)
             elif modality == 'video':
-                ds = UniversalVideoDataset(
-                    hp.universal_data_root, hp.video_frames, hp.video_resolution
-                )
-                if len(ds) > 0:
-                    return ds
+                return UniversalVideoDataset(hp.universal_data_root, hp.video_frames, hp.video_resolution)
             elif modality == 'threed':
-                ds = UniversalThreeDDataset(hp.universal_data_root, hp.triplane_res)
-                if len(ds) > 0:
-                    return ds
-
-        # Priority 3: Synthetic fallback for smoke-testing
-        print(f"  [WARN] No real data for '{modality}', using synthetic")
+                return UniversalThreeDDataset(hp.universal_data_root, hp.triplane_res)
+            raise ValueError(modality)
+        # Synthetic fallback for smoke-testing
         if modality == 'image':
             return SyntheticMultiModalDataset(hp.synthetic_n, 'image', hp.image_resolution)
         elif modality == 'video':
@@ -193,19 +158,28 @@ class MAVTDataModule(L.LightningDataModule):
         elif modality == 'threed':
             return SyntheticMultiModalDataset(hp.synthetic_n, 'threed',
                                               triplane_res=hp.triplane_res)
-        raise ValueError(f"Unknown modality: {modality}")
+        raise ValueError(modality)
 
     # ------------------------------------------------------------------ #
 
     def setup(self, stage: Optional[str] = None) -> None:
-        datasets = []
-        for m in self.hparams.active_modalities:
-            ds = self._make_dataset(m)
-            print(f"  [{m}] dataset: {type(ds).__name__} ({len(ds):,} samples)")
-            datasets.append(ds)
+        hp = self.hparams
+        full_datasets = [self._make_dataset(m) for m in hp.active_modalities]
 
-        if len(datasets) == 1:
-            self._train_ds: Dataset = datasets[0]
+        train_splits, val_splits, test_splits = [], [], []
+        for ds in full_datasets:
+            n = len(ds)
+            n_val = max(1, int(n * hp.val_split))
+            n_test = max(1, int(n * hp.test_split)) if hp.test_split > 0 else 0
+            n_train = n - n_val - n_test
+            parts = random_split(ds, [n_train, n_val, n_test]) if n_test else random_split(ds, [n_train, n_val])
+            train_splits.append(parts[0])
+            val_splits.append(parts[1])
+            if n_test:
+                test_splits.append(parts[2])
+
+        if len(train_splits) == 1:
+            self._train_ds: Dataset = train_splits[0]
             self._batch_sampler = None
         else:
             self._train_ds = ConcatDataset(train_splits)
