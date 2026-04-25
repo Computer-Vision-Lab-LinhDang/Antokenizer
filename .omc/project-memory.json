@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1777016902795,
+  "lastScanned": 1777113996555,
   "projectRoot": "/Users/nguyenbinhan/Workspace/AToken/atoken",
   "techStack": {
     "languages": [
@@ -54,14 +54,27 @@
       "path": "configs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777016902766,
+      "lastAccessed": 1777113996390,
       "keyFiles": []
+    },
+    "logs": {
+      "path": "logs",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1777113996391,
+      "keyFiles": [
+        "err_7737.txt",
+        "err_7738.txt",
+        "err_7739.txt",
+        "err_7743.txt",
+        "out_7737.txt"
+      ]
     },
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 2,
-      "lastAccessed": 1777016902767,
+      "lastAccessed": 1777113996393,
       "keyFiles": [
         "download_objaverse.py",
         "glb_to_tripplane.py"
@@ -71,14 +84,21 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 0,
-      "lastAccessed": 1777016902768,
+      "lastAccessed": 1777113996393,
       "keyFiles": []
     },
     "train": {
       "path": "train",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777016902781,
+      "lastAccessed": 1777113996394,
+      "keyFiles": []
+    },
+    "wandb": {
+      "path": "wandb",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777113996394,
       "keyFiles": []
     }
   },
@@ -176,7 +196,7 @@
     {
       "path": "configs/train/stage1_image.yaml",
       "accessCount": 1,
-      "lastAccessed": 1776874072699,
+      "lastAccessed": 1777114300584,
       "type": "file"
     },
     {
@@ -200,31 +220,31 @@
     {
       "path": "src/mavt/__init__.py",
       "accessCount": 1,
-      "lastAccessed": 1777018551150,
+      "lastAccessed": 1777114304393,
       "type": "file"
     },
     {
-      "path": "src/mavt/training/__init__.py",
+      "path": "src/mavt/losses/losses.py",
       "accessCount": 1,
-      "lastAccessed": 1777019528228,
+      "lastAccessed": 1777114308848,
       "type": "file"
     },
     {
-      "path": "src/mavt/losses/__init__.py",
+      "path": "configs/model/mavt_base.yaml",
       "accessCount": 1,
-      "lastAccessed": 1777019528737,
+      "lastAccessed": 1777114334263,
       "type": "file"
     },
     {
-      "path": "src/mavt/model/transformer.py",
+      "path": "smoke_test.py",
       "accessCount": 1,
-      "lastAccessed": 1777021471186,
+      "lastAccessed": 1777114334614,
       "type": "file"
     },
     {
-      "path": "src/mavt/model/rgat.py",
+      "path": "src/mavt/training/lightning_module.py",
       "accessCount": 1,
-      "lastAccessed": 1777021471516,
+      "lastAccessed": 1777114335513,
       "type": "file"
     },
     {
