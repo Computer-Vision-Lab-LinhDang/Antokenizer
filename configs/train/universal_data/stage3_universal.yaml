@@ -63,7 +63,7 @@ model:
   w_kl: 1e-4
   w_clip: 0.0
   w_sem: 0.2
-  w_aux: 0.01
+  w_aux: 0.0   # slot diversity disabled
   use_lpips: true
   use_clip: false
   warmup_steps: 500
