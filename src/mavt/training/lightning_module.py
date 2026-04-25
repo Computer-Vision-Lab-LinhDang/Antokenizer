@@ -46,7 +46,6 @@ class MAVTLightningModule(L.LightningModule):
         latent_dim: int = 32,
         kl_weight: float = 1e-4,           # legacy: KL weighting now lives in MAVTLoss
         semantic_dim: int = 768,
-        retr_dim: int = 512,
         num_classes: Optional[int] = None,
         matryoshka_dims: Optional[List[int]] = None,
         matryoshka_alphas: Optional[Dict[int, float]] = None,
@@ -62,11 +61,9 @@ class MAVTLightningModule(L.LightningModule):
         w_l1: float = 1.0,
         w_lpips: float = 0.1,
         w_kl: float = 1.0,
-        w_clip: float = 0.0,
         w_sem: float = 0.0,
         w_aux: float = 0.01,
         use_lpips: bool = True,
-        use_clip: bool = False,
         # Curriculum
         training_stage: int = 1,
         siglip2_model_name: str = "google/siglip2-base-patch16-224",
@@ -93,7 +90,7 @@ class MAVTLightningModule(L.LightningModule):
             patch_size=patch_size, t_patch=t_patch,
             matryoshka_dims=matryoshka_dims,
             latent_dim=latent_dim,
-            semantic_dim=semantic_dim, retr_dim=retr_dim, num_classes=num_classes,
+            semantic_dim=semantic_dim, num_classes=num_classes,
             dec_dim=dec_dim, num_dec_attn_blocks=num_dec_attn_blocks,
             r_s=r_s, r_t=r_t,
             use_gradient_checkpointing=use_gradient_checkpointing,
@@ -102,8 +99,8 @@ class MAVTLightningModule(L.LightningModule):
 
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
-            w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
-            use_lpips=use_lpips, use_clip=use_clip,
+            w_sem=w_sem, w_aux=w_aux,
+            use_lpips=use_lpips,
             matryoshka_alphas=matryoshka_alphas,
         )
 
@@ -241,7 +238,6 @@ class MAVTLightningModule(L.LightningModule):
             all_prefixes=self.model.matryoshka_dims,
             slot_diversity=out.cd_metrics['slot_diversity'],
             teacher_embed=teacher_embed,
-            retr_per_prefix=out.retrieval,
         )
 
         for k, v in losses.items():

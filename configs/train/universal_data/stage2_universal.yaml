@@ -60,12 +60,10 @@ model:
   siglip2_model_name: google/siglip2-base-patch16-224
   w_l1: 1.0
   w_lpips: 0.1
-  w_kl: 1e-4
-  w_clip: 0.0
+  w_kl: 1.0          # MAVTLoss applies β_k = w_kl · (d_k / D_max) per prefix
   w_sem: 0.3
-  w_aux: 0.0   # slot diversity disabled
+  w_aux: 0.0         # slot diversity disabled
   use_lpips: true
-  use_clip: false
   warmup_steps: 500
   total_steps: 200000
   weight_decay: 0.01

@@ -46,7 +46,6 @@ class MAVTOutput:
     loss_kl: Dict[int, torch.Tensor]
     g: Dict[int, torch.Tensor]
     semantic: Dict[int, torch.Tensor]
-    retrieval: Dict[int, torch.Tensor]
     classification: Optional[Dict[int, torch.Tensor]]
     # Slot diversity / residual ratio metrics from C-D split.
     cd_metrics: Dict[str, torch.Tensor]
@@ -71,7 +70,6 @@ class MAVT(nn.Module):
         matryoshka_dims: Optional[Sequence[int]] = None,
         latent_dim: int = 32,
         semantic_dim: int = 768,
-        retr_dim: int = 512,
         num_classes: Optional[int] = None,
         # Decoder
         dec_dim: int = 768,
@@ -111,7 +109,6 @@ class MAVT(nn.Module):
             dims=self.matryoshka_dims,
             latent_dim=latent_dim,
             semantic_dim=semantic_dim,
-            retr_dim=retr_dim,
             num_classes=num_classes,
         )
 
@@ -210,7 +207,6 @@ class MAVT(nn.Module):
             loss_kl={d: mrl_out[d]['kl']    for d in self.matryoshka_dims},
             g={d: mrl_out[d]['g']      for d in self.matryoshka_dims},
             semantic={d: mrl_out[d]['sem']    for d in self.matryoshka_dims},
-            retrieval={d: mrl_out[d]['retr']   for d in self.matryoshka_dims},
             classification=(
                 {d: mrl_out[d]['cls'] for d in self.matryoshka_dims}
                 if self.matryoshka_head.cls_heads is not None else None

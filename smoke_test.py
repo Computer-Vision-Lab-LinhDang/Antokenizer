@@ -38,7 +38,6 @@ def make_model(device):
         matryoshka_dims=(8, 32, 64),
         latent_dim=8,
         semantic_dim=32,
-        retr_dim=16,
         dec_dim=32,
         num_dec_attn_blocks=2,
         r_s=2, r_t=1,

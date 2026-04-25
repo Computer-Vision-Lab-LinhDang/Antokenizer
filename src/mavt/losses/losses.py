@@ -5,7 +5,6 @@ For every active prefix d_k the loss accumulates:
     L_k = mod_w · ( w_l1·L1(recon_k, x) + w_lpips·LPIPS(recon_k, x) )
         + β_k     · KL_k                                           (β_k = w_kl · d_k / D_max)
         + w_sem   · cosine_distill(sem_k, teacher)
-        + w_clip  · InfoNCE(retr_k, text_embed)                    (optional)
 
     L_total = Σ_k α_k · L_k  +  w_aux · slot_diversity
 
@@ -140,21 +139,17 @@ class MAVTLoss(nn.Module):
         w_l1: float    = 1.0,
         w_lpips: float = 0.1,
         w_kl: float    = 1.0,
-        w_clip: float  = 0.0,
         w_sem: float   = 0.5,
         w_aux: float   = 0.01,
         use_lpips: bool = True,
-        use_clip: bool  = False,
         matryoshka_alphas: Optional[Mapping[int, float]] = None,
     ):
         super().__init__()
         self.w_l1 = w_l1
         self.w_lpips = w_lpips
         self.w_kl = w_kl
-        self.w_clip = w_clip
         self.w_sem = w_sem
         self.w_aux = w_aux
-        self.use_clip = use_clip
         self.alphas: Dict[int, float] = (
             {int(k): float(v) for k, v in matryoshka_alphas.items()}
             if matryoshka_alphas else {}
@@ -173,8 +168,6 @@ class MAVTLoss(nn.Module):
         all_prefixes:     Sequence[int],
         slot_diversity:   torch.Tensor,
         teacher_embed:    Optional[torch.Tensor] = None,
-        retr_per_prefix:  Optional[Mapping[int, torch.Tensor]] = None,
-        text_embed:       Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
 
         device = target.device
@@ -198,7 +191,6 @@ class MAVTLoss(nn.Module):
         l_lp_sum    = zero.clone()
         l_kl_sum    = zero.clone()
         l_sem_sum   = zero.clone()
-        l_clip_sum  = zero.clone()
 
         per_prefix_logs: Dict[str, torch.Tensor] = {}
 
@@ -229,18 +221,11 @@ class MAVTLoss(nn.Module):
                 l_sem_sum = l_sem_sum + alpha * sem_d
                 per_prefix_logs[f'loss_sem_{d}'] = sem_d.detach()
 
-            if (self.use_clip and self.w_clip > 0.0 and retr_per_prefix is not None
-                    and d in retr_per_prefix and text_embed is not None):
-                clip_d = infonce_loss(retr_per_prefix[d], text_embed)
-                l_clip_sum = l_clip_sum + alpha * clip_d
-                per_prefix_logs[f'loss_clip_{d}'] = clip_d.detach()
-
         l_div = slot_diversity_loss(slot_diversity)
 
         total = (
             mod_w * l_recon_sum
             + l_kl_sum
-            + self.w_clip * l_clip_sum
             + self.w_sem * l_sem_sum
             + self.w_aux * l_div
         )
@@ -251,7 +236,6 @@ class MAVTLoss(nn.Module):
             'loss_l1':    l_l1_sum,
             'loss_lpips': l_lp_sum,
             'loss_kl':    l_kl_sum,
-            'loss_clip':  l_clip_sum,
             'loss_sem':   l_sem_sum,
             'loss_div':   l_div,
         }

@@ -7,7 +7,6 @@ model:
   t_patch: 2
   latent_dim: 32
   semantic_dim: 768
-  retr_dim: 512
   num_classes: null
   matryoshka_dims: [8, 64, 256, 512, 1152]
   matryoshka_alphas: {8: 1.0, 64: 1.0, 256: 1.0, 512: 1.0, 1152: 1.0}

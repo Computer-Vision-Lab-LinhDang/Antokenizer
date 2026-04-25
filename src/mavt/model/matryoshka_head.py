@@ -8,8 +8,8 @@ parallel branches that share the same tokens but differ in channel width:
                       z_k is always ``latent_dim``-d so a single shared
                       AsymmetricDecoder can decode every prefix.
   • Understanding:    learnable query q_k attends over the d_k-channel tokens
-                      → g_k ∈ R^{d_k}, then per-prefix multi-task heads
-                      (semantic distillation, retrieval, optional classification).
+                      → g_k ∈ R^{d_k}, then per-prefix heads
+                      (semantic distillation, optional classification).
 
 All sub-modules are eagerly constructed in ``__init__`` so their parameters
 are registered before ``configure_optimizers`` runs.
@@ -20,7 +20,6 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _pick_num_heads(dim: int, max_heads: int = 8) -> int:
@@ -58,7 +57,6 @@ class MatryoshkaHead(nn.Module):
                     width of ``compressed`` fed at forward time.
     latent_dim    : VAE latent width, shared across prefixes.
     semantic_dim  : output dim of the semantic distillation head.
-    retr_dim      : output dim of the (L2-normalised) retrieval head.
     num_classes   : optional classification head; disabled when ``None``.
     max_pool_heads: cap on attention heads for the pooler (smaller prefixes
                     fall back to the largest divisor of ``d_k``).
@@ -69,7 +67,6 @@ class MatryoshkaHead(nn.Module):
         dims: Sequence[int] = (8, 64, 256, 512, 1152),
         latent_dim: int = 32,
         semantic_dim: int = 768,
-        retr_dim: int = 512,
         num_classes: Optional[int] = None,
         max_pool_heads: int = 8,
     ):
@@ -77,7 +74,6 @@ class MatryoshkaHead(nn.Module):
         self.dims: Tuple[int, ...] = tuple(int(d) for d in dims)
         self.latent_dim = int(latent_dim)
         self.semantic_dim = int(semantic_dim)
-        self.retr_dim = int(retr_dim)
         if not self.dims or list(self.dims) != sorted(self.dims):
             raise ValueError(f"dims must be ascending, got {self.dims}")
 
@@ -107,9 +103,6 @@ class MatryoshkaHead(nn.Module):
         self.sem_heads = nn.ModuleDict({
             str(d): nn.Linear(d, semantic_dim) for d in self.dims
         })
-        self.retr_heads = nn.ModuleDict({
-            str(d): nn.Linear(d, retr_dim) for d in self.dims
-        })
         self.cls_heads = (
             nn.ModuleDict({str(d): nn.Linear(d, num_classes) for d in self.dims})
             if num_classes else None
@@ -132,7 +125,7 @@ class MatryoshkaHead(nn.Module):
         -------
         dict keyed by ``d_k`` containing per-prefix tensors:
             z, mu, logvar, kl     — reconstruction branch
-            g, sem, retr, [cls]   — understanding branch
+            g, sem, [cls]         — understanding branch
         """
         if compressed.shape[-1] != self.dims[-1]:
             raise ValueError(
@@ -157,8 +150,7 @@ class MatryoshkaHead(nn.Module):
             entry: Dict[str, torch.Tensor] = {
                 'z': z, 'mu': mu, 'logvar': logvar, 'kl': kl,
                 'g': g,
-                'sem':  self.sem_heads[str(d)](g),
-                'retr': F.normalize(self.retr_heads[str(d)](g), dim=-1),
+                'sem': self.sem_heads[str(d)](g),
             }
             if self.cls_heads is not None:
                 entry['cls'] = self.cls_heads[str(d)](g)
