@@ -60,6 +60,7 @@ model:
   w_l1: 1.0
   w_kl: 1e-4
   w_lpips: 0.1
+  w_kl: 1e-4
   w_clip: 0.0
   w_sem: 0.5
   w_aux: 0.01
@@ -73,7 +74,7 @@ model:
 data:
   active_modalities:
     - image
-  universal_data_root: datasets/sample100-1
+  universal_data_root: dataset/
   image_resolution: 256
   batch_size: 32
   num_workers: 8
