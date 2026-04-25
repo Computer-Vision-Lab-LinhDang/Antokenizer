@@ -51,6 +51,7 @@ class MAVTLightningModule(L.LightningModule):
         # Loss
         w_l1: float = 1.0,
         w_lpips: float = 0.1,
+        w_kl: float = 1e-4,
         w_clip: float = 0.0,
         w_sem: float = 0.0,
         w_aux: float = 0.01,
@@ -81,7 +82,7 @@ class MAVTLightningModule(L.LightningModule):
         )
 
         self.loss_fn = MAVTLoss(
-            w_l1=w_l1, w_lpips=w_lpips, w_kl=1.0,
+            w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
             use_lpips=use_lpips, use_clip=use_clip,
         )
