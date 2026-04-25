@@ -181,7 +181,6 @@ class MAVTLoss(nn.Module):
         loss_kl: torch.Tensor,
         slot_diversity: torch.Tensor,
         modality: str,
-        semantic_embed: Optional[torch.Tensor] = None,
         semantic_embeds: Optional[Mapping[int, torch.Tensor]] = None,
         text_embed: Optional[torch.Tensor] = None,
         teacher_embed: Optional[torch.Tensor] = None,
