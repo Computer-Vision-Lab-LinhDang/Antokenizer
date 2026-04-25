@@ -35,10 +35,10 @@ def make_model(device):
         num_blocks=4,
         patch_size=16,
         t_patch=2,
+        matryoshka_dims=(8, 32, 64),
         latent_dim=8,
-        kl_weight=1e-4,
         semantic_dim=32,
-        mrl_prefixes=(4, 8),
+        retr_dim=16,
         dec_dim=32,
         num_dec_attn_blocks=2,
         r_s=2, r_t=1,
@@ -139,37 +139,40 @@ def test_forward(device):
     print('\n[4] Full forward pass - all modalities')
     model = make_model(device)
     model.eval()
+    d_max = model.matryoshka_dims[-1]
 
     # Image 128x128
     x_img = torch.randn(2, 3, 128, 128, device=device)
     with torch.no_grad():
         out = model(x_img, 'image')
     check('image recon shape == input shape',
-          out.reconstruction.shape == x_img.shape, str(out.reconstruction.shape))
-    check('image z last dim == latent_dim', out.z.shape[-1] == 8)
-    check('image semantic shape', out.semantic.shape == (2, 32), str(out.semantic.shape))
-    check('image MRL semantic prefixes',
-          sorted(out.semantic_mrl.keys()) == [4, 8],
-          str(sorted(out.semantic_mrl.keys())))
-    check('image MRL semantic shape',
-          out.semantic_mrl[4].shape == (2, 32), str(out.semantic_mrl[4].shape))
-    check('image loss_kl is scalar', out.loss_kl.ndim == 0)
+          out.reconstruction[d_max].shape == x_img.shape,
+          str(out.reconstruction[d_max].shape))
+    check('image z last dim == latent_dim', out.z[d_max].shape[-1] == 8)
+    check('image semantic shape', out.semantic[d_max].shape == (2, 32),
+          str(out.semantic[d_max].shape))
+    check('image loss_kl is scalar', out.loss_kl[d_max].ndim == 0)
+    check('all matryoshka prefixes present in semantic dict',
+          set(out.semantic.keys()) == set(model.matryoshka_dims))
+    check('all matryoshka prefixes present in recon dict',
+          set(out.reconstruction.keys()) == set(model.matryoshka_dims))
 
-    # Video: 8 frames, 64x64.
-    # Decoder works in patch-grid temporal space (Tp = T//t_patch = 4).
+    # Video: 8 frames, 64x64. Decoder works in patch-grid temporal space (Tp=4).
     x_vid = torch.randn(2, 3, 8, 64, 64, device=device)
     with torch.no_grad():
         out_v = model(x_vid, 'video')
-    expected_vid = (2, 3, 4, 64, 64)   # Tp=4, spatial 64x64 (4 grid * 16x PS)
+    expected_vid = (2, 3, 4, 64, 64)
     check('video recon shape (B, 3, Tp, H, W)',
-          out_v.reconstruction.shape == expected_vid, str(out_v.reconstruction.shape))
+          out_v.reconstruction[d_max].shape == expected_vid,
+          str(out_v.reconstruction[d_max].shape))
 
     # 3D triplane: 3 planes, 3 channels, 64x64
     x_3d = torch.randn(2, 3, 3, 64, 64, device=device)
     with torch.no_grad():
         out_3 = model(x_3d, 'threed')
     check('3d recon shape == input shape',
-          out_3.reconstruction.shape == x_3d.shape, str(out_3.reconstruction.shape))
+          out_3.reconstruction[d_max].shape == x_3d.shape,
+          str(out_3.reconstruction[d_max].shape))
 
 
 # --------------------------------------------------------------------------- #
