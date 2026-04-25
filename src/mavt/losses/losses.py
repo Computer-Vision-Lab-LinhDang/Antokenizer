@@ -25,7 +25,15 @@ class LPIPSLoss(nn.Module):
             import lpips
             self._lpips = lpips.LPIPS(net=net)
             self._available = True
-        except ImportError:
+        except ImportError as exc:
+            import warnings
+            warnings.warn(
+                f"[MAVTLoss] `lpips` package not installed ({exc}); "
+                "perceptual loss disabled. Install with `pip install lpips`. "
+                "Without LPIPS, image reconstructions will collapse to gray (L1-only failure mode).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             self._available = False
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

@@ -30,7 +30,7 @@ else
 fi
 cd "$PROJECT_DIR"
 
-IMAGE_SHARDS_DIR="${IMAGE_SHARDS_DIR:-$PROJECT_DIR/dataset/image10k/train}"
+UNIVERSAL_DATA_ROOT="${UNIVERSAL_DATA_ROOT:-${IMAGE_SHARDS_DIR:-$PROJECT_DIR/dataset/image10k/train}}"
 STAGE1_CONFIG="${STAGE1_CONFIG:-configs/train/universal_data/stage1_universal.yaml}"
 INSTALL_DEPS="${INSTALL_DEPS:-false}"
 
@@ -145,8 +145,8 @@ fi
 
 NUM_GPUS=$("$PYTHON_CMD" -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "1")
 PYTHON_BIN="$(command -v "$PYTHON_CMD")"
-if [ -d "$IMAGE_SHARDS_DIR" ]; then
-    IMAGE_SHARD_COUNT=$(find "$IMAGE_SHARDS_DIR" -maxdepth 1 -type f -name '*.tar' | wc -l | tr -d ' ')
+if [ -d "$UNIVERSAL_DATA_ROOT" ]; then
+    IMAGE_SHARD_COUNT=$(find "$UNIVERSAL_DATA_ROOT" -maxdepth 1 -type f -name '*.tar' | wc -l | tr -d ' ')
 else
     IMAGE_SHARD_COUNT=0
 fi
@@ -156,8 +156,8 @@ echo "  MAVT Stage 1 — Image Only"
 echo "  Project dir:      $PROJECT_DIR"
 echo "  Python:           $PYTHON_BIN"
 echo "  GPUs:             $NUM_GPUS"
-echo "  Dataset path:     $IMAGE_SHARDS_DIR"
-echo "  Dataset exists:   $([ -d "$IMAGE_SHARDS_DIR" ] && echo yes || echo no)"
+echo "  Dataset path:     $UNIVERSAL_DATA_ROOT"
+echo "  Dataset exists:   $([ -d "$UNIVERSAL_DATA_ROOT" ] && echo yes || echo no)"
 echo "  Image .tar shards: $IMAGE_SHARD_COUNT"
 echo "  Config:           $STAGE1_CONFIG"
 echo "  Pretrained model: $SIGLIP2_MODEL_NAME_EFFECTIVE ($SIGLIP2_MODEL_NAME_SOURCE)"
@@ -187,7 +187,7 @@ echo "[INFO] Starting Stage 1 training..."
 "$PYTHON_CMD" train.py fit \
     --config configs/model/mavt_base.yaml \
     --config "$STAGE1_CONFIG" \
-    --data.image_shards_dir "$IMAGE_SHARDS_DIR" \
+    --data.universal_data_root "$UNIVERSAL_DATA_ROOT" \
     --data.active_modalities '["image"]' \
     --data.image_resolution 256 \
     --data.batch_size 32 \

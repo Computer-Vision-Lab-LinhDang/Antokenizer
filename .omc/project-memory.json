@@ -85,20 +85,20 @@
   "hotPaths": [
     {
       "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 8,
-      "lastAccessed": 1777022557312,
+      "accessCount": 10,
+      "lastAccessed": 1777094485962,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 7,
+      "lastAccessed": 1777090769549,
       "type": "file"
     },
     {
       "path": "src/mavt/model/mavt.py",
       "accessCount": 6,
       "lastAccessed": 1777024171020,
-      "type": "file"
-    },
-    {
-      "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 6,
-      "lastAccessed": 1777024192889,
       "type": "file"
     },
     {
@@ -114,6 +114,18 @@
       "type": "file"
     },
     {
+      "path": "src/mavt/data/datamodule.py",
+      "accessCount": 5,
+      "lastAccessed": 1777091054426,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/losses/losses.py",
+      "accessCount": 5,
+      "lastAccessed": 1777094586506,
+      "type": "file"
+    },
+    {
       "path": "src/mavt/model/patchify.py",
       "accessCount": 4,
       "lastAccessed": 1777021897353,
@@ -126,9 +138,15 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/losses/losses.py",
+      "path": "train_stage1.sh",
+      "accessCount": 4,
+      "lastAccessed": 1777090811264,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/data/datasets.py",
       "accessCount": 3,
-      "lastAccessed": 1777019612927,
+      "lastAccessed": 1777090992849,
       "type": "file"
     },
     {
@@ -153,18 +171,6 @@
       "path": "configs/model/mavt_base.yaml",
       "accessCount": 1,
       "lastAccessed": 1777017297301,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/data/datamodule.py",
-      "accessCount": 1,
-      "lastAccessed": 1777017302641,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/data/datasets.py",
-      "accessCount": 1,
-      "lastAccessed": 1777017302848,
       "type": "file"
     },
     {

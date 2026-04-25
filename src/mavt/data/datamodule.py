@@ -9,11 +9,14 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, random_split
 import lightning as L
 
+from pathlib import Path
+
 from mavt.data.datasets import (
     SyntheticMultiModalDataset,
     UniversalImageDataset,
     UniversalVideoDataset,
     UniversalThreeDDataset,
+    WDSImageDataset,
 )
 
 
@@ -143,7 +146,11 @@ class MAVTDataModule(L.LightningDataModule):
         hp = self.hparams
         if hp.universal_data_root:
             if modality == 'image':
-                return UniversalImageDataset(hp.universal_data_root, hp.image_resolution)
+                root = Path(hp.universal_data_root)
+                # Auto-detect WebDataset .tar shard layout vs. raw images/ directory
+                if any(root.glob("*.tar")):
+                    return WDSImageDataset(str(root), hp.image_resolution)
+                return UniversalImageDataset(str(root), hp.image_resolution)
             elif modality == 'video':
                 return UniversalVideoDataset(hp.universal_data_root, hp.video_frames, hp.video_resolution)
             elif modality == 'threed':
