@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ProxyCommand=\\\"sshpass -p 1 ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -W %h:%p...",
-  "error": "Exit code 255\nPermission denied, please try again.\r\nPermission denied, please try again.\r\nuser02@172.16.3.9: Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).",
-  "timestamp": "2026-04-25T17:40:32.779Z",
-  "retry_count": 3
+  "tool_input_preview": "{\"command\":\"python -c \\\"\\nfrom mavt.data.datamodule import MAVTDataModule\\nimport inspect\\nsig = inspect.signature(MAVTDataModule.__init__)\\nfor name in ('image_shards_dir', 'video_shards_dir', 'video...",
+  "error": "Exit code 127\n(eval):1: command not found: python",
+  "timestamp": "2026-04-26T02:02:19.712Z",
+  "retry_count": 1
 }

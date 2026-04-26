@@ -116,27 +116,39 @@
   },
   "hotPaths": [
     {
+      "path": "src/mavt/data/datamodule.py",
+      "accessCount": 6,
+      "lastAccessed": 1777169220179,
+      "type": "file"
+    },
+    {
       "path": "src/mavt/training/lightning_module.py",
       "accessCount": 4,
       "lastAccessed": 1777138689765,
       "type": "file"
     },
     {
-      "path": "configs/train/universal_data/stage3_universal.yaml",
-      "accessCount": 2,
-      "lastAccessed": 1777138763919,
-      "type": "file"
-    },
-    {
       "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 2,
-      "lastAccessed": 1777138790625,
+      "accessCount": 3,
+      "lastAccessed": 1777167386040,
       "type": "file"
     },
     {
       "path": "configs/train/universal_data/stage2_universal.yaml",
-      "accessCount": 2,
-      "lastAccessed": 1777138806011,
+      "accessCount": 3,
+      "lastAccessed": 1777167387045,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage3_universal.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1777167387146,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/data/datasets.py",
+      "accessCount": 3,
+      "lastAccessed": 1777169149383,
       "type": "file"
     },
     {

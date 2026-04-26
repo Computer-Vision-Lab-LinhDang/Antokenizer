@@ -12,6 +12,7 @@ import lightning as L
 from pathlib import Path
 
 from mavt.data.datasets import (
+    ShardVideoDataset,
     SyntheticMultiModalDataset,
     UniversalImageDataset,
     UniversalVideoDataset,
@@ -122,6 +123,11 @@ class MAVTDataModule(L.LightningDataModule):
         active_modalities: List[str] = ('image',),
         # Data root (None → synthetic smoke-test)
         universal_data_root: Optional[str] = None,
+        # Per-modality overrides (override universal_data_root when set)
+        image_shards_dir: Optional[str] = None,
+        video_shards_dir: Optional[str] = None,
+        video_max_shards: Optional[int] = None,
+        triplane_dir: Optional[str] = None,
         # Data params
         image_resolution: int = 256,
         video_frames: int = 16,
@@ -144,6 +150,20 @@ class MAVTDataModule(L.LightningDataModule):
 
     def _make_dataset(self, modality: str) -> Dataset:
         hp = self.hparams
+        # Per-modality overrides take precedence over universal_data_root
+        if modality == 'image' and hp.image_shards_dir:
+            return WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
+        if modality == 'video' and hp.video_shards_dir:
+            return ShardVideoDataset(
+                hp.video_shards_dir,
+                n_frames=hp.video_frames,
+                resolution=hp.video_resolution,
+                max_shards=hp.video_max_shards,
+            )
+        if modality == 'threed' and hp.triplane_dir:
+            return UniversalThreeDDataset(
+                root='', resolution=hp.triplane_res, renders_dir=hp.triplane_dir,
+            )
         if hp.universal_data_root:
             if modality == 'image':
                 root = Path(hp.universal_data_root)

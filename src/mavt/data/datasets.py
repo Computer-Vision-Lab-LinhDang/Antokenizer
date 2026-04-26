@@ -186,14 +186,19 @@ class UniversalThreeDDataset(Dataset):
         id       : object folder name
     """
 
-    def __init__(self, root: str, resolution: int = 256):
-        root = Path(root)
-        captions_path = root / 'captions' / '3d.json'
+    def __init__(self, root: str, resolution: int = 256,
+                 renders_dir: Optional[str] = None):
+        root_path = Path(root) if root else None
+        captions_path = (root_path / 'captions' / '3d.json') if root_path else None
         self.captions: Dict[str, str] = (
-            json.loads(captions_path.read_text()) if captions_path.exists() else {}
+            json.loads(captions_path.read_text())
+            if captions_path is not None and captions_path.exists() else {}
         )
-        renders_dir = root / '3d_objects' / 'renders'
-        if renders_dir.exists():
+        renders_dir = (
+            Path(renders_dir) if renders_dir
+            else (root_path / '3d_objects' / 'renders' if root_path else None)
+        )
+        if renders_dir is not None and renders_dir.exists():
             self.obj_dirs: List[Path] = sorted(
                 d for d in renders_dir.iterdir()
                 if d.is_dir() and not d.name.startswith('.')
