@@ -116,9 +116,21 @@
   },
   "hotPaths": [
     {
+      "path": "scripts/download_datasets.sh",
+      "accessCount": 13,
+      "lastAccessed": 1777193568572,
+      "type": "file"
+    },
+    {
       "path": "src/mavt/data/datamodule.py",
       "accessCount": 6,
       "lastAccessed": 1777169220179,
+      "type": "file"
+    },
+    {
+      "path": "train_stage3.sh",
+      "accessCount": 5,
+      "lastAccessed": 1777169882838,
       "type": "file"
     },
     {
@@ -167,6 +179,12 @@
       "path": "train.py",
       "accessCount": 1,
       "lastAccessed": 1777138818587,
+      "type": "file"
+    },
+    {
+      "path": "convert_to_wds.py",
+      "accessCount": 1,
+      "lastAccessed": 1777192276116,
       "type": "file"
     }
   ],

@@ -164,6 +164,7 @@ def prepare_videos(video_shards_dir: str, data_root: Path, max_videos: int = Non
             f.write(p.name + "\n")
 
     print(f"  Videos: {count:,} linked -> {videos_dir}")
+    
     print(f"  Captions: {len(captions):,} -> {cap_path}")
 
 

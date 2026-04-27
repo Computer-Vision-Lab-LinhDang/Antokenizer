@@ -27,7 +27,11 @@
       "Bash(conda env *)",
       "Bash(uv pip *)",
       "Bash(python3 *)",
-      "Bash(ssh *)"
+      "Bash(ssh *)",
+      "Bash(bash -n /Users/nguyenbinhan/Workspace/AToken/atoken/scripts/download_datasets.sh)",
+      "Bash(chmod +x /Users/nguyenbinhan/Workspace/AToken/atoken/scripts/download_datasets.sh)",
+      "Read(//Users/nguyenbinhan/miniconda3/**)",
+      "Bash(command -v python3)"
     ]
   }
 }
