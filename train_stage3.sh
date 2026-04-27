@@ -15,13 +15,12 @@
 #   - SigLIP2 fully unfrozen
 #   - LR = 2e-5
 #   - Resume from Stage 2 checkpoint
-#   - 3D data from universal root (triplane renders required)
+#   - 3D data loaded directly from dataset/tripplane/<uid>/{oxoy,oxoz,oyoz}.png
 #
 # Prerequisites:
 #   1. Stage 2 checkpoint exists
-#   2. Objaverse .glb files downloaded (obja.py)
-#   3. Triplane renders generated (scripts/glb_to_tripplane.py)
-#   4. prepare_dataset.py run with --objaverse_dir to create universal layout
+#   2. Triplane renders ready at $TRIPLANE_DIR (one subdir per object,
+#      each containing oxoy.png, oxoz.png, oyoz.png)
 #
 # Usage:
 #   sbatch train_stage3.sh
@@ -39,7 +38,7 @@ cd "$PROJECT_DIR"
 
 IMAGE_SHARDS_DIR="$PROJECT_DIR/dataset/image10k/train"
 VIDEO_SHARDS_DIR="$PROJECT_DIR/dataset/dataset_10m"
-UNIVERSAL_ROOT="$PROJECT_DIR/data/universal"
+TRIPLANE_DIR="$PROJECT_DIR/dataset/tripplane"
 
 # --- Stage 2 checkpoint (edit this path after Stage 2 completes) ---
 STAGE2_CKPT="checkpoints/stage2/last.ckpt"
@@ -62,9 +61,8 @@ export TOKENIZERS_PARALLELISM=false
 NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "1")
 
 # --- Check 3D data availability ---
-THREED_RENDERS="$UNIVERSAL_ROOT/3d_objects/renders"
-if [ -d "$THREED_RENDERS" ]; then
-    N_3D=$(find "$THREED_RENDERS" -mindepth 1 -maxdepth 1 -type d | wc -l)
+if [ -d "$TRIPLANE_DIR" ]; then
+    N_3D=$(find "$TRIPLANE_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)
 else
     N_3D=0
 fi
@@ -74,20 +72,16 @@ echo "  MAVT Stage 3 — Image + Video + 3D"
 echo "  GPUs: $NUM_GPUS"
 echo "  Image shards:   $IMAGE_SHARDS_DIR"
 echo "  Video shards:   $VIDEO_SHARDS_DIR"
-echo "  Universal root: $UNIVERSAL_ROOT"
+echo "  Triplane dir:   $TRIPLANE_DIR"
 echo "  3D objects:     $N_3D renders"
 echo "  Checkpoint:     $STAGE2_CKPT"
 echo "========================================"
 
 if [ "$N_3D" -eq 0 ]; then
     echo ""
-    echo "[WARN] No 3D triplane renders found in $THREED_RENDERS"
-    echo "       3D modality will fall back to synthetic data."
-    echo "       To use real 3D data:"
-    echo "         1. python obja.py              # download .glb files"
-    echo "         2. python scripts/glb_to_tripplane.py  # render triplanes"
-    echo "         3. python prepare_dataset.py --data_root $UNIVERSAL_ROOT --objaverse_dir dataset/objaverse"
-    echo ""
+    echo "[ERROR] No 3D triplane renders found in $TRIPLANE_DIR"
+    echo "        Expected layout: $TRIPLANE_DIR/<uid>/{oxoy,oxoz,oyoz}.png"
+    exit 1
 fi
 
 # Verify checkpoint exists
@@ -105,7 +99,7 @@ python train.py fit \
     --data.image_shards_dir "$IMAGE_SHARDS_DIR" \
     --data.video_shards_dir "$VIDEO_SHARDS_DIR" \
     --data.video_max_shards 100 \
-    --data.universal_data_root "$UNIVERSAL_ROOT" \
+    --data.triplane_dir "$TRIPLANE_DIR" \
     --data.active_modalities '["image", "video", "threed"]' \
     --data.image_resolution 256 \
     --data.video_frames 16 \
@@ -117,7 +111,6 @@ python train.py fit \
     --model.training_stage 3 \
     --model.init_siglip2 false \
     --model.use_lpips true \
-    --model.use_clip false \
     --model.warmup_steps 500 \
     --model.total_steps 200000 \
     --trainer.devices "$NUM_GPUS" \
