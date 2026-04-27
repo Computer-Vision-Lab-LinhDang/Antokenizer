@@ -215,10 +215,28 @@ class MAVTDataModule(L.LightningDataModule):
                 drop_last=True, shuffle=True,
             )
 
-        self._val_ds: Dataset = val_splits[0] if len(val_splits) == 1 else ConcatDataset(val_splits)
-        self._test_ds: Optional[Dataset] = (
-            test_splits[0] if len(test_splits) == 1 else ConcatDataset(test_splits)
-        ) if test_splits else None
+        if len(val_splits) == 1:
+            self._val_ds: Dataset = val_splits[0]
+            self._val_batch_sampler = None
+        else:
+            self._val_ds = ConcatDataset(val_splits)
+            self._val_batch_sampler = ModalityGroupedBatchSampler(
+                self._val_ds, hp.batch_size,
+                drop_last=False, shuffle=False,
+            )
+
+        if not test_splits:
+            self._test_ds: Optional[Dataset] = None
+            self._test_batch_sampler = None
+        elif len(test_splits) == 1:
+            self._test_ds = test_splits[0]
+            self._test_batch_sampler = None
+        else:
+            self._test_ds = ConcatDataset(test_splits)
+            self._test_batch_sampler = ModalityGroupedBatchSampler(
+                self._test_ds, hp.batch_size,
+                drop_last=False, shuffle=False,
+            )
 
     def train_dataloader(self) -> DataLoader:
         hp = self.hparams
@@ -242,6 +260,14 @@ class MAVTDataModule(L.LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         hp = self.hparams
+        if self._val_batch_sampler is not None:
+            return DataLoader(
+                self._val_ds,
+                batch_sampler=self._val_batch_sampler,
+                num_workers=hp.num_workers,
+                pin_memory=hp.pin_memory,
+                collate_fn=_collate,
+            )
         return DataLoader(
             self._val_ds, batch_size=hp.batch_size, shuffle=False,
             num_workers=hp.num_workers, pin_memory=hp.pin_memory,
@@ -252,6 +278,14 @@ class MAVTDataModule(L.LightningDataModule):
         if self._test_ds is None:
             return None
         hp = self.hparams
+        if self._test_batch_sampler is not None:
+            return DataLoader(
+                self._test_ds,
+                batch_sampler=self._test_batch_sampler,
+                num_workers=hp.num_workers,
+                pin_memory=hp.pin_memory,
+                collate_fn=_collate,
+            )
         return DataLoader(
             self._test_ds, batch_size=hp.batch_size, shuffle=False,
             num_workers=hp.num_workers, pin_memory=hp.pin_memory,

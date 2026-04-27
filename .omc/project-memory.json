@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1777138646794,
+  "lastScanned": 1777284994459,
   "projectRoot": "/Users/nguyenbinhan/Workspace/AToken/atoken",
   "techStack": {
     "languages": [
@@ -54,7 +54,7 @@
       "path": "__pycache__",
       "purpose": null,
       "fileCount": 4,
-      "lastAccessed": 1777138646781,
+      "lastAccessed": 1777284994444,
       "keyFiles": [
         "evaluate.cpython-314.pyc",
         "quick_train_test.cpython-314.pyc",
@@ -66,14 +66,14 @@
       "path": "configs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777138646784,
+      "lastAccessed": 1777284994445,
       "keyFiles": []
     },
     "logs": {
       "path": "logs",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1777138646785,
+      "lastAccessed": 1777284994454,
       "keyFiles": [
         "err_7737.txt",
         "err_7738.txt",
@@ -85,9 +85,10 @@
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
-      "fileCount": 2,
-      "lastAccessed": 1777138646786,
+      "fileCount": 3,
+      "lastAccessed": 1777284994454,
       "keyFiles": [
+        "download_datasets.sh",
         "download_objaverse.py",
         "glb_to_tripplane.py"
       ]
@@ -96,21 +97,21 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 0,
-      "lastAccessed": 1777138646787,
+      "lastAccessed": 1777284994455,
       "keyFiles": []
     },
     "train": {
       "path": "train",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777138646788,
+      "lastAccessed": 1777284994456,
       "keyFiles": []
     },
     "wandb": {
       "path": "wandb",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777138646789,
+      "lastAccessed": 1777284994456,
       "keyFiles": []
     }
   },
@@ -123,14 +124,14 @@
     },
     {
       "path": "src/mavt/data/datamodule.py",
-      "accessCount": 6,
-      "lastAccessed": 1777169220179,
+      "accessCount": 9,
+      "lastAccessed": 1777285301866,
       "type": "file"
     },
     {
       "path": "train_stage3.sh",
-      "accessCount": 5,
-      "lastAccessed": 1777169882838,
+      "accessCount": 6,
+      "lastAccessed": 1777285047317,
       "type": "file"
     },
     {
