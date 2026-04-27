@@ -105,7 +105,7 @@ PY
     done < "${local_dir}/.shards_keep.txt"
 
     log "Tải ${keep} shard về ${local_dir}..."
-    huggingface-cli download \
+    hf download \
         "${repo_id}" \
         --repo-type dataset \
         --local-dir "${local_dir}" \
@@ -124,7 +124,7 @@ download_imagenet() {
     download_half_shards "${IMAGENET_REPO}" "${IMAGENET_DIR}" "data/train-" "parquet" "${IMAGENET_EXTRA_SHARDS:-100}"
     # Validation/test rất nhỏ → tải đầy đủ để có ground-truth eval.
     log "Tải toàn bộ validation/test (nhỏ) + metadata..."
-    huggingface-cli download \
+    hf download \
         "${IMAGENET_REPO}" \
         --repo-type dataset \
         --local-dir "${IMAGENET_DIR}" \
@@ -158,10 +158,9 @@ PY
     fi
 
     log "Gộp ${csv_dir} (1/2 partition) -> ${merged}"
-    WEBVID_ROOT="${WEBVID_DIR}" \
-    WEBVID_MERGED="${merged}" \
-    WEBVID_MAX_ROWS="${WEBVID_MAX_ROWS:-0}" \
-    python3 - <<'PY'
+    local _merge_py
+    _merge_py="$(mktemp /tmp/webvid_merge_XXXXXX.py)"
+    cat > "${_merge_py}" <<'PY'
 import csv
 import os
 import sys
@@ -200,6 +199,9 @@ with open(out, "w", newline="", encoding="utf-8") as fout:
             for row in reader:
                 if not (row.get("contentUrl") or "").strip():
                     continue
+                # PyArrow (used by video2dataset) does not handle multiline cell
+                # values by default; collapse embedded newlines to a space.
+                row = {k: (v.replace("\r\n", " ").replace("\r", " ").replace("\n", " ") if isinstance(v, str) else v) for k, v in row.items()}
                 writer.writerow(row)
                 n_rows += 1
                 if max_rows > 0 and n_rows >= max_rows:
@@ -214,6 +216,11 @@ if n_rows == 0:
 limit_note = f" (limited by WEBVID_MAX_ROWS={max_rows})" if max_rows > 0 else ""
 print(f"[merge] rows={n_rows}{limit_note} -> {out}")
 PY
+    WEBVID_ROOT="${WEBVID_DIR}" \
+    WEBVID_MERGED="${merged}" \
+    WEBVID_MAX_ROWS="${WEBVID_MAX_ROWS:-0}" \
+    python3 "${_merge_py}"
+    rm -f "${_merge_py}"
 
     local size="${WEBVID_VIDEO_SIZE:-256}"
     local download_size="${WEBVID_DOWNLOAD_SIZE:-480}"
@@ -227,6 +234,116 @@ PY
     local tmp_dir="${WEBVID_TMP_DIR:-/tmp}"
 
     log "video2dataset → ${out_dir} (format=${output_format}, shard=${shard_size}, size=${size}, proc=${nproc}, thr=${nthr})"
+    local _v2d_py
+    _v2d_py="$(mktemp /tmp/webvid_v2d_XXXXXX.py)"
+    cat > "${_v2d_py}" <<'PY'
+import csv
+import inspect
+import os
+
+from video2dataset import video2dataset
+
+if __name__ == "__main__":
+    url_list = os.environ["WEBVID_URL_LIST"]
+    output_folder = os.environ["WEBVID_OUTPUT_FOLDER"]
+    output_format = os.environ["WEBVID_OUTPUT_FORMAT"]
+    video_size = int(os.environ["WEBVID_VIDEO_SIZE"])
+    download_size = int(os.environ["WEBVID_DOWNLOAD_SIZE"])
+    shard_size = int(os.environ["WEBVID_SHARD_SIZE"])
+    processes_count = int(os.environ["WEBVID_PROCESSES"])
+    thread_count = int(os.environ["WEBVID_THREADS"])
+    resize_mode = os.environ["WEBVID_RESIZE_MODE"].strip()
+    incremental_mode = os.environ["WEBVID_INCREMENTAL_MODE"]
+    timeout = int(os.environ["WEBVID_TIMEOUT"])
+    tmp_dir = os.environ["WEBVID_TMP_DIR"]
+
+    with open(url_list, newline="", encoding="utf-8") as fin:
+        columns = next(csv.reader(fin))
+
+    required = {"contentUrl", "name"}
+    missing = required.difference(columns)
+    if missing:
+        raise SystemExit(f"video2dataset input thiếu cột bắt buộc: {sorted(missing)}")
+
+    save_cols = [c for c in ("videoid", "page_dir", "duration", "page_idx") if c in columns]
+    common_kwargs = {
+        "url_list": url_list,
+        "output_folder": output_folder,
+        "output_format": output_format,
+        "input_format": "csv",
+        "url_col": "contentUrl",
+        "caption_col": "name",
+        "save_additional_columns": save_cols,
+    }
+
+    signature = inspect.signature(video2dataset)
+    params = signature.parameters
+
+    if "encode_formats" in params:
+        common_kwargs["encode_formats"] = {"video": "mp4"}
+
+    if "config" in params:
+        subsampling = {}
+        if resize_mode.lower() not in {"", "0", "none", "no", "false"}:
+            subsampling["ResolutionSubsampler"] = {
+                "args": {
+                    "video_size": video_size,
+                    "resize_mode": resize_mode,
+                }
+            }
+        kwargs = {
+            **common_kwargs,
+            "config": {
+                "subsampling": subsampling,
+                "reading": {
+                    "yt_args": {
+                        "download_size": download_size,
+                        "download_audio_rate": 44100,
+                        "yt_metadata_args": None,
+                    },
+                    "timeout": timeout,
+                    "sampler": None,
+                },
+                "storage": {
+                    "number_sample_per_shard": shard_size,
+                    "oom_shard_count": 5,
+                    "captions_are_subtitles": False,
+                },
+                "distribution": {
+                    "processes_count": processes_count,
+                    "thread_count": thread_count,
+                    "subjob_size": 1000,
+                    "distributor": "multiprocessing",
+                },
+            },
+            "incremental_mode": incremental_mode,
+            "tmp_dir": tmp_dir,
+        }
+    else:
+        legacy_kwargs = {
+            **common_kwargs,
+            "processes_count": processes_count,
+            "thread_count": thread_count,
+            "number_sample_per_shard": shard_size,
+            "oom_shard_count": 5,
+            "distributor": "multiprocessing",
+            "subjob_size": 1000,
+            "incremental_mode": incremental_mode,
+            "timeout": timeout,
+            "tmp_dir": tmp_dir,
+        }
+        if resize_mode.lower() not in {"", "0", "none", "no", "false"}:
+            legacy_kwargs["video_size"] = video_size
+            legacy_kwargs["resize_mode"] = [part.strip() for part in resize_mode.split(",") if part.strip()]
+        kwargs = {key: value for key, value in legacy_kwargs.items() if key in params}
+
+    print(
+        "[v2d] api_params="
+        f"{','.join(params)}; save_cols={save_cols}; output_format={output_format}; "
+        f"resize_mode={resize_mode or 'none'}"
+    )
+    video2dataset(**kwargs)
+PY
     WEBVID_URL_LIST="${merged}" \
     WEBVID_OUTPUT_FOLDER="${out_dir}" \
     WEBVID_OUTPUT_FORMAT="${output_format}" \
@@ -239,113 +356,8 @@ PY
     WEBVID_INCREMENTAL_MODE="${incremental_mode}" \
     WEBVID_TIMEOUT="${timeout}" \
     WEBVID_TMP_DIR="${tmp_dir}" \
-    python3 - <<'PY'
-import csv
-import inspect
-import os
-
-from video2dataset import video2dataset
-
-url_list = os.environ["WEBVID_URL_LIST"]
-output_folder = os.environ["WEBVID_OUTPUT_FOLDER"]
-output_format = os.environ["WEBVID_OUTPUT_FORMAT"]
-video_size = int(os.environ["WEBVID_VIDEO_SIZE"])
-download_size = int(os.environ["WEBVID_DOWNLOAD_SIZE"])
-shard_size = int(os.environ["WEBVID_SHARD_SIZE"])
-processes_count = int(os.environ["WEBVID_PROCESSES"])
-thread_count = int(os.environ["WEBVID_THREADS"])
-resize_mode = os.environ["WEBVID_RESIZE_MODE"].strip()
-incremental_mode = os.environ["WEBVID_INCREMENTAL_MODE"]
-timeout = int(os.environ["WEBVID_TIMEOUT"])
-tmp_dir = os.environ["WEBVID_TMP_DIR"]
-
-with open(url_list, newline="", encoding="utf-8") as fin:
-    columns = next(csv.reader(fin))
-
-required = {"contentUrl", "name"}
-missing = required.difference(columns)
-if missing:
-    raise SystemExit(f"video2dataset input thiếu cột bắt buộc: {sorted(missing)}")
-
-save_cols = [c for c in ("videoid", "page_dir", "duration", "page_idx") if c in columns]
-common_kwargs = {
-    "url_list": url_list,
-    "output_folder": output_folder,
-    "output_format": output_format,
-    "input_format": "csv",
-    "url_col": "contentUrl",
-    "caption_col": "name",
-    "save_additional_columns": save_cols,
-}
-
-signature = inspect.signature(video2dataset)
-params = signature.parameters
-
-if "encode_formats" in params:
-    common_kwargs["encode_formats"] = {"video": "mp4"}
-
-if "config" in params:
-    subsampling = {}
-    if resize_mode.lower() not in {"", "0", "none", "no", "false"}:
-        subsampling["ResolutionSubsampler"] = {
-            "args": {
-                "video_size": video_size,
-                "resize_mode": resize_mode,
-            }
-        }
-    kwargs = {
-        **common_kwargs,
-        "config": {
-            "subsampling": subsampling,
-            "reading": {
-                "yt_args": {
-                    "download_size": download_size,
-                    "download_audio_rate": 44100,
-                    "yt_metadata_args": None,
-                },
-                "timeout": timeout,
-                "sampler": None,
-            },
-            "storage": {
-                "number_sample_per_shard": shard_size,
-                "oom_shard_count": 5,
-                "captions_are_subtitles": False,
-            },
-            "distribution": {
-                "processes_count": processes_count,
-                "thread_count": thread_count,
-                "subjob_size": 1000,
-                "distributor": "multiprocessing",
-            },
-        },
-        "incremental_mode": incremental_mode,
-        "tmp_dir": tmp_dir,
-    }
-else:
-    legacy_kwargs = {
-        **common_kwargs,
-        "processes_count": processes_count,
-        "thread_count": thread_count,
-        "number_sample_per_shard": shard_size,
-        "oom_shard_count": 5,
-        "distributor": "multiprocessing",
-        "subjob_size": 1000,
-        "incremental_mode": incremental_mode,
-        "timeout": timeout,
-        "tmp_dir": tmp_dir,
-    }
-    if resize_mode.lower() not in {"", "0", "none", "no", "false"}:
-        legacy_kwargs["video_size"] = video_size
-        legacy_kwargs["resize_mode"] = [part.strip() for part in resize_mode.split(",") if part.strip()]
-    kwargs = {key: value for key, value in legacy_kwargs.items() if key in params}
-
-print(
-    "[v2d] api_params="
-    f"{','.join(params)}; save_cols={save_cols}; output_format={output_format}; "
-    f"resize_mode={resize_mode or 'none'}"
-)
-video2dataset(**kwargs)
-PY
+    python3 "${_v2d_py}"
+    rm -f "${_v2d_py}"
     log "Hoàn tất fetch MP4: ${out_dir}"
 }
 
@@ -353,17 +365,17 @@ download_webvid() {
     log "=== WebVid-10M: ${WEBVID_REPO} → ${WEBVID_DIR} ==="
     # TempoFunk/webvid-10M chỉ chứa metadata CSV (videoid + caption + URL),
     # tổ chức theo data/train/partitions/XXXX.csv. Lấy 1/2 số partition.
-    download_half_shards "${WEBVID_REPO}" "${WEBVID_DIR}" "data/train/partitions/" "csv"
+    # download_half_shards "${WEBVID_REPO}" "${WEBVID_DIR}" "data/train/partitions/" "csv"
     # Validation rất nhỏ → tải đầy đủ.
     log "Tải toàn bộ validation partitions (nhỏ)..."
-    huggingface-cli download \
-        "${WEBVID_REPO}" \
-        --repo-type dataset \
-        --local-dir "${WEBVID_DIR}" \
-        --max-workers "${NUM_PROC}" \
-        "${HF_TOKEN_ARG[@]}" \
-        --include "data/val/partitions/*.csv" \
-        --include "README*" || true
+    # hf download \
+    #     "${WEBVID_REPO}" \
+    #     --repo-type dataset \
+    #     --local-dir "${WEBVID_DIR}" \
+    #     --max-workers "${NUM_PROC}" \
+    #     "${HF_TOKEN_ARG[@]}" \
+    #     --include "data/val/partitions/*.csv" \
+    #     --include "README*" || true
 
     if [[ "${SKIP_WEBVID_VIDEOS:-0}" != "1" ]]; then
         fetch_webvid_videos
