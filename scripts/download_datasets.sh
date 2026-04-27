@@ -16,9 +16,15 @@
 #
 # Tuỳ chọn (env):
 #   SKIP_WEBVID_VIDEOS=1   # bỏ qua bước fetch MP4 bằng video2dataset
-#   WEBVID_VIDEO_SIZE=256  # cạnh ngắn khi resize video (mặc định 256)
+#   WEBVID_VIDEO_SIZE=256  # dùng khi WEBVID_RESIZE_MODE != none
+#   WEBVID_DOWNLOAD_SIZE=480 # preferred height cho yt-dlp fallback
+#   WEBVID_SHARD_SIZE=1000 # số sample/shard của video2dataset
 #   WEBVID_PROCESSES=8     # số process cho video2dataset
 #   WEBVID_THREADS=16      # số thread cho video2dataset
+#   WEBVID_OUTPUT_FORMAT=files|webdataset  # mặc định files, khớp loader trong repo
+#   WEBVID_RESIZE_MODE=none|scale|scale,crop  # mặc định none: chỉ download, không resize
+#   WEBVID_INCREMENTAL_MODE=incremental|overwrite
+#   WEBVID_MAX_ROWS=N      # debug: chỉ tải N dòng metadata đầu tiên
 #
 # Cách dùng:
 #   bash scripts/download_datasets.sh                 # tải cả 3
@@ -138,8 +144,10 @@ fetch_webvid_videos() {
     local out_dir="${WEBVID_DIR}/videos_train"
     local merged="${WEBVID_DIR}/.train_half.csv"
 
-    if ! command -v video2dataset >/dev/null 2>&1; then
-        log "[WARN] không tìm thấy 'video2dataset'. Chạy: pip install video2dataset. Bỏ qua bước MP4."
+    if ! python3 - <<'PY' >/dev/null 2>&1; then
+from video2dataset import video2dataset  # noqa: F401
+PY
+        log "[WARN] python3 không import được 'video2dataset'. Chạy: pip install -U video2dataset. Bỏ qua bước MP4."
         return 0
     fi
 
@@ -150,65 +158,194 @@ fetch_webvid_videos() {
     fi
 
     log "Gộp ${csv_dir} (1/2 partition) -> ${merged}"
-    python3 - <<PY
-import csv, os
-keep = [l.strip() for l in open("${WEBVID_DIR}/.shards_keep.txt") if l.strip()]
-root = "${WEBVID_DIR}"
-out  = "${merged}"
-header_written = False
+    WEBVID_ROOT="${WEBVID_DIR}" \
+    WEBVID_MERGED="${merged}" \
+    WEBVID_MAX_ROWS="${WEBVID_MAX_ROWS:-0}" \
+    python3 - <<'PY'
+import csv
+import os
+import sys
+
+root = os.environ["WEBVID_ROOT"]
+out = os.environ["WEBVID_MERGED"]
+max_rows = int(os.environ.get("WEBVID_MAX_ROWS") or 0)
+keep_path = os.path.join(root, ".shards_keep.txt")
+keep = [line.strip() for line in open(keep_path, encoding="utf-8") if line.strip()]
+required = {"contentUrl", "name"}
 n_rows = 0
-with open(out, "w", newline="") as fout:
+n_missing_files = 0
+
+with open(out, "w", newline="", encoding="utf-8") as fout:
     writer = None
+    fieldnames = None
     for rel in keep:
-        p = os.path.join(root, rel)
-        if not os.path.exists(p):
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            n_missing_files += 1
             continue
-        with open(p, newline="") as fin:
+        with open(path, newline="", encoding="utf-8") as fin:
             reader = csv.DictReader(fin)
+            if not reader.fieldnames:
+                continue
+            missing = required.difference(reader.fieldnames)
+            if missing:
+                raise SystemExit(f"[merge] CSV {path} thiếu cột bắt buộc: {sorted(missing)}")
+            if writer is None:
+                fieldnames = reader.fieldnames
+                writer = csv.DictWriter(fout, fieldnames=fieldnames)
+                writer.writeheader()
+            elif reader.fieldnames != fieldnames:
+                raise SystemExit(f"[merge] CSV {path} có header khác file đầu tiên")
+
             for row in reader:
-                if writer is None:
-                    writer = csv.DictWriter(fout, fieldnames=reader.fieldnames)
-                    writer.writeheader()
+                if not (row.get("contentUrl") or "").strip():
+                    continue
                 writer.writerow(row)
                 n_rows += 1
-print(f"[merge] rows={n_rows} -> {out}")
+                if max_rows > 0 and n_rows >= max_rows:
+                    break
+        if max_rows > 0 and n_rows >= max_rows:
+            break
+
+if n_missing_files:
+    print(f"[merge] warning: missing_files={n_missing_files}", file=sys.stderr)
+if n_rows == 0:
+    raise SystemExit("[merge] không có dòng hợp lệ để tải video")
+limit_note = f" (limited by WEBVID_MAX_ROWS={max_rows})" if max_rows > 0 else ""
+print(f"[merge] rows={n_rows}{limit_note} -> {out}")
 PY
 
     local size="${WEBVID_VIDEO_SIZE:-256}"
+    local download_size="${WEBVID_DOWNLOAD_SIZE:-480}"
+    local shard_size="${WEBVID_SHARD_SIZE:-1000}"
     local nproc="${WEBVID_PROCESSES:-8}"
     local nthr="${WEBVID_THREADS:-16}"
-    local cfg="${WEBVID_DIR}/.v2d_config.yaml"
+    local output_format="${WEBVID_OUTPUT_FORMAT:-files}"
+    local resize_mode="${WEBVID_RESIZE_MODE:-none}"
+    local incremental_mode="${WEBVID_INCREMENTAL_MODE:-incremental}"
+    local timeout="${WEBVID_TIMEOUT:-60}"
+    local tmp_dir="${WEBVID_TMP_DIR:-/tmp}"
 
-    cat > "${cfg}" <<YAML
-subsampling:
-  ResizeSubsampler:
-    video_size: ${size}
-    resize_mode: ["scale", "crop"]
-reading:
-  yt_args:
-    download_size: "480p"
-  timeout: 60
-  sampler: null
-storage:
-  number_sample_per_shard: 1000
-  oom_shard_count: 5
-distribution:
-  processes_count: ${nproc}
-  thread_count: ${nthr}
-  distributor: multiprocessing
-YAML
+    log "video2dataset → ${out_dir} (format=${output_format}, shard=${shard_size}, size=${size}, proc=${nproc}, thr=${nthr})"
+    WEBVID_URL_LIST="${merged}" \
+    WEBVID_OUTPUT_FOLDER="${out_dir}" \
+    WEBVID_OUTPUT_FORMAT="${output_format}" \
+    WEBVID_VIDEO_SIZE="${size}" \
+    WEBVID_DOWNLOAD_SIZE="${download_size}" \
+    WEBVID_SHARD_SIZE="${shard_size}" \
+    WEBVID_PROCESSES="${nproc}" \
+    WEBVID_THREADS="${nthr}" \
+    WEBVID_RESIZE_MODE="${resize_mode}" \
+    WEBVID_INCREMENTAL_MODE="${incremental_mode}" \
+    WEBVID_TIMEOUT="${timeout}" \
+    WEBVID_TMP_DIR="${tmp_dir}" \
+    python3 - <<'PY'
+import csv
+import inspect
+import os
 
-    log "video2dataset → ${out_dir} (size=${size}, proc=${nproc}, thr=${nthr})"
-    video2dataset \
-        --url_list="${merged}" \
-        --input_format="csv" \
-        --output_folder="${out_dir}" \
-        --output_format="webdataset" \
-        --url_col="contentUrl" \
-        --caption_col="name" \
-        --save_additional_columns='[videoid,page_dir,duration]' \
-        --encode_formats='{"video": "mp4"}' \
-        --config="${cfg}"
+from video2dataset import video2dataset
+
+url_list = os.environ["WEBVID_URL_LIST"]
+output_folder = os.environ["WEBVID_OUTPUT_FOLDER"]
+output_format = os.environ["WEBVID_OUTPUT_FORMAT"]
+video_size = int(os.environ["WEBVID_VIDEO_SIZE"])
+download_size = int(os.environ["WEBVID_DOWNLOAD_SIZE"])
+shard_size = int(os.environ["WEBVID_SHARD_SIZE"])
+processes_count = int(os.environ["WEBVID_PROCESSES"])
+thread_count = int(os.environ["WEBVID_THREADS"])
+resize_mode = os.environ["WEBVID_RESIZE_MODE"].strip()
+incremental_mode = os.environ["WEBVID_INCREMENTAL_MODE"]
+timeout = int(os.environ["WEBVID_TIMEOUT"])
+tmp_dir = os.environ["WEBVID_TMP_DIR"]
+
+with open(url_list, newline="", encoding="utf-8") as fin:
+    columns = next(csv.reader(fin))
+
+required = {"contentUrl", "name"}
+missing = required.difference(columns)
+if missing:
+    raise SystemExit(f"video2dataset input thiếu cột bắt buộc: {sorted(missing)}")
+
+save_cols = [c for c in ("videoid", "page_dir", "duration", "page_idx") if c in columns]
+common_kwargs = {
+    "url_list": url_list,
+    "output_folder": output_folder,
+    "output_format": output_format,
+    "input_format": "csv",
+    "url_col": "contentUrl",
+    "caption_col": "name",
+    "save_additional_columns": save_cols,
+}
+
+signature = inspect.signature(video2dataset)
+params = signature.parameters
+
+if "encode_formats" in params:
+    common_kwargs["encode_formats"] = {"video": "mp4"}
+
+if "config" in params:
+    subsampling = {}
+    if resize_mode.lower() not in {"", "0", "none", "no", "false"}:
+        subsampling["ResolutionSubsampler"] = {
+            "args": {
+                "video_size": video_size,
+                "resize_mode": resize_mode,
+            }
+        }
+    kwargs = {
+        **common_kwargs,
+        "config": {
+            "subsampling": subsampling,
+            "reading": {
+                "yt_args": {
+                    "download_size": download_size,
+                    "download_audio_rate": 44100,
+                    "yt_metadata_args": None,
+                },
+                "timeout": timeout,
+                "sampler": None,
+            },
+            "storage": {
+                "number_sample_per_shard": shard_size,
+                "oom_shard_count": 5,
+                "captions_are_subtitles": False,
+            },
+            "distribution": {
+                "processes_count": processes_count,
+                "thread_count": thread_count,
+                "subjob_size": 1000,
+                "distributor": "multiprocessing",
+            },
+        },
+        "incremental_mode": incremental_mode,
+        "tmp_dir": tmp_dir,
+    }
+else:
+    legacy_kwargs = {
+        **common_kwargs,
+        "processes_count": processes_count,
+        "thread_count": thread_count,
+        "number_sample_per_shard": shard_size,
+        "oom_shard_count": 5,
+        "distributor": "multiprocessing",
+        "subjob_size": 1000,
+        "incremental_mode": incremental_mode,
+        "timeout": timeout,
+        "tmp_dir": tmp_dir,
+    }
+    if resize_mode.lower() not in {"", "0", "none", "no", "false"}:
+        legacy_kwargs["video_size"] = video_size
+        legacy_kwargs["resize_mode"] = [part.strip() for part in resize_mode.split(",") if part.strip()]
+    kwargs = {key: value for key, value in legacy_kwargs.items() if key in params}
+
+print(
+    "[v2d] api_params="
+    f"{','.join(params)}; save_cols={save_cols}; output_format={output_format}; "
+    f"resize_mode={resize_mode or 'none'}"
+)
+video2dataset(**kwargs)
+PY
     log "Hoàn tất fetch MP4: ${out_dir}"
 }
 
