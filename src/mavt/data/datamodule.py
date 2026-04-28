@@ -12,6 +12,7 @@ import lightning as L
 from pathlib import Path
 
 from mavt.data.datasets import (
+    HFParquetImageDataset,
     ShardVideoDataset,
     SyntheticMultiModalDataset,
     UniversalImageDataset,
@@ -161,6 +162,9 @@ class MAVTDataModule(L.LightningDataModule):
         hp = self.hparams
         # Per-modality overrides take precedence over universal_data_root
         if modality == 'image' and hp.image_shards_dir:
+            shards_path = Path(hp.image_shards_dir)
+            if any(shards_path.glob('train-*.parquet')):
+                return HFParquetImageDataset(hp.image_shards_dir, hp.image_resolution, split='train')
             return WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
         if modality == 'video' and hp.video_shards_dir:
             return ShardVideoDataset(

@@ -3,7 +3,7 @@
 #SBATCH --partition=defq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=8
+#SBATCH --gpus-per-node=5
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=180G
 #SBATCH --time=72:00:00
@@ -29,6 +29,10 @@
 
 set -euo pipefail
 
+# --- Use GPUs 3-7 (set BEFORE any Python/CUDA init) ---
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+NUM_GPUS=8  
+
 if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
     PROJECT_DIR="$SLURM_SUBMIT_DIR"
 else
@@ -36,13 +40,13 @@ else
 fi
 cd "$PROJECT_DIR"
 
-IMAGE_SHARDS_DIR="$PROJECT_DIR/dataset/image10k/train"
-VIDEO_SHARDS_DIR="$PROJECT_DIR/dataset/dataset_10m"
+IMAGE_SHARDS_DIR="$PROJECT_DIR/dataset/imagenet-1k/data"
+VIDEO_SHARDS_DIR="$PROJECT_DIR/dataset/webvid-10M/videos_train"
 TRIPLANE_DIR="$PROJECT_DIR/dataset/tripplane"
 
 # --- Stage 2 checkpoint (edit this path after Stage 2 completes) ---
 STAGE2_CKPT="checkpoints/stage2/last.ckpt"
-ALLOW_FROM_SCRATCH="${ALLOW_FROM_SCRATCH:-false}"
+ALLOW_FROM_SCRATCH="${ALLOW_FROM_SCRATCH:-true}"
 
 mkdir -p logs checkpoints/stage3
 
@@ -59,7 +63,9 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
 
-NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "1")
+# --- WandB ---
+export WANDB_PROJECT="${WANDB_PROJECT:-mavt-tokenizer}"
+export WANDB_RUN_NAME="${WANDB_RUN_NAME:-stage3-$(date +%Y%m%d-%H%M%S)}"
 
 # --- Check 3D data availability ---
 if [ -d "$TRIPLANE_DIR" ]; then
@@ -70,12 +76,13 @@ fi
 
 echo "========================================"
 echo "  MAVT Stage 3 — Image + Video + 3D"
-echo "  GPUs: $NUM_GPUS"
+echo "  GPUs: $NUM_GPUS  (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
 echo "  Image shards:   $IMAGE_SHARDS_DIR"
 echo "  Video shards:   $VIDEO_SHARDS_DIR"
 echo "  Triplane dir:   $TRIPLANE_DIR"
 echo "  3D objects:     $N_3D renders"
 echo "  Checkpoint:     $STAGE2_CKPT"
+echo "  WandB project:  $WANDB_PROJECT  run=$WANDB_RUN_NAME"
 echo "========================================"
 
 if [ "$N_3D" -eq 0 ]; then
@@ -103,15 +110,15 @@ python train.py fit \
     --config configs/train/universal_data/stage3_universal.yaml \
     --data.image_shards_dir "$IMAGE_SHARDS_DIR" \
     --data.video_shards_dir "$VIDEO_SHARDS_DIR" \
-    --data.video_max_shards 100 \
+    --data.video_max_shards 209 \
     --data.triplane_dir "$TRIPLANE_DIR" \
     --data.active_modalities '["image", "video", "threed"]' \
     --data.image_resolution 256 \
     --data.video_frames 16 \
     --data.video_resolution 256 \
     --data.triplane_res 256 \
-    --data.batch_size 8 \
-    --data.num_workers 8 \
+    --data.batch_size 12 \
+    --data.num_workers 32 \
     --data.pin_memory true \
     --model.training_stage 3 \
     --model.init_siglip2 true \
@@ -123,5 +130,8 @@ python train.py fit \
     --trainer.max_steps 200000 \
     --trainer.accumulate_grad_batches 4 \
     --trainer.log_every_n_steps 50 \
-    --trainer.val_check_interval 2000 \
+    --trainer.val_check_interval 1.0 \
+    --trainer.logger.class_path lightning.pytorch.loggers.WandbLogger \
+    --trainer.logger.init_args.project "$WANDB_PROJECT" \
+    --trainer.logger.init_args.name "$WANDB_RUN_NAME" \
     $CKPT_ARG

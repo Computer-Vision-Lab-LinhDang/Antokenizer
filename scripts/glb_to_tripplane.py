@@ -140,6 +140,8 @@ def process(args):
     for i, glb_path in enumerate(glbs, 1):
         obj_id = glb_path.stem  # hash filename, no extension
         obj_out = output_dir / obj_id
+        if all((obj_out / f"{v}.png").exists() for v in ("oxoy", "oxoz", "oyoz")):
+            continue
         try:
             glb_to_planes(str(glb_path), str(obj_out), img_size=args.img_size)
             print(f"[{i}/{len(glbs)}] {obj_id}")

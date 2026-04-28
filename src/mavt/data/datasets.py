@@ -237,6 +237,78 @@ class UniversalThreeDDataset(Dataset):
 #  Shard-based datasets (direct reading without extraction)                    #
 # --------------------------------------------------------------------------- #
 
+# Per-worker shard cache: {path: (image_bytes_list, labels_list)}
+_hf_shard_cache: Dict[str, Tuple[List[bytes], List[str]]] = {}
+
+
+class HFParquetImageDataset(Dataset):
+    """Load images from HuggingFace-format parquet shards.
+
+    Expects files named ``{split}-NNNNN-of-MMMMM.parquet`` with columns
+    ``image`` (struct with 'bytes' key) and ``label`` (int).
+    """
+
+    def __init__(self, shards_dir: str, resolution: int = 256,
+                 split: str = 'train', cache_shards: int = 4):
+        import pyarrow.parquet as pq
+
+        self.resolution = resolution
+        self.cache_shards = cache_shards
+        self.transform = transforms.Compose([
+            transforms.Resize(resolution),
+            transforms.CenterCrop(resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+
+        # Build (shard_path, row_idx) index using only metadata — no data loaded.
+        self._index: List[Tuple[str, int]] = []
+        pq_files = sorted(Path(shards_dir).glob(f"{split}-*.parquet"))
+        for pq_file in pq_files:
+            if pq_file.stat().st_size == 0:
+                continue
+            meta = pq.read_metadata(str(pq_file))
+            n = meta.num_rows
+            path_str = str(pq_file)
+            for i in range(n):
+                self._index.append((path_str, i))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def _load_shard(self, path: str) -> Tuple[List[bytes], List[str]]:
+        global _hf_shard_cache
+        if path not in _hf_shard_cache:
+            import pyarrow.parquet as pq
+            table = pq.read_table(path, columns=['image', 'label'])
+            images = [r.as_py()['bytes'] for r in table['image']]
+            labels = [str(v.as_py()) for v in table['label']]
+            if len(_hf_shard_cache) >= self.cache_shards:
+                _hf_shard_cache.pop(next(iter(_hf_shard_cache)))
+            _hf_shard_cache[path] = (images, labels)
+        return _hf_shard_cache[path]
+
+    def __getitem__(self, idx: int) -> Dict:
+        from PIL import Image as PILImage
+        import io
+
+        path, row_idx = self._index[idx]
+        images, labels = self._load_shard(path)
+
+        try:
+            img = PILImage.open(io.BytesIO(images[row_idx])).convert('RGB')
+            data = self.transform(img)
+        except Exception:
+            data = torch.zeros(3, self.resolution, self.resolution)
+
+        return {
+            'data': data,
+            'modality': 'image',
+            'caption': labels[row_idx],
+            'id': f"{Path(path).stem}_{row_idx}",
+        }
+
+
 class WDSImageDataset(Dataset):
     """Read images directly from WebDataset .tar shards.
 
@@ -346,7 +418,7 @@ class ShardVideoDataset(Dataset):
             import pyarrow.parquet as pq
             for shard_dir in shard_dirs:
                 pq_file = self.shards_dir / f"{shard_dir.name}.parquet"
-                if pq_file.exists():
+                if pq_file.exists() and pq_file.stat().st_size > 0:
                     table = pq.read_table(pq_file, columns=["key"])
                     keys = table["key"].to_pylist()
                     for k in keys:
