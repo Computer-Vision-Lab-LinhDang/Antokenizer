@@ -64,6 +64,9 @@ model:
   w_sem: 0.2
   w_aux: 0.0         # slot diversity disabled
   use_lpips: true
+  # MRL-E: decode 1 random prefix per step instead of all 5 — reduces decoder
+  # cost ~5× (critical with 3 modalities incl. heavy 3D triplane + video frames).
+  recon_prefix_policy: random
   warmup_steps: 500
   total_steps: 50000
   weight_decay: 0.01

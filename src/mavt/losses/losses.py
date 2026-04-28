@@ -95,15 +95,24 @@ def slot_diversity_loss(slot_diversity_metric: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 
 class ModalityEMAWeighter(nn.Module):
-    """Maintain a running EMA of L_recon per modality and return inverse-EMA
-    weights normalised so the mean weight is 1."""
+    """Maintain a running EMA of L_recon per active modality.
+
+    The returned weight is proportional to the modality EMA and normalised so
+    the active-modality mean is 1. This gives harder modalities more gradient
+    while keeping single-modality training unchanged.
+    """
 
     def __init__(self, modalities=('image', 'video', 'threed'), momentum: float = 0.99):
         super().__init__()
         self.momentum = momentum
         self.modalities = tuple(modalities)
+        self.active_modalities = tuple(modalities)
         for m in modalities:
             self.register_buffer(f'ema_{m}', torch.tensor(1.0))
+
+    def set_active_modalities(self, modalities: Sequence[str]) -> None:
+        active = tuple(m for m in modalities if m in self.modalities)
+        self.active_modalities = active or self.modalities
 
     def update(self, modality: str, loss_recon: torch.Tensor) -> None:
         attr = f'ema_{modality}'
@@ -115,9 +124,10 @@ class ModalityEMAWeighter(nn.Module):
         attr = f'ema_{modality}'
         if not hasattr(self, attr):
             return torch.tensor(1.0)
-        inv = [1.0 / (getattr(self, f'ema_{m}') + 1e-8) for m in self.modalities]
-        normalizer = torch.stack(inv).sum() / len(self.modalities)
-        return (1.0 / (getattr(self, attr) + 1e-8)) / (normalizer + 1e-8)
+        active = self.active_modalities or self.modalities
+        values = [getattr(self, f'ema_{m}') for m in active]
+        normalizer = torch.stack(values).mean()
+        return getattr(self, attr) / (normalizer + 1e-8)
 
 
 # --------------------------------------------------------------------------- #
@@ -233,11 +243,14 @@ class MAVTLoss(nn.Module):
         losses: Dict[str, torch.Tensor] = {
             'loss':       total,
             'loss_recon': l_recon_sum,
+            'loss_recon_weighted': mod_w * l_recon_sum,
             'loss_l1':    l_l1_sum,
             'loss_lpips': l_lp_sum,
             'loss_kl':    l_kl_sum,
             'loss_sem':   l_sem_sum,
+            'loss_sem_weighted': self.w_sem * l_sem_sum,
             'loss_div':   l_div,
+            'modality_weight': mod_w.detach(),
         }
         losses.update(per_prefix_logs)
         return losses

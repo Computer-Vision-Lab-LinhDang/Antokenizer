@@ -42,6 +42,7 @@ TRIPLANE_DIR="$PROJECT_DIR/dataset/tripplane"
 
 # --- Stage 2 checkpoint (edit this path after Stage 2 completes) ---
 STAGE2_CKPT="checkpoints/stage2/last.ckpt"
+ALLOW_FROM_SCRATCH="${ALLOW_FROM_SCRATCH:-false}"
 
 mkdir -p logs checkpoints/stage3
 
@@ -86,8 +87,12 @@ fi
 
 # Verify checkpoint exists
 if [ ! -f "$STAGE2_CKPT" ]; then
-    echo "[WARN] Stage 2 checkpoint not found: $STAGE2_CKPT"
-    echo "       Training from scratch (no --ckpt_path)."
+    if [ "$ALLOW_FROM_SCRATCH" != "true" ]; then
+        echo "[ERROR] Stage 2 checkpoint not found: $STAGE2_CKPT"
+        echo "        Stage 3 should resume from Stage 2. Set ALLOW_FROM_SCRATCH=true only for debugging."
+        exit 1
+    fi
+    echo "[WARN] Stage 2 checkpoint not found; training Stage 3 from pretrained SigLIP2 only."
     CKPT_ARG=""
 else
     CKPT_ARG="--ckpt_path $STAGE2_CKPT"
@@ -109,7 +114,7 @@ python train.py fit \
     --data.num_workers 8 \
     --data.pin_memory true \
     --model.training_stage 3 \
-    --model.init_siglip2 false \
+    --model.init_siglip2 true \
     --model.use_lpips true \
     --model.warmup_steps 500 \
     --model.total_steps 200000 \

@@ -197,7 +197,6 @@ echo "[INFO] Starting Stage 1 training..."
     "${SIGLIP2_MODEL_NAME_ARG[@]}" \
     "${INIT_SIGLIP2_ARG[@]}" \
     --model.use_lpips true \
-    --model.use_clip false \
     --model.warmup_steps 1000 \
     --model.total_steps 200000 \
     --trainer.devices "$NUM_GPUS" \

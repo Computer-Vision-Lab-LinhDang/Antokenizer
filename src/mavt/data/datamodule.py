@@ -47,10 +47,13 @@ class ModalityGroupedBatchSampler(Sampler):
     """
 
     def __init__(self, concat_dataset: ConcatDataset, batch_size: int,
-                 drop_last: bool = True, shuffle: bool = True):
+                 drop_last: bool = True, shuffle: bool = True,
+                 seed: int = 42):
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
 
         # Build per-modality index lists from ConcatDataset boundaries
         self.groups: List[List[int]] = []
@@ -60,6 +63,10 @@ class ModalityGroupedBatchSampler(Sampler):
             self.groups.append(list(range(offset, offset + n)))
             offset += n
 
+    def set_epoch(self, epoch: int) -> None:
+        """Sync per-epoch shuffle seed across DDP ranks. Call once per epoch."""
+        self.epoch = int(epoch)
+
     @staticmethod
     def _dist_info() -> tuple:
         """Return (rank, world_size) from the live process group if available."""
@@ -68,18 +75,20 @@ class ModalityGroupedBatchSampler(Sampler):
         return 0, 1
 
     def _make_batches(self) -> List[List[int]]:
+        # Seeded RNG identical on every rank — guarantees disjoint partitioning.
+        rng = random.Random(self.seed + self.epoch)
         all_batches: List[List[int]] = []
         for indices in self.groups:
             idx = indices[:]
             if self.shuffle:
-                random.shuffle(idx)
+                rng.shuffle(idx)
             for start in range(0, len(idx), self.batch_size):
                 batch = idx[start: start + self.batch_size]
                 if self.drop_last and len(batch) < self.batch_size:
                     continue
                 all_batches.append(batch)
         if self.shuffle:
-            random.shuffle(all_batches)
+            rng.shuffle(all_batches)
         return all_batches
 
     def __iter__(self) -> Iterator[List[int]]:

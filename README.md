@@ -208,13 +208,17 @@ python3 train.py fit --config configs/train/stage1_image.yaml \
 ```
 L_total = w_mod * (w_l1 * L1 + w_lpips * LPIPS)
         + w_kl  * KL
-        + w_clip * InfoNCE(visual, text)     [optional]
+        + w_sem * cosine(student_semantic, SigLIP2_teacher)
         + w_aux  * SlotDiversity
 ```
 
-Default weights: `w_l1=1.0, w_lpips=0.1, w_kl=1e-4, w_clip=0.1, w_aux=0.01`.
+Stage weights are set in `configs/train/universal_data/stage*_universal.yaml`.
+Current defaults are `w_l1=1.0`, `w_lpips=0.1`, `w_kl=1.0`,
+`w_sem=0.5/0.3/0.2` for stages 1/2/3, and `w_aux=0.0` in the stage configs.
 
-`w_mod` is a per-modality inverse-EMA scale so harder modalities receive proportionally more gradient.
+`w_mod` is a per-active-modality EMA scale so harder modalities receive
+proportionally more reconstruction gradient. It is exactly `1.0` in
+single-modality training.
 
 ---
 

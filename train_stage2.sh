@@ -38,6 +38,7 @@ VIDEO_SHARDS_DIR="$PROJECT_DIR/dataset/dataset_10m"
 
 # --- Stage 1 checkpoint (edit this path after Stage 1 completes) ---
 STAGE1_CKPT="checkpoints/stage1/last.ckpt"
+ALLOW_FROM_SCRATCH="${ALLOW_FROM_SCRATCH:-false}"
 
 mkdir -p logs checkpoints/stage2
 
@@ -64,8 +65,12 @@ echo "========================================"
 
 # Verify checkpoint exists
 if [ ! -f "$STAGE1_CKPT" ]; then
-    echo "[WARN] Stage 1 checkpoint not found: $STAGE1_CKPT"
-    echo "       Training from scratch (no --ckpt_path)."
+    if [ "$ALLOW_FROM_SCRATCH" != "true" ]; then
+        echo "[ERROR] Stage 1 checkpoint not found: $STAGE1_CKPT"
+        echo "        Stage 2 should resume from Stage 1. Set ALLOW_FROM_SCRATCH=true only for debugging."
+        exit 1
+    fi
+    echo "[WARN] Stage 1 checkpoint not found; training Stage 2 from pretrained SigLIP2 only."
     CKPT_ARG=""
 else
     CKPT_ARG="--ckpt_path $STAGE1_CKPT"
@@ -85,9 +90,8 @@ python train.py fit \
     --data.num_workers 8 \
     --data.pin_memory true \
     --model.training_stage 2 \
-    --model.init_siglip2 false \
+    --model.init_siglip2 true \
     --model.use_lpips true \
-    --model.use_clip false \
     --model.warmup_steps 500 \
     --model.total_steps 200000 \
     --trainer.devices "$NUM_GPUS" \

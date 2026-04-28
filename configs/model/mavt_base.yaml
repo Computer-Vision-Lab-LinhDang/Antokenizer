@@ -9,7 +9,9 @@ model:
   semantic_dim: 768
   num_classes: null
   matryoshka_dims: [8, 64, 256, 512, 1152]
-  matryoshka_alphas: {8: 1.0, 64: 1.0, 256: 1.0, 512: 1.0, 1152: 1.0}
+  # Decay α for small prefixes — d=8 has fundamentally higher recon/sem floor
+  # (capacity-limited) and would otherwise dominate gradient under uniform α.
+  matryoshka_alphas: {8: 0.05, 64: 0.15, 256: 0.3, 512: 0.5, 1152: 1.0}
   recon_prefix_policy: all      # 'all' | 'random' (MRL-E) | 'largest'
   dec_dim: 768
   num_dec_attn_blocks: 4
