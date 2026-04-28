@@ -117,9 +117,15 @@ class MAVTLightningModule(L.LightningModule):
         if stage != 'fit':
             return
         self._prepare_cd_split_poolers()
-        if hp.init_siglip2:
+        ckpt_path = getattr(self.trainer, 'ckpt_path', None) if self.trainer else None
+        if hp.init_siglip2 and not ckpt_path:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
             self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
+        elif hp.init_siglip2 and ckpt_path:
+            print(
+                f"[lightning_module] ckpt_path={ckpt_path!r}; "
+                "skipping SigLIP2 init to avoid overwriting checkpoint weights"
+            )
         if hp.use_semantic_distill and self.semantic_teacher is None:
             self._load_semantic_teacher(hp.siglip2_model_name)
 
@@ -129,6 +135,8 @@ class MAVTLightningModule(L.LightningModule):
             return
         dm_hp = dm.hparams
         active = getattr(dm_hp, 'active_modalities', None) or []
+        if hasattr(self.loss_fn, 'ema_weighter'):
+            self.loss_fn.ema_weighter.set_active_modalities(active)
         specs = []
         for modality in active:
             if modality == 'image':
@@ -246,10 +254,25 @@ class MAVTLightningModule(L.LightningModule):
         for k, v in out.cd_metrics.items():
             self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True,
                      sync_dist=True)
-        self.log(f'{log_prefix}/modality_{modality}', 1.0,
-                 on_step=False, on_epoch=True, sync_dist=False)
+        for name in ('image', 'video', 'threed'):
+            is_current = 1.0 if modality == name else 0.0
+            self.log(
+                f'{log_prefix}/modality_{name}',
+                is_current,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
 
         return losses['loss']
+
+    def on_train_epoch_start(self) -> None:
+        # Re-seed ModalityGroupedBatchSampler so all DDP ranks shuffle identically
+        # this epoch (otherwise each rank sees a different shuffle and overlaps).
+        loader = self.trainer.train_dataloader
+        sampler = getattr(loader, 'batch_sampler', None) if loader is not None else None
+        if sampler is not None and hasattr(sampler, 'set_epoch'):
+            sampler.set_epoch(self.current_epoch)
 
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         return self._step(batch, 'train')
