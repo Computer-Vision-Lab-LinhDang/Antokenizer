@@ -118,7 +118,7 @@ python train.py fit \
     --data.video_resolution 256 \
     --data.triplane_res 256 \
     --data.batch_size 12 \
-    --data.num_workers 32 \
+    --data.num_workers 8 \
     --data.pin_memory true \
     --model.training_stage 3 \
     --model.init_siglip2 true \
