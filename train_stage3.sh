@@ -3,9 +3,9 @@
 #SBATCH --partition=defq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=5
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=180G
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 #SBATCH --time=72:00:00
 #SBATCH --output=logs/stage3_%j.log
 #SBATCH --error=logs/stage3_%j.err
@@ -29,9 +29,10 @@
 
 set -euo pipefail
 
-# --- Use GPUs 3-7 (set BEFORE any Python/CUDA init) ---
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-NUM_GPUS=8  
+# --- Single-GPU setup. SLURM (#SBATCH --gpus-per-node=1) exports
+#     CUDA_VISIBLE_DEVICES itself; do not override here. Outside SLURM, set it
+#     explicitly when invoking the script: `CUDA_VISIBLE_DEVICES=3 bash train_stage3.sh`.
+NUM_GPUS=1
 
 if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
     PROJECT_DIR="$SLURM_SUBMIT_DIR"
@@ -40,8 +41,8 @@ else
 fi
 cd "$PROJECT_DIR"
 
-IMAGE_SHARDS_DIR="$PROJECT_DIR/dataset/imagenet-1k/data"
-VIDEO_SHARDS_DIR="$PROJECT_DIR/dataset/webvid-10M/videos_train"
+IMAGE_SHARDS_DIR="$PROJECT_DIR/dataset/image10k/train"
+VIDEO_SHARDS_DIR="$PROJECT_DIR/dataset/dataset_10m"
 TRIPLANE_DIR="$PROJECT_DIR/dataset/tripplane"
 
 # --- Stage 2 checkpoint (edit this path after Stage 2 completes) ---
@@ -76,7 +77,7 @@ fi
 
 echo "========================================"
 echo "  MAVT Stage 3 — Image + Video + 3D"
-echo "  GPUs: $NUM_GPUS  (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
+echo "  GPUs: $NUM_GPUS  (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset})"
 echo "  Image shards:   $IMAGE_SHARDS_DIR"
 echo "  Video shards:   $VIDEO_SHARDS_DIR"
 echo "  Triplane dir:   $TRIPLANE_DIR"
@@ -117,8 +118,8 @@ python train.py fit \
     --data.video_frames 16 \
     --data.video_resolution 256 \
     --data.triplane_res 256 \
-    --data.batch_size 12 \
-    --data.num_workers 32 \
+    --data.batch_size 4 \
+    --data.num_workers 8 \
     --data.pin_memory true \
     --model.training_stage 3 \
     --model.init_siglip2 true \
@@ -126,6 +127,7 @@ python train.py fit \
     --model.warmup_steps 500 \
     --model.total_steps 200000 \
     --trainer.devices "$NUM_GPUS" \
+    --trainer.strategy auto \
     --trainer.precision bf16-mixed \
     --trainer.max_steps 200000 \
     --trainer.accumulate_grad_batches 4 \

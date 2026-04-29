@@ -23,6 +23,36 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 
+def _read_video_pyav(path: str, n_frames: int) -> torch.Tensor:
+    """Decode a video into ``(T, 3, H, W)`` uint8 frames using PyAV.
+
+    Used in place of the removed ``torchvision.io.read_video`` (gone in
+    torchvision >= 0.24). Loads at most ``n_frames * 4`` raw frames to bound
+    memory; the caller does the final temporal subsample.
+    """
+    import av
+    import numpy as np
+
+    container = av.open(path)
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = 'AUTO'
+        frames: List[np.ndarray] = []
+        # Cap raw decode budget: a 16-frame clip rarely benefits from > 64 raw frames.
+        cap = max(n_frames * 4, n_frames + 8)
+        for frame in container.decode(stream):
+            frames.append(frame.to_ndarray(format='rgb24'))
+            if len(frames) >= cap:
+                break
+    finally:
+        container.close()
+
+    if not frames:
+        raise ValueError(f'no frames decoded from {path}')
+    arr = np.stack(frames)                         # (T, H, W, 3) uint8
+    return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()  # (T, 3, H, W)
+
+
 # --------------------------------------------------------------------------- #
 #  Synthetic                                                                    #
 # --------------------------------------------------------------------------- #
@@ -145,23 +175,22 @@ class UniversalVideoDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx: int) -> Dict:
-        import torchvision.io as tvio
         path = self.paths[idx]
         obj_id = path.stem
         try:
-            vframes, _, _ = tvio.read_video(str(path), pts_unit='sec', output_format='TCHW')
+            vframes = _read_video_pyav(str(path), self.n_frames)
             T = vframes.shape[0]
-            if T == 0:
-                raise ValueError('empty video')
             if T < self.n_frames:
                 reps = (self.n_frames // T) + 1
                 vframes = vframes.repeat(reps, 1, 1, 1)
-            step = max(1, T // self.n_frames)
+            step = max(1, vframes.shape[0] // self.n_frames)
             idxs = torch.arange(0, vframes.shape[0], step)[: self.n_frames]
             clip = vframes[idxs].float() / 255.0          # (T, 3, H, W) in [0,1]
             clip = torch.stack([self.frame_transform(clip[t]) for t in range(len(clip))])
             data = clip.permute(1, 0, 2, 3)               # (3, T, H, W)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            print(f"[UniversalVideoDataset] decode failed for {path}: "
+                  f"{type(exc).__name__}: {exc} — returning zeros")
             data = torch.zeros(3, self.n_frames, self.resolution, self.resolution)
         return {
             'data': data,
@@ -312,12 +341,17 @@ class HFParquetImageDataset(Dataset):
 class WDSImageDataset(Dataset):
     """Read images directly from WebDataset .tar shards.
 
-    More efficient than extracting files — reads tar sequentially and
-    builds an in-memory index on first access.
+    Reads tar headers sequentially and builds an in-memory index on first
+    access. The index (shard_path, member, label) is cached to disk per shard
+    so repeated runs skip the expensive header walk — at 609 shards × ~108MB
+    a cold scan takes ~10 minutes, while a warm load is sub-second.
     """
 
-    def __init__(self, shards_dir: str, resolution: int = 256):
+    def __init__(self, shards_dir: str, resolution: int = 256,
+                 max_shards: Optional[int] = None,
+                 cache_dir: Optional[str] = None):
         import tarfile
+        import pickle
         self.resolution = resolution
         self.transform = transforms.Compose([
             transforms.Resize(resolution),
@@ -326,31 +360,51 @@ class WDSImageDataset(Dataset):
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
 
-        # Build index: list of (shard_path, member_name, label)
-        self.index: List[Tuple[str, str, str]] = []
         shard_paths = sorted(Path(shards_dir).glob("*.tar"))
+        if max_shards:
+            shard_paths = shard_paths[:max_shards]
 
+        cache_root = Path(cache_dir) if cache_dir else (Path(shards_dir) / '.wds_index_cache')
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        self.index: List[Tuple[str, str, str]] = []
         for sp in shard_paths:
-            try:
-                with tarfile.open(sp, "r") as tar:
-                    members = {m.name: m for m in tar.getmembers()}
-                    keys = set()
-                    for name in members:
-                        key = name.rsplit(".", 1)[0]
-                        keys.add(key)
-                    for key in sorted(keys):
-                        jpg_name = f"{key}.jpg"
-                        if jpg_name in members:
-                            # Try to read label
+            cache_file = cache_root / f"{sp.stem}.pkl"
+            shard_index: Optional[List[Tuple[str, str, str]]] = None
+            if cache_file.exists() and cache_file.stat().st_mtime >= sp.stat().st_mtime:
+                try:
+                    with open(cache_file, 'rb') as fh:
+                        shard_index = pickle.load(fh)
+                except Exception:  # noqa: BLE001
+                    shard_index = None
+            if shard_index is None:
+                shard_index = []
+                try:
+                    with tarfile.open(sp, "r") as tar:
+                        members = {m.name: m for m in tar.getmembers()}
+                        keys = set()
+                        for name in members:
+                            key = name.rsplit(".", 1)[0]
+                            keys.add(key)
+                        for key in sorted(keys):
+                            jpg_name = f"{key}.jpg"
+                            if jpg_name not in members:
+                                continue
                             label = ""
                             txt_name = f"{key}.txt"
                             if txt_name in members:
                                 f = tar.extractfile(members[txt_name])
                                 if f:
                                     label = f.read().decode("utf-8", errors="replace").strip()
-                            self.index.append((str(sp), jpg_name, label))
-            except Exception:
-                continue
+                            shard_index.append((str(sp), jpg_name, label))
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    with open(cache_file, 'wb') as fh:
+                        pickle.dump(shard_index, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.index.extend(shard_index)
 
     def __len__(self) -> int:
         return len(self.index)
@@ -442,7 +496,6 @@ class ShardVideoDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict:
-        import torchvision.io as tvio
         shard_id, file_key = self.samples[idx]
         shard_dir = self.shards_dir / shard_id
         mp4_path = shard_dir / f"{file_key}.mp4"
@@ -458,12 +511,8 @@ class ShardVideoDataset(Dataset):
                 pass
 
         try:
-            vframes, _, _ = tvio.read_video(
-                str(mp4_path), pts_unit='sec', output_format='TCHW'
-            )
+            vframes = _read_video_pyav(str(mp4_path), self.n_frames)
             T = vframes.shape[0]
-            if T == 0:
-                raise ValueError('empty video')
             if T < self.n_frames:
                 reps = (self.n_frames // T) + 1
                 vframes = vframes.repeat(reps, 1, 1, 1)
@@ -473,7 +522,9 @@ class ShardVideoDataset(Dataset):
             clip = vframes[idxs].float() / 255.0
             clip = torch.stack([self.frame_transform(clip[t]) for t in range(len(clip))])
             data = clip.permute(1, 0, 2, 3)  # (3, T, H, W)
-        except Exception:
+        except Exception as exc:
+            print(f"[ShardVideoDataset] decode failed for {mp4_path}: "
+                  f"{type(exc).__name__}: {exc} — returning zeros")
             data = torch.zeros(3, self.n_frames, self.resolution, self.resolution)
 
         return {

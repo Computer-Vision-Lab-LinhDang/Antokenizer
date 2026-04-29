@@ -200,12 +200,20 @@ class MAVTLightningModule(L.LightningModule):
     #  Prefix sampling                                                    #
     # ------------------------------------------------------------------ #
 
-    def _select_recon_prefixes(self) -> Optional[Sequence[int]]:
-        """Return the prefixes to decode this step, per ``recon_prefix_policy``."""
+    def _select_recon_prefixes(self, phase: str = 'train') -> Optional[Sequence[int]]:
+        """Return the prefixes to decode this step, per ``recon_prefix_policy``.
+
+        Validation always decodes every prefix so ``val/loss`` and downstream
+        checkpoint monitors are deterministic across runs (otherwise random
+        prefix sampling would make the monitored metric a noisy single-prefix
+        estimate that fluctuates checkpoint-to-checkpoint).
+        """
+        if phase == 'val':
+            return None  # MAVT.forward defaults to all
         policy = self.hparams.recon_prefix_policy
         all_dims = self.model.matryoshka_dims
         if policy == 'all':
-            return None  # MAVT.forward defaults to all
+            return None
         if policy == 'largest':
             return (all_dims[-1],)
         return (random.choice(all_dims),)  # 'random' (MRL-E)
@@ -221,7 +229,7 @@ class MAVTLightningModule(L.LightningModule):
         out = self.model(
             x, modality,
             decode=True,
-            recon_prefixes=self._select_recon_prefixes(),
+            recon_prefixes=self._select_recon_prefixes(log_prefix),
         )
 
         # For video: decoder reconstructs in patch-grid temporal space.
@@ -249,11 +257,19 @@ class MAVTLightningModule(L.LightningModule):
         )
 
         for k, v in losses.items():
+            # Aggregate metric across all modalities.
             self.log(f'{log_prefix}/{k}', v, on_step=True, on_epoch=True,
                      prog_bar=(k == 'loss'), sync_dist=True)
+            # Per-modality breakdown so a spike in one modality doesn't
+            # disappear into the cross-modality average.
+            self.log(f'{log_prefix}/{modality}/{k}', v,
+                     on_step=True, on_epoch=True,
+                     prog_bar=False, sync_dist=True)
         for k, v in out.cd_metrics.items():
             self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True,
                      sync_dist=True)
+            self.log(f'{log_prefix}/{modality}/cd_{k}', v,
+                     on_step=False, on_epoch=True, sync_dist=True)
         for name in ('image', 'video', 'threed'):
             is_current = 1.0 if modality == name else 0.0
             self.log(
@@ -277,10 +293,22 @@ class MAVTLightningModule(L.LightningModule):
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         return self._step(batch, 'train')
 
+    def on_validation_epoch_start(self) -> None:
+        # Track which modalities have already been visualised this val epoch.
+        # The val sampler iterates modalities in order, so without this gate
+        # only the first modality (image) ever reaches _log_images.
+        self._val_logged_modalities: set = set()
+
     def validation_step(self, batch: Dict, batch_idx: int) -> None:
         with torch.no_grad():
             self._step(batch, 'val')
-            if batch_idx == 0:
+            modality = batch['modality']
+            logged = getattr(self, '_val_logged_modalities', None)
+            if logged is None:
+                logged = set()
+                self._val_logged_modalities = logged
+            if modality not in logged:
+                logged.add(modality)
                 self._log_images(batch)
 
     # ------------------------------------------------------------------ #
@@ -312,32 +340,36 @@ class MAVTLightningModule(L.LightningModule):
     # ------------------------------------------------------------------ #
 
     def _log_images(self, batch: Dict, n: int = 4) -> None:
-        try:
-            x       = batch['data'][:n]
-            modality = batch['modality']
-            d_max = self.model.matryoshka_dims[-1]
-            out = self.model(x, modality, decode=True, recon_prefixes=(d_max,))
-            recon = out.reconstruction[d_max]
+        x        = batch['data'][:n]
+        modality = batch['modality']
+        d_max = self.model.matryoshka_dims[-1]
+        out = self.model(x, modality, decode=True, recon_prefixes=(d_max,))
+        recon = out.reconstruction[d_max]
 
-            if modality == 'image':
-                grid_in  = _to_grid(x)
-                grid_out = _to_grid(recon)
-            elif modality == 'video':
-                grid_in  = _to_grid(x[:, :, 0])
-                grid_out = _to_grid(recon[:, :, 0])
-            elif modality == 'threed':
-                grid_in  = _to_grid(x[:, 0])
-                grid_out = _to_grid(recon[:, 0])
-            else:
-                return
+        if modality == 'image':
+            grid_in  = _to_grid(x)
+            grid_out = _to_grid(recon)
+        elif modality == 'video':
+            # Log a strip of frames from the first sample so a static gray panel
+            # is obviously distinct from a frozen-but-varying reconstruction.
+            grid_in  = _to_grid(x[0].permute(1, 0, 2, 3))      # (T, 3, H, W)
+            grid_out = _to_grid(recon[0].permute(1, 0, 2, 3))
+        elif modality == 'threed':
+            grid_in  = _to_grid(x[0])      # (3, 3, H, W) → 3 planes
+            grid_out = _to_grid(recon[0])
+        else:
+            return
 
-            loggers = self.loggers if isinstance(self.loggers, (list, tuple)) else [self.loggers]
-            for logger in loggers:
-                if hasattr(logger, 'log_image'):
-                    logger.log_image(key=f'val/{modality}_input',  images=[grid_in])
-                    logger.log_image(key=f'val/{modality}_recon',  images=[grid_out])
-        except Exception:  # noqa: BLE001
-            pass
+        if grid_in is None or grid_out is None:
+            print(f"[lightning_module] _log_images: torchvision/PIL unavailable, "
+                  f"skipping {modality} visualisation")
+            return
+
+        loggers = self.loggers if isinstance(self.loggers, (list, tuple)) else [self.loggers]
+        for logger in loggers:
+            if hasattr(logger, 'log_image'):
+                logger.log_image(key=f'val/{modality}_input',  images=[grid_in])
+                logger.log_image(key=f'val/{modality}_recon',  images=[grid_out])
 
     # ------------------------------------------------------------------ #
     #  Optimiser                                                           #
@@ -392,10 +424,10 @@ def _to_grid(x: torch.Tensor, nrow: int = 4) -> Any:
     try:
         from torchvision.utils import make_grid
         from PIL import Image
-        x = x.detach().cpu().float().clamp(-1, 1)
-        x = (x + 1) / 2
-        grid = make_grid(x, nrow=nrow, normalize=False)
-        arr = (grid.permute(1, 2, 0).numpy() * 255).astype('uint8')
-        return Image.fromarray(arr)
-    except Exception:  # noqa: BLE001
+    except ImportError:
         return None
+    x = x.detach().cpu().float().clamp(-1, 1)
+    x = (x + 1) / 2
+    grid = make_grid(x, nrow=nrow, normalize=False)
+    arr = (grid.permute(1, 2, 0).numpy() * 255).astype('uint8')
+    return Image.fromarray(arr)

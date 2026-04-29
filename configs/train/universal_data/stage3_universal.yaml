@@ -87,3 +87,13 @@ data:
   pin_memory: true
   val_split: 0.1
   test_split: 0.1
+  # Optional modality balancing — relative sampling weights per modality.
+  # Default (null) uses natural batch counts, which is dominated by image+video
+  # in production (image ≈ video ≈ 600k vs threed ≈ 30k). Use 1:1:1 for an
+  # equal-mix curriculum, or e.g. {image: 1, video: 1, threed: 2} to bias
+  # toward 3D in stage 3.
+  modality_weights: null
+  # modality_weights:
+  #   image:  1.0
+  #   video:  1.0
+  #   threed: 1.0

@@ -20,6 +20,9 @@ parts/
 sdist/
 var/
 wheels/
+data/
+test.zip
+media_images_val_video_recon_*.png 
 share/python-wheels/
 *.egg-info/
 .installed.cfg
