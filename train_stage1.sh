@@ -37,6 +37,9 @@ INSTALL_DEPS="${INSTALL_DEPS:-false}"
 mkdir -p logs checkpoints/stage1
 
 # --- Environment ---
+# Strip .venv/bin from PATH so conda python takes precedence
+export PATH="$(echo "$PATH" | tr ':' '\n' | grep -v '\.venv/bin' | tr '\n' ':' | sed 's/:$//')"
+unset VIRTUAL_ENV
 if [ -d "$HOME/miniconda3" ]; then
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
     conda activate base
@@ -46,6 +49,7 @@ export PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}"
 export TORCH_NCCL_BLOCKING_WAIT=1
 export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
+
 
 PYTHON_CMD="${PYTHON_CMD:-python}"
 if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
@@ -151,8 +155,16 @@ else
     IMAGE_SHARD_COUNT=0
 fi
 
+_PYTHON_PATH="$(command -v "$PYTHON_CMD")"
+case "$_PYTHON_PATH" in
+    */.venv/*) _ACTIVE_ENV=".venv ($_PYTHON_PATH)" ;;
+    */miniconda3/*|*/anaconda3/*|*/conda/*) _ACTIVE_ENV="conda ${CONDA_DEFAULT_ENV:-?} ($_PYTHON_PATH)" ;;
+    *) _ACTIVE_ENV="system ($_PYTHON_PATH)" ;;
+esac
+
 echo "========================================"
 echo "  MAVT Stage 1 — Image Only"
+echo "  Env:              $_ACTIVE_ENV"
 echo "  Project dir:      $PROJECT_DIR"
 echo "  Python:           $PYTHON_BIN"
 echo "  GPUs:             $NUM_GPUS"

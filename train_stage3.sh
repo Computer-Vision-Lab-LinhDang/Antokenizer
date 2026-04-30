@@ -52,9 +52,9 @@ ALLOW_FROM_SCRATCH="${ALLOW_FROM_SCRATCH:-true}"
 mkdir -p logs checkpoints/stage3
 
 # --- Environment ---
-if [ -d ".venv" ]; then
-    source .venv/bin/activate
-elif [ -d "$HOME/miniconda3" ]; then
+export PATH="$(echo "$PATH" | tr ':' '\n' | grep -v '\.venv/bin' | tr '\n' ':' | sed 's/:$//')"
+unset VIRTUAL_ENV
+if [ -d "$HOME/miniconda3" ]; then
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
     conda activate base
 fi
@@ -75,8 +75,16 @@ else
     N_3D=0
 fi
 
+_PYTHON_PATH="$(command -v python)"
+case "$_PYTHON_PATH" in
+    */.venv/*) _ACTIVE_ENV=".venv ($_PYTHON_PATH)" ;;
+    */miniconda3/*|*/anaconda3/*|*/conda/*) _ACTIVE_ENV="conda ${CONDA_DEFAULT_ENV:-?} ($_PYTHON_PATH)" ;;
+    *) _ACTIVE_ENV="system ($_PYTHON_PATH)" ;;
+esac
+
 echo "========================================"
 echo "  MAVT Stage 3 — Image + Video + 3D"
+echo "  Env:            $_ACTIVE_ENV"
 echo "  GPUs: $NUM_GPUS  (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset})"
 echo "  Image shards:   $IMAGE_SHARDS_DIR"
 echo "  Video shards:   $VIDEO_SHARDS_DIR"

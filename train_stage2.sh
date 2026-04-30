@@ -43,6 +43,8 @@ ALLOW_FROM_SCRATCH="${ALLOW_FROM_SCRATCH:-false}"
 mkdir -p logs checkpoints/stage2
 
 # --- Environment ---
+export PATH="$(echo "$PATH" | tr ':' '\n' | grep -v '\.venv/bin' | tr '\n' ':' | sed 's/:$//')"
+unset VIRTUAL_ENV
 if [ -d "$HOME/miniconda3" ]; then
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
     conda activate base
@@ -55,8 +57,16 @@ export TOKENIZERS_PARALLELISM=false
 
 NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "1")
 
+_PYTHON_PATH="$(command -v python)"
+case "$_PYTHON_PATH" in
+    */.venv/*) _ACTIVE_ENV=".venv ($_PYTHON_PATH)" ;;
+    */miniconda3/*|*/anaconda3/*|*/conda/*) _ACTIVE_ENV="conda ${CONDA_DEFAULT_ENV:-?} ($_PYTHON_PATH)" ;;
+    *) _ACTIVE_ENV="system ($_PYTHON_PATH)" ;;
+esac
+
 echo "========================================"
 echo "  MAVT Stage 2 — Image + Video"
+echo "  Env:  $_ACTIVE_ENV"
 echo "  GPUs: $NUM_GPUS"
 echo "  Image shards: $IMAGE_SHARDS_DIR"
 echo "  Video shards: $VIDEO_SHARDS_DIR"
