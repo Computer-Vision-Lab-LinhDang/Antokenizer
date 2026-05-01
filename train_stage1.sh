@@ -162,6 +162,19 @@ case "$_PYTHON_PATH" in
     *) _ACTIVE_ENV="system ($_PYTHON_PATH)" ;;
 esac
 
+LPIPS_STATUS="$("$PYTHON_CMD" -c "
+import importlib.metadata as m
+try:
+    import lpips
+    try:
+        v = m.version('lpips')
+    except Exception:
+        v = '?'
+    print(f'installed v{v} ({lpips.__file__})')
+except ImportError as e:
+    print(f'NOT INSTALLED ({e})')
+" 2>&1)"
+
 echo "========================================"
 echo "  MAVT Stage 1 — Image Only"
 echo "  Env:              $_ACTIVE_ENV"
@@ -174,6 +187,7 @@ echo "  Image .tar shards: $IMAGE_SHARD_COUNT"
 echo "  Config:           $STAGE1_CONFIG"
 echo "  Pretrained model: $SIGLIP2_MODEL_NAME_EFFECTIVE ($SIGLIP2_MODEL_NAME_SOURCE)"
 echo "  Init pretrained:  $INIT_SIGLIP2_EFFECTIVE ($INIT_SIGLIP2_SOURCE)"
+echo "  LPIPS:            $LPIPS_STATUS"
 echo "  Progress bar:     $CONFIG_PROGRESS_BAR (RichProgressBar config)"
 echo "  Install deps:     $INSTALL_DEPS"
 echo "========================================"
