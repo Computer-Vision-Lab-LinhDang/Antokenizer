@@ -26,4 +26,3 @@ model:
   w_kl: 1.0
   w_sem: 0.5
   w_aux: 0.01
-  w_kl_spatial: 0.0001

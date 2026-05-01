@@ -10,6 +10,7 @@ Monitoring signals (logged during training):
 """
 
 from __future__ import annotations
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -51,22 +52,50 @@ class CrossAttentionLayer(nn.Module):
 
 
 class SlotPooler(nn.Module):
-    """Slot cross-attention pooler: learns to pool N tokens into num_slots tokens."""
+    """Slot cross-attention pooler with optional spatial position anchoring.
+
+    When grid_h/grid_w are provided, each slot query is initialised with a
+    fixed 2-D sinusoidal position bias so the cross-attention learns to pool
+    spatially localised information rather than permutation-invariant slots.
+    """
 
     def __init__(self, num_slots: int, dim: int, num_heads: int = 8,
-                 num_layers: int = 2):
+                 num_layers: int = 2,
+                 grid_h: Optional[int] = None, grid_w: Optional[int] = None):
         super().__init__()
         self.num_slots = num_slots
-        # Learnable slot initialisation
         self.slots = nn.Parameter(torch.randn(1, num_slots, dim) * (dim ** -0.5))
         self.layers = nn.ModuleList([
             CrossAttentionLayer(dim, num_heads) for _ in range(num_layers)
         ])
+        if grid_h is not None and grid_w is not None:
+            pos = SlotPooler._make_2d_sinpos(grid_h, grid_w, dim)
+            self.register_buffer('slot_pos', pos)   # (1, num_slots, dim), fixed
+        else:
+            self.slot_pos = None
+
+    @staticmethod
+    def _make_2d_sinpos(grid_h: int, grid_w: int, dim: int) -> torch.Tensor:
+        """Fixed 2-D sinusoidal encoding → (1, grid_h*grid_w, dim)."""
+        assert dim % 4 == 0, "dim must be divisible by 4"
+        d = dim // 4
+        den = 10000 ** (torch.arange(0, d, dtype=torch.float) / d)
+        rows = torch.arange(grid_h, dtype=torch.float).unsqueeze(1) / den   # (H, d)
+        cols = torch.arange(grid_w, dtype=torch.float).unsqueeze(1) / den   # (W, d)
+        row_enc = torch.stack([rows.sin(), rows.cos()], dim=-1).flatten(1)  # (H, 2d)
+        col_enc = torch.stack([cols.sin(), cols.cos()], dim=-1).flatten(1)  # (W, 2d)
+        row_exp = row_enc.unsqueeze(1).expand(grid_h, grid_w, 2 * d)
+        col_exp = col_enc.unsqueeze(0).expand(grid_h, grid_w, 2 * d)
+        pos = torch.cat([row_exp, col_exp], dim=-1)                          # (H, W, dim)
+        return pos.reshape(1, grid_h * grid_w, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, N, D) → slots: (B, num_slots, D)"""
         B = x.shape[0]
-        slots = self.slots.expand(B, -1, -1)
+        slots = self.slots
+        if self.slot_pos is not None:
+            slots = slots + self.slot_pos
+        slots = slots.expand(B, -1, -1)
         for layer in self.layers:
             slots = layer(slots, x)
         return slots
@@ -102,6 +131,16 @@ class ContentDetailSplit(nn.Module):
         self._num_heads = num_heads
         self._num_slot_layers = num_slot_layers
 
+    @staticmethod
+    def _grid_dims(n: int) -> Tuple[Optional[int], Optional[int]]:
+        """Return (H, W) with H*W == n, H closest to sqrt(n). None if not found."""
+        h = round(math.sqrt(n))
+        for delta in range(6):
+            for h_try in sorted({max(1, h - delta), h + delta}):
+                if n % h_try == 0:
+                    return h_try, n // h_try
+        return None, None
+
     def prepare_poolers(self, N_c: int, N_d: int) -> None:
         """Eagerly create poolers for a known (N_c, N_d) combo.
 
@@ -111,10 +150,14 @@ class ContentDetailSplit(nn.Module):
         key = f"{N_c}_{N_d}"
         if key in self._content_poolers:
             return
+        c_h, c_w = self._grid_dims(N_c)
+        d_h, d_w = self._grid_dims(N_d)
         self._content_poolers[key] = SlotPooler(
-            N_c, self.dim, self._num_heads, self._num_slot_layers)
-        self._detail_poolers[key]  = SlotPooler(
-            N_d, self.dim, self._num_heads, self._num_slot_layers)
+            N_c, self.dim, self._num_heads, self._num_slot_layers,
+            grid_h=c_h, grid_w=c_w)
+        self._detail_poolers[key] = SlotPooler(
+            N_d, self.dim, self._num_heads, self._num_slot_layers,
+            grid_h=d_h, grid_w=d_w)
 
     def _get_poolers(self, N_c: int, N_d: int) -> Tuple[SlotPooler, SlotPooler]:
         key = f"{N_c}_{N_d}"

@@ -23,7 +23,6 @@ from mavt.model.backbone import HybridBackbone
 from mavt.model.content_detail_split import ContentDetailSplit
 from mavt.model.matryoshka_head import MatryoshkaHead
 from mavt.model.decoder import AsymmetricDecoder
-from mavt.model.spatial_encoder import SpatialEncoder
 
 
 # Compression ratios per modality (content, detail)
@@ -50,9 +49,6 @@ class MAVTOutput:
     classification: Optional[Dict[int, torch.Tensor]]
     # Slot diversity / residual ratio metrics from C-D split.
     cd_metrics: Dict[str, torch.Tensor]
-    # Spatial reconstruction branch
-    z_spatial: torch.Tensor          # (B, N_patches, latent_dim)
-    kl_spatial: torch.Tensor         # scalar
     # Which prefixes ran the decoder this forward pass.
     recon_prefixes: Tuple[int, ...]
 
@@ -124,9 +120,6 @@ class MAVT(nn.Module):
             mlp_ratio=mlp_ratio,
         )
 
-        # Stage 5b — Spatial encoder for reconstruction only
-        self.spatial_encoder = SpatialEncoder(embed_dim, latent_dim)
-
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
@@ -194,9 +187,6 @@ class MAVT(nn.Module):
         tokens, positions, plane_ids = self.patchify(x, modality)
         features = self.backbone(tokens, positions, plane_ids, modality)
 
-        # Spatial reconstruction path: spatially-organized z_spatial
-        z_spatial, _, _, kl_spatial = self.spatial_encoder(features)
-
         content_ratio, detail_ratio = _MODALITY_RATIOS[modality]
         compressed, cd_metrics = self.cd_split(features, content_ratio, detail_ratio)
 
@@ -204,11 +194,9 @@ class MAVT(nn.Module):
 
         chosen_prefixes = self._resolve_recon_prefixes(recon_prefixes) if decode else ()
         recon: Dict[int, torch.Tensor] = {}
-        # decode once from z_spatial, assign to d_max for loss compat
-        if decode and chosen_prefixes:
-            d_max_recon = max(chosen_prefixes)
-            recon[d_max_recon] = self.decoder(
-                z_spatial, positions, modality, grid_shape
+        for d in chosen_prefixes:
+            recon[d] = self.decoder(
+                mrl_out[d]['z'], positions, modality, grid_shape
             )
 
         return MAVTOutput(
@@ -224,8 +212,6 @@ class MAVT(nn.Module):
                 if self.matryoshka_head.cls_heads is not None else None
             ),
             cd_metrics=cd_metrics,
-            z_spatial=z_spatial,
-            kl_spatial=kl_spatial,
             recon_prefixes=tuple(chosen_prefixes),
         )
 

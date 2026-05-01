@@ -151,7 +151,6 @@ class MAVTLoss(nn.Module):
         w_kl: float    = 1.0,
         w_sem: float   = 0.5,
         w_aux: float   = 0.01,
-        w_kl_spatial: float = 1e-4,
         use_lpips: bool = True,
         matryoshka_alphas: Optional[Mapping[int, float]] = None,
     ):
@@ -161,7 +160,6 @@ class MAVTLoss(nn.Module):
         self.w_kl = w_kl
         self.w_sem = w_sem
         self.w_aux = w_aux
-        self.w_kl_spatial = w_kl_spatial
         self.alphas: Dict[int, float] = (
             {int(k): float(v) for k, v in matryoshka_alphas.items()}
             if matryoshka_alphas else {}
@@ -180,7 +178,6 @@ class MAVTLoss(nn.Module):
         all_prefixes:     Sequence[int],
         slot_diversity:   torch.Tensor,
         teacher_embed:    Optional[torch.Tensor] = None,
-        kl_spatial:       Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
 
         device = target.device
@@ -236,16 +233,11 @@ class MAVTLoss(nn.Module):
 
         l_div = slot_diversity_loss(slot_diversity)
 
-        l_kl_spatial = (self.w_kl_spatial * kl_spatial
-                        if kl_spatial is not None
-                        else zero)
-
         total = (
             mod_w * l_recon_sum
             + l_kl_sum
             + self.w_sem * l_sem_sum
             + self.w_aux * l_div
-            + l_kl_spatial
         )
 
         losses: Dict[str, torch.Tensor] = {
@@ -259,7 +251,6 @@ class MAVTLoss(nn.Module):
             'loss_sem_weighted': self.w_sem * l_sem_sum,
             'loss_div':   l_div,
             'modality_weight': mod_w.detach(),
-            'loss_kl_spatial': l_kl_spatial.detach() if isinstance(l_kl_spatial, torch.Tensor) else l_kl_spatial,
         }
         losses.update(per_prefix_logs)
         return losses

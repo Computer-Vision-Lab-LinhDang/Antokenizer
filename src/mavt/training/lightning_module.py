@@ -63,7 +63,6 @@ class MAVTLightningModule(L.LightningModule):
         w_kl: float = 1.0,
         w_sem: float = 0.0,
         w_aux: float = 0.01,
-        w_kl_spatial: float = 1e-4,
         use_lpips: bool = True,
         # Curriculum
         training_stage: int = 1,
@@ -102,7 +101,6 @@ class MAVTLightningModule(L.LightningModule):
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_sem=w_sem, w_aux=w_aux,
-            w_kl_spatial=w_kl_spatial,
             use_lpips=use_lpips,
             matryoshka_alphas=matryoshka_alphas,
         )
@@ -261,7 +259,6 @@ class MAVTLightningModule(L.LightningModule):
             all_prefixes=self.model.matryoshka_dims,
             slot_diversity=out.cd_metrics['slot_diversity'],
             teacher_embed=teacher_embed,
-            kl_spatial=out.kl_spatial,
         )
 
         for k, v in losses.items():

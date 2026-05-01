@@ -120,8 +120,20 @@
   "hotPaths": [
     {
       "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 18,
-      "lastAccessed": 1777601562179,
+      "accessCount": 23,
+      "lastAccessed": 1777651776987,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/mavt.py",
+      "accessCount": 15,
+      "lastAccessed": 1777651689043,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/losses/losses.py",
+      "accessCount": 15,
+      "lastAccessed": 1777651752624,
       "type": "file"
     },
     {
@@ -137,9 +149,15 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/model/mavt.py",
-      "accessCount": 9,
-      "lastAccessed": 1777601557125,
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 11,
+      "lastAccessed": 1777651801139,
+      "type": "file"
+    },
+    {
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 10,
+      "lastAccessed": 1777651790777,
       "type": "file"
     },
     {
@@ -149,21 +167,9 @@
       "type": "file"
     },
     {
-      "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 8,
-      "lastAccessed": 1777601552085,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/losses/losses.py",
-      "accessCount": 8,
-      "lastAccessed": 1777601561870,
-      "type": "file"
-    },
-    {
-      "path": "configs/model/mavt_base.yaml",
+      "path": "src/mavt/model/content_detail_split.py",
       "accessCount": 7,
-      "lastAccessed": 1777601539223,
+      "lastAccessed": 1777651647939,
       "type": "file"
     },
     {
@@ -224,12 +230,6 @@
       "path": "train_stage1.sh",
       "accessCount": 1,
       "lastAccessed": 1777555076729,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/model/content_detail_split.py",
-      "accessCount": 1,
-      "lastAccessed": 1777598930839,
       "type": "file"
     },
     {
