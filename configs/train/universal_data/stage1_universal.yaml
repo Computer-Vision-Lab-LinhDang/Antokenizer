@@ -58,13 +58,14 @@ model:
   use_semantic_distill: true
   siglip2_model_name: google/siglip2-base-patch16-224
   w_l1: 1.0
-  w_lpips: 0.1
+  w_lpips: 1.0        # equal weight with L1 to force perceptual sharpness
   w_kl: 1.0          # MAVTLoss applies β_k = w_kl · (d_k / D_max) per prefix
   w_sem: 0.5
   w_aux: 0.0         # slot diversity disabled
   use_lpips: true
   warmup_steps: 1000
   total_steps: 200000
+  kl_anneal_steps: 50000  # ramp KL from 0→1 over 50k steps to prevent posterior collapse
   weight_decay: 0.01
   grad_clip: 1.0
 

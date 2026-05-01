@@ -74,6 +74,7 @@ class MAVTLightningModule(L.LightningModule):
         grad_clip: float = 1.0,
         warmup_steps: int = 1000,
         total_steps: int = 200_000,
+        kl_anneal_steps: int = 50_000,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -245,11 +246,15 @@ class MAVTLightningModule(L.LightningModule):
                 proxy = self._make_teacher_input(x, modality, self._teacher_image_size)
                 teacher_embed = self.semantic_teacher(pixel_values=proxy).pooler_output
 
+        kl_mult = min(1.0, self.global_step / max(1, self.hparams.kl_anneal_steps))
+        scaled_kl = {d: v * kl_mult for d, v in out.loss_kl.items()}
+        self.log(f'{log_prefix}/kl_mult', kl_mult, prog_bar=False)
+
         losses = self.loss_fn(
             target=target,
             modality=modality,
             recon_per_prefix=out.reconstruction,
-            kl_per_prefix=out.loss_kl,
+            kl_per_prefix=scaled_kl,
             sem_per_prefix=out.semantic,
             all_prefixes=self.model.matryoshka_dims,
             slot_diversity=out.cd_metrics['slot_diversity'],

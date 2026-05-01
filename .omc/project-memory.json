@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1777284994459,
+  "lastScanned": 1777426729744,
   "projectRoot": "/Users/nguyenbinhan/Workspace/AToken/atoken",
   "techStack": {
     "languages": [
@@ -54,7 +54,7 @@
       "path": "__pycache__",
       "purpose": null,
       "fileCount": 4,
-      "lastAccessed": 1777284994444,
+      "lastAccessed": 1777426729716,
       "keyFiles": [
         "evaluate.cpython-314.pyc",
         "quick_train_test.cpython-314.pyc",
@@ -66,14 +66,14 @@
       "path": "configs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777284994445,
+      "lastAccessed": 1777426729730,
       "keyFiles": []
     },
     "logs": {
       "path": "logs",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1777284994454,
+      "lastAccessed": 1777426729735,
       "keyFiles": [
         "err_7737.txt",
         "err_7738.txt",
@@ -86,7 +86,7 @@
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 3,
-      "lastAccessed": 1777284994454,
+      "lastAccessed": 1777426729738,
       "keyFiles": [
         "download_datasets.sh",
         "download_objaverse.py",
@@ -97,21 +97,21 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 0,
-      "lastAccessed": 1777284994455,
+      "lastAccessed": 1777426729740,
       "keyFiles": []
     },
     "train": {
       "path": "train",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777284994456,
+      "lastAccessed": 1777426729742,
       "keyFiles": []
     },
     "wandb": {
       "path": "wandb",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777284994456,
+      "lastAccessed": 1777426729743,
       "keyFiles": []
     }
   },
@@ -123,6 +123,12 @@
       "type": "file"
     },
     {
+      "path": "src/mavt/training/lightning_module.py",
+      "accessCount": 13,
+      "lastAccessed": 1777593413012,
+      "type": "file"
+    },
+    {
       "path": "src/mavt/data/datamodule.py",
       "accessCount": 12,
       "lastAccessed": 1777365707003,
@@ -130,14 +136,8 @@
     },
     {
       "path": "train_stage3.sh",
-      "accessCount": 7,
-      "lastAccessed": 1777363731759,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 6,
-      "lastAccessed": 1777365744953,
+      "accessCount": 8,
+      "lastAccessed": 1777555067486,
       "type": "file"
     },
     {
@@ -147,15 +147,21 @@
       "type": "file"
     },
     {
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 5,
+      "lastAccessed": 1777593434870,
+      "type": "file"
+    },
+    {
       "path": "src/mavt/data/datasets.py",
       "accessCount": 4,
       "lastAccessed": 1777364249707,
       "type": "file"
     },
     {
-      "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 3,
-      "lastAccessed": 1777167386040,
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 4,
+      "lastAccessed": 1777592971611,
       "type": "file"
     },
     {
@@ -165,9 +171,9 @@
       "type": "file"
     },
     {
-      "path": "configs/model/mavt_base.yaml",
+      "path": "src/mavt/losses/losses.py",
       "accessCount": 3,
-      "lastAccessed": 1777365951742,
+      "lastAccessed": 1777592971349,
       "type": "file"
     },
     {
@@ -189,9 +195,21 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/losses/losses.py",
+      "path": "src/mavt/model/decoder.py",
       "accessCount": 1,
-      "lastAccessed": 1777363722187,
+      "lastAccessed": 1777554978800,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/matryoshka_head.py",
+      "accessCount": 1,
+      "lastAccessed": 1777554980463,
+      "type": "file"
+    },
+    {
+      "path": "train_stage1.sh",
+      "accessCount": 1,
+      "lastAccessed": 1777555076729,
       "type": "file"
     }
   ],
