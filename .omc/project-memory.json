@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1777426729744,
+  "lastScanned": 1777598778137,
   "projectRoot": "/Users/nguyenbinhan/Workspace/AToken/atoken",
   "techStack": {
     "languages": [
@@ -54,7 +54,7 @@
       "path": "__pycache__",
       "purpose": null,
       "fileCount": 4,
-      "lastAccessed": 1777426729716,
+      "lastAccessed": 1777598778127,
       "keyFiles": [
         "evaluate.cpython-314.pyc",
         "quick_train_test.cpython-314.pyc",
@@ -66,14 +66,14 @@
       "path": "configs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777426729730,
+      "lastAccessed": 1777598778130,
       "keyFiles": []
     },
     "logs": {
       "path": "logs",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1777426729735,
+      "lastAccessed": 1777598778131,
       "keyFiles": [
         "err_7737.txt",
         "err_7738.txt",
@@ -85,9 +85,11 @@
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
-      "fileCount": 3,
-      "lastAccessed": 1777426729738,
+      "fileCount": 6,
+      "lastAccessed": 1777598778133,
       "keyFiles": [
+        "Ảnh màn hình 2026-04-30 lúc 06.44.41.png",
+        "dataloader_smoke_stage3.py",
         "download_datasets.sh",
         "download_objaverse.py",
         "glb_to_tripplane.py"
@@ -97,35 +99,35 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 0,
-      "lastAccessed": 1777426729740,
+      "lastAccessed": 1777598778133,
       "keyFiles": []
     },
     "train": {
       "path": "train",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777426729742,
+      "lastAccessed": 1777598778134,
       "keyFiles": []
     },
     "wandb": {
       "path": "wandb",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777426729743,
+      "lastAccessed": 1777598778134,
       "keyFiles": []
     }
   },
   "hotPaths": [
     {
-      "path": "scripts/download_datasets.sh",
-      "accessCount": 13,
-      "lastAccessed": 1777193568572,
+      "path": "src/mavt/training/lightning_module.py",
+      "accessCount": 18,
+      "lastAccessed": 1777601562179,
       "type": "file"
     },
     {
-      "path": "src/mavt/training/lightning_module.py",
+      "path": "scripts/download_datasets.sh",
       "accessCount": 13,
-      "lastAccessed": 1777593413012,
+      "lastAccessed": 1777193568572,
       "type": "file"
     },
     {
@@ -135,9 +137,33 @@
       "type": "file"
     },
     {
+      "path": "src/mavt/model/mavt.py",
+      "accessCount": 9,
+      "lastAccessed": 1777601557125,
+      "type": "file"
+    },
+    {
       "path": "train_stage3.sh",
       "accessCount": 8,
       "lastAccessed": 1777555067486,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 8,
+      "lastAccessed": 1777601552085,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/losses/losses.py",
+      "accessCount": 8,
+      "lastAccessed": 1777601561870,
+      "type": "file"
+    },
+    {
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 7,
+      "lastAccessed": 1777601539223,
       "type": "file"
     },
     {
@@ -147,21 +173,9 @@
       "type": "file"
     },
     {
-      "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 5,
-      "lastAccessed": 1777593434870,
-      "type": "file"
-    },
-    {
       "path": "src/mavt/data/datasets.py",
       "accessCount": 4,
       "lastAccessed": 1777364249707,
-      "type": "file"
-    },
-    {
-      "path": "configs/model/mavt_base.yaml",
-      "accessCount": 4,
-      "lastAccessed": 1777592971611,
       "type": "file"
     },
     {
@@ -171,9 +185,9 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/losses/losses.py",
-      "accessCount": 3,
-      "lastAccessed": 1777592971349,
+      "path": "src/mavt/model/spatial_encoder.py",
+      "accessCount": 2,
+      "lastAccessed": 1777601556597,
       "type": "file"
     },
     {
@@ -210,6 +224,18 @@
       "path": "train_stage1.sh",
       "accessCount": 1,
       "lastAccessed": 1777555076729,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/content_detail_split.py",
+      "accessCount": 1,
+      "lastAccessed": 1777598930839,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/patchify.py",
+      "accessCount": 1,
+      "lastAccessed": 1777598931465,
       "type": "file"
     }
   ],

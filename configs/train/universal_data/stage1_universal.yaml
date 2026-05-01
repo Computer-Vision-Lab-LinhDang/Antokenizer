@@ -60,6 +60,7 @@ model:
   w_l1: 1.0
   w_lpips: 1.0        # equal weight with L1 to force perceptual sharpness
   w_kl: 1.0          # MAVTLoss applies β_k = w_kl · (d_k / D_max) per prefix
+  w_kl_spatial: 0.0001  # near-zero: z_spatial stays informative for reconstruction
   w_sem: 0.5
   w_aux: 0.0         # slot diversity disabled
   use_lpips: true
