@@ -62,6 +62,9 @@ class MAVTLightningModule(L.LightningModule):
         siglip2_model_name: str = "google/siglip2-base-patch16-224",
         init_siglip2: bool = True,
         use_semantic_distill: bool = False,
+        # Cross-stage weight transfer (loads model weights only, NOT optimizer
+        # / scheduler / step state — use --ckpt_path for true resume instead).
+        init_from_ckpt: Optional[str] = None,
         # Optimiser
         weight_decay: float = 0.01,
         grad_clip: float = 1.0,
@@ -107,6 +110,26 @@ class MAVTLightningModule(L.LightningModule):
             self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
         if hp.use_semantic_distill and self.semantic_teacher is None:
             self._load_semantic_teacher(hp.siglip2_model_name)
+        # Cross-stage weight transfer (after siglip2 / teacher are in place so
+        # they get overwritten by ckpt values when present).
+        if hp.init_from_ckpt:
+            self._load_weights_from_ckpt(hp.init_from_ckpt)
+
+    def _load_weights_from_ckpt(self, path: str) -> None:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        sd = ckpt.get('state_dict', ckpt)
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+        kept_missing = [
+            k for k in missing
+            if not k.startswith('semantic_teacher.')
+            and not k.startswith('model.cd_split._content_poolers.')
+            and not k.startswith('model.cd_split._detail_poolers.')
+        ]
+        print(f"[init_from_ckpt] loaded {path}")
+        print(f"[init_from_ckpt] missing (kept random init): {len(kept_missing)} keys "
+              f"+ {len(missing) - len(kept_missing)} expected (teacher/new poolers)")
+        if unexpected:
+            print(f"[init_from_ckpt] unexpected (dropped): {len(unexpected)} keys")
 
     def _prepare_cd_split_poolers(self) -> None:
         """Read active modality + resolution from the attached DataModule and

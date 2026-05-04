@@ -17,6 +17,7 @@ from mavt.data.datasets import (
     UniversalVideoDataset,
     UniversalThreeDDataset,
     WDSImageDataset,
+    ShardVideoDataset,
 )
 
 
@@ -122,6 +123,10 @@ class MAVTDataModule(L.LightningDataModule):
         active_modalities: List[str] = ('image',),
         # Data root (None → synthetic smoke-test)
         universal_data_root: Optional[str] = None,
+        # Per-modality shard roots (override universal_data_root when set)
+        image_shards_dir: Optional[str] = None,
+        video_shards_dir: Optional[str] = None,
+        video_max_shards: Optional[int] = None,
         # Data params
         image_resolution: int = 256,
         video_frames: int = 16,
@@ -144,6 +149,14 @@ class MAVTDataModule(L.LightningDataModule):
 
     def _make_dataset(self, modality: str) -> Dataset:
         hp = self.hparams
+        # Per-modality shard roots take precedence over universal_data_root
+        if modality == 'image' and hp.image_shards_dir:
+            return WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
+        if modality == 'video' and hp.video_shards_dir:
+            return ShardVideoDataset(
+                hp.video_shards_dir, hp.video_frames, hp.video_resolution,
+                max_shards=hp.video_max_shards,
+            )
         if hp.universal_data_root:
             if modality == 'image':
                 root = Path(hp.universal_data_root)
@@ -195,10 +208,29 @@ class MAVTDataModule(L.LightningDataModule):
                 drop_last=True, shuffle=True,
             )
 
-        self._val_ds: Dataset = val_splits[0] if len(val_splits) == 1 else ConcatDataset(val_splits)
-        self._test_ds: Optional[Dataset] = (
-            test_splits[0] if len(test_splits) == 1 else ConcatDataset(test_splits)
-        ) if test_splits else None
+        if len(val_splits) == 1:
+            self._val_ds: Dataset = val_splits[0]
+            self._val_batch_sampler: Optional[ModalityGroupedBatchSampler] = None
+        else:
+            self._val_ds = ConcatDataset(val_splits)
+            self._val_batch_sampler = ModalityGroupedBatchSampler(
+                self._val_ds, hp.batch_size,
+                drop_last=False, shuffle=False,
+            )
+
+        if test_splits:
+            if len(test_splits) == 1:
+                self._test_ds: Optional[Dataset] = test_splits[0]
+                self._test_batch_sampler: Optional[ModalityGroupedBatchSampler] = None
+            else:
+                self._test_ds = ConcatDataset(test_splits)
+                self._test_batch_sampler = ModalityGroupedBatchSampler(
+                    self._test_ds, hp.batch_size,
+                    drop_last=False, shuffle=False,
+                )
+        else:
+            self._test_ds = None
+            self._test_batch_sampler = None
 
     def train_dataloader(self) -> DataLoader:
         hp = self.hparams
@@ -222,6 +254,14 @@ class MAVTDataModule(L.LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         hp = self.hparams
+        if self._val_batch_sampler is not None:
+            return DataLoader(
+                self._val_ds,
+                batch_sampler=self._val_batch_sampler,
+                num_workers=hp.num_workers,
+                pin_memory=hp.pin_memory,
+                collate_fn=_collate,
+            )
         return DataLoader(
             self._val_ds, batch_size=hp.batch_size, shuffle=False,
             num_workers=hp.num_workers, pin_memory=hp.pin_memory,
@@ -232,6 +272,14 @@ class MAVTDataModule(L.LightningDataModule):
         if self._test_ds is None:
             return None
         hp = self.hparams
+        if self._test_batch_sampler is not None:
+            return DataLoader(
+                self._test_ds,
+                batch_sampler=self._test_batch_sampler,
+                num_workers=hp.num_workers,
+                pin_memory=hp.pin_memory,
+                collate_fn=_collate,
+            )
         return DataLoader(
             self._test_ds, batch_size=hp.batch_size, shuffle=False,
             num_workers=hp.num_workers, pin_memory=hp.pin_memory,
