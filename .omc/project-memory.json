@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1777016902795,
+  "lastScanned": 1777866235340,
   "projectRoot": "/Users/nguyenbinhan/Workspace/AToken/atoken",
   "techStack": {
     "languages": [
@@ -50,18 +50,43 @@
   },
   "customNotes": [],
   "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1777866235296,
+      "keyFiles": [
+        "evaluate.cpython-314.pyc",
+        "quick_train_test.cpython-314.pyc",
+        "smoke_test.cpython-314.pyc",
+        "train.cpython-314.pyc"
+      ]
+    },
     "configs": {
       "path": "configs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777016902766,
+      "lastAccessed": 1777866235297,
       "keyFiles": []
+    },
+    "logs": {
+      "path": "logs",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1777866235310,
+      "keyFiles": [
+        "err_7737.txt",
+        "err_7738.txt",
+        "err_7739.txt",
+        "err_7743.txt",
+        "out_7737.txt"
+      ]
     },
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 2,
-      "lastAccessed": 1777016902767,
+      "lastAccessed": 1777866235311,
       "keyFiles": [
         "download_objaverse.py",
         "glb_to_tripplane.py"
@@ -71,46 +96,65 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 0,
-      "lastAccessed": 1777016902768,
+      "lastAccessed": 1777866235322,
       "keyFiles": []
     },
     "train": {
       "path": "train",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1777016902781,
+      "lastAccessed": 1777866235327,
+      "keyFiles": []
+    },
+    "wandb": {
+      "path": "wandb",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1777866235329,
       "keyFiles": []
     }
   },
   "hotPaths": [
     {
       "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 10,
-      "lastAccessed": 1777094485962,
+      "accessCount": 17,
+      "lastAccessed": 1777868992395,
       "type": "file"
     },
     {
       "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 8,
-      "lastAccessed": 1777101682907,
+      "accessCount": 11,
+      "lastAccessed": 1777869039445,
       "type": "file"
     },
     {
       "path": "configs/train/universal_data/stage2_universal.yaml",
-      "accessCount": 7,
-      "lastAccessed": 1777105300842,
+      "accessCount": 10,
+      "lastAccessed": 1777869054055,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/losses/losses.py",
+      "accessCount": 9,
+      "lastAccessed": 1777868911758,
       "type": "file"
     },
     {
       "path": "configs/train/universal_data/stage3_universal.yaml",
-      "accessCount": 7,
-      "lastAccessed": 1777105328710,
+      "accessCount": 9,
+      "lastAccessed": 1777869015867,
       "type": "file"
     },
     {
       "path": "src/mavt/model/mavt.py",
+      "accessCount": 7,
+      "lastAccessed": 1777866599699,
+      "type": "file"
+    },
+    {
+      "path": "train_stage1.sh",
       "accessCount": 6,
-      "lastAccessed": 1777024171020,
+      "lastAccessed": 1777866590459,
       "type": "file"
     },
     {
@@ -120,27 +164,15 @@
       "type": "file"
     },
     {
-      "path": "src/mavt/losses/losses.py",
+      "path": "src/mavt/model/decoder.py",
       "accessCount": 5,
-      "lastAccessed": 1777094586506,
+      "lastAccessed": 1777866599440,
       "type": "file"
     },
     {
       "path": "src/mavt/model/patchify.py",
-      "accessCount": 4,
-      "lastAccessed": 1777021897353,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/model/decoder.py",
-      "accessCount": 4,
-      "lastAccessed": 1777024134650,
-      "type": "file"
-    },
-    {
-      "path": "train_stage1.sh",
-      "accessCount": 4,
-      "lastAccessed": 1777090811264,
+      "accessCount": 5,
+      "lastAccessed": 1777866662502,
       "type": "file"
     },
     {
@@ -156,9 +188,21 @@
       "type": "file"
     },
     {
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1777867344947,
+      "type": "file"
+    },
+    {
       "path": "README.md",
       "accessCount": 2,
       "lastAccessed": 1777018549894,
+      "type": "file"
+    },
+    {
+      "path": "src/mavt/model/latent_heads.py",
+      "accessCount": 2,
+      "lastAccessed": 1777866662864,
       "type": "file"
     },
     {
@@ -168,21 +212,9 @@
       "type": "file"
     },
     {
-      "path": "configs/model/mavt_base.yaml",
-      "accessCount": 1,
-      "lastAccessed": 1777017297301,
-      "type": "file"
-    },
-    {
       "path": "src/mavt/model/backbone.py",
       "accessCount": 1,
       "lastAccessed": 1777017987108,
-      "type": "file"
-    },
-    {
-      "path": "src/mavt/model/latent_heads.py",
-      "accessCount": 1,
-      "lastAccessed": 1777017988674,
       "type": "file"
     },
     {

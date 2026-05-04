@@ -51,12 +51,13 @@ class MAVTLightningModule(L.LightningModule):
         # Loss
         w_l1: float = 1.0,
         w_lpips: float = 0.1,
-        w_kl: float = 1e-4,
+        w_kl: float = 1.0,      # passthrough — KL pre-scaled by VAEHead.kl_weight
         w_clip: float = 0.0,
         w_sem: float = 0.0,
         w_aux: float = 0.01,
         use_lpips: bool = True,
         use_clip: bool = False,
+        active_modalities: list = None,  # e.g. ['image', 'video']; None → all three
         # Curriculum
         training_stage: int = 1,
         siglip2_model_name: str = "google/siglip2-base-patch16-224",
@@ -84,10 +85,12 @@ class MAVTLightningModule(L.LightningModule):
             mlp_ratio=mlp_ratio, dropout=dropout,
         )
 
+        _active_mods = tuple(active_modalities) if active_modalities else ('image', 'video', 'threed')
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
             use_lpips=use_lpips, use_clip=use_clip,
+            active_modalities=_active_mods,
         )
 
         # Frozen vision teacher (loaded lazily in setup() to keep __init__ light)
@@ -105,6 +108,8 @@ class MAVTLightningModule(L.LightningModule):
         # Eager slot pooler creation — must run BEFORE configure_optimizers
         # so the new params land in the optimizer's param_groups.
         self._prepare_cd_split_poolers()
+        # Sync EMA modalities from DataModule — single source of truth
+        self._sync_ema_modalities()
         if hp.init_siglip2:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
             self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
@@ -160,6 +165,23 @@ class MAVTLightningModule(L.LightningModule):
                 })
         if specs:
             self.model.prepare_for_modalities(specs)
+
+    def _sync_ema_modalities(self) -> None:
+        """Use DataModule as single source of truth for active_modalities.
+
+        Overrides whatever was set in model config so data.active_modalities
+        and the EMA weighter never drift apart.
+        """
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is not None and hasattr(dm, 'hparams'):
+            active = getattr(dm.hparams, 'active_modalities', None)
+            if active:
+                self.loss_fn.ema_weighter.active_modalities = tuple(active)
+                return
+        # Fallback: use model config param if DataModule not available
+        fallback = getattr(self.hparams, 'active_modalities', None)
+        if fallback:
+            self.loss_fn.ema_weighter.active_modalities = tuple(fallback)
 
     def _load_semantic_teacher(self, model_name: str) -> None:
         """Load frozen SigLIP2 vision tower as teacher for cosine distillation."""
@@ -248,10 +270,15 @@ class MAVTLightningModule(L.LightningModule):
             teacher_embed=teacher_embed,
         )
 
-        # Logging
+        # Logging — aggregate (all modalities combined)
         for k, v in losses.items():
             self.log(f'{log_prefix}/{k}', v, on_step=True, on_epoch=True,
                      prog_bar=(k == 'loss'), sync_dist=True)
+        # Per-modality breakdown (diagnose image vs video separately)
+        for k in ('loss', 'loss_recon', 'loss_l1', 'loss_kl'):
+            if k in losses:
+                self.log(f'{log_prefix}/{k}_{modality}', losses[k],
+                         on_step=True, on_epoch=True, sync_dist=True)
         for k, v in out.cd_metrics.items():
             self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True,
                      sync_dist=True)

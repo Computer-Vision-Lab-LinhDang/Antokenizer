@@ -108,13 +108,21 @@ class ModalityEMAWeighter(nn.Module):
     (i.e. mean weight = 1.0), instead of normalizing each modality's loss to 1.
     This keeps relative balancing between modalities while preserving the
     absolute magnitude of l_recon — so a decreasing l_recon shows up in l_total.
+
+    All three EMA buffers are always registered regardless of active_modalities so
+    that checkpoints load cleanly across stages (stage1→stage2→stage3 resume).
+    active_modalities controls only which set is used for weight normalization and
+    can be updated at runtime (e.g. synced from DataModule in setup()).
     """
+
+    _ALL_MODALITIES = ('image', 'video', 'threed')
 
     def __init__(self, modalities=('image', 'video', 'threed'), momentum: float = 0.99):
         super().__init__()
         self.momentum = momentum
-        self.modalities = tuple(modalities)
-        for m in modalities:
+        self.active_modalities = tuple(modalities)  # plain attr — mutable, not a buffer
+        # Always register all three so stage1 ckpt loads into stage2 without missing keys
+        for m in self._ALL_MODALITIES:
             self.register_buffer(f'ema_{m}', torch.tensor(1.0))
 
     def update(self, modality: str, loss_recon: torch.Tensor) -> None:
@@ -128,9 +136,11 @@ class ModalityEMAWeighter(nn.Module):
         if not hasattr(self, attr):
             return torch.tensor(1.0)
 
-        inv = [1.0 / (getattr(self, f'ema_{m}') + 1e-8) for m in self.modalities]
+        # Normalize only over active modalities — inactive ones (e.g. threed in stage2)
+        # are excluded so their stuck-at-1.0 EMA doesn't distort the normalizer.
+        inv = [1.0 / (getattr(self, f'ema_{m}') + 1e-8) for m in self.active_modalities]
         inv_stack = torch.stack(inv)
-        normalizer = inv_stack.sum() / len(self.modalities)  # mean(inv)
+        normalizer = inv_stack.sum() / len(self.active_modalities)
         return (1.0 / (getattr(self, attr) + 1e-8)) / (normalizer + 1e-8)
 
 
@@ -145,18 +155,23 @@ class MAVTLoss(nn.Module):
         recon (L1 + LPIPS) + KL + vision-vision distillation + slot diversity.
 
     InfoNCE/text branch is retained but disabled by default (use_clip=False).
+
+    Note on w_kl: loss_kl arrives pre-scaled by VAEHead.kl_weight already.
+    Keep w_kl=1.0 (default) so no double-scaling occurs. Setting both
+    w_kl=1e-4 and kl_weight=1e-4 makes KL ~1e-8 of total loss → posterior collapse.
     """
 
     def __init__(
         self,
         w_l1: float   = 1.0,
         w_lpips: float = 0.1,
-        w_kl: float   = 1e-4,   # already baked into VAEHead; set 1.0 here
+        w_kl: float   = 1.0,    # passthrough — KL already scaled by VAEHead.kl_weight
         w_clip: float = 0.0,    # InfoNCE(visual, text) — off by default
         w_sem: float  = 0.5,    # cosine distill from frozen vision teacher
         w_aux: float  = 0.01,
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
+        active_modalities: tuple = ('image', 'video', 'threed'),
     ):
         super().__init__()
         self.w_l1   = w_l1
@@ -168,7 +183,7 @@ class MAVTLoss(nn.Module):
         self.use_clip = use_clip
 
         self.lpips = LPIPSLoss() if use_lpips else None
-        self.ema_weighter = ModalityEMAWeighter()
+        self.ema_weighter = ModalityEMAWeighter(modalities=active_modalities)
 
     def forward(
         self,
@@ -189,7 +204,8 @@ class MAVTLoss(nn.Module):
 
         # Modality inverse-EMA scaling
         mod_w = self.ema_weighter.weight(modality).to(pred.device)
-        self.ema_weighter.update(modality, l_recon)
+        if self.training:  # don't let validation batches poison training weights
+            self.ema_weighter.update(modality, l_recon)
 
         # CLIP contrastive (legacy text path — off by default)
         l_clip = torch.tensor(0.0, device=pred.device)
