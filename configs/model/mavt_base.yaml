@@ -1,6 +1,6 @@
 # MAVT base model configuration
 model:
-  embed_dim: 1152
+  embed_dim: 768
   num_heads: 16
   num_blocks: 12
   patch_size: 16

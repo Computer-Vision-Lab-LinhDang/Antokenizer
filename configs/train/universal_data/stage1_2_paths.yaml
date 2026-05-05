@@ -1,0 +1,33 @@
+# Override of stage1_universal.yaml's callback dirpaths/filenames
+# to save under checkpoints/stage1_2/ (separate from previous stage1 run).
+# Pass AFTER stage1_universal.yaml so the callbacks list is replaced.
+trainer:
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage1_2/balanced
+        filename: mavt-stage1_2-balanced-{step:07d}-{val/loss:.4f}
+        save_top_k: 1
+        monitor: val/loss
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage1_2/recon
+        filename: mavt-stage1_2-recon-{step:07d}-{val/loss_recon:.4f}
+        save_top_k: 1
+        monitor: val/loss_recon
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage1_2/sem
+        filename: mavt-stage1_2-sem-{step:07d}-{val/loss_sem:.4f}
+        save_top_k: 1
+        monitor: val/loss_sem
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar

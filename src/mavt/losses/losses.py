@@ -118,17 +118,18 @@ def temporal_consistency_loss(pred: torch.Tensor, target: torch.Tensor) -> torch
 # --------------------------------------------------------------------------- #
 
 class ModalityEMAWeighter(nn.Module):
-    """Maintains a running EMA of L_recon per modality for inverse scaling.
+    """Maintains a running EMA of L_recon per modality for proportional scaling.
 
-    Normalizes the *coefficients* across modalities to sum to ``num_modalities``
-    (i.e. mean weight = 1.0), instead of normalizing each modality's loss to 1.
-    This keeps relative balancing between modalities while preserving the
-    absolute magnitude of l_recon — so a decreasing l_recon shows up in l_total.
+    weight(modality) = ema_modality / mean(ema_active). Modalities with HIGHER
+    recon loss get LARGER weight so cross-stage transfer (e.g. image already
+    converged from stage 1, video starts random in stage 2) doesn't starve the
+    untrained branch of gradient. Mean weight = 1.0, so total loss magnitude is
+    preserved.
 
-    All three EMA buffers are always registered regardless of active_modalities so
-    that checkpoints load cleanly across stages (stage1→stage2→stage3 resume).
-    active_modalities controls only which set is used for weight normalization and
-    can be updated at runtime (e.g. synced from DataModule in setup()).
+    All three EMA buffers are always registered regardless of active_modalities
+    so that checkpoints load cleanly across stages (stage1→stage2→stage3 resume).
+    active_modalities controls only which set is used for weight normalization
+    and can be updated at runtime (e.g. synced from DataModule in setup()).
     """
 
     _ALL_MODALITIES = ('image', 'video', 'threed')
@@ -152,12 +153,13 @@ class ModalityEMAWeighter(nn.Module):
         if not hasattr(self, attr):
             return torch.tensor(1.0)
 
-        # Normalize only over active modalities — inactive ones (e.g. threed in stage2)
-        # are excluded so their stuck-at-1.0 EMA doesn't distort the normalizer.
-        inv = [1.0 / (getattr(self, f'ema_{m}') + 1e-8) for m in self.active_modalities]
-        inv_stack = torch.stack(inv)
-        normalizer = inv_stack.sum() / len(self.active_modalities)
-        return (1.0 / (getattr(self, attr) + 1e-8)) / (normalizer + 1e-8)
+        # Proportional: high-loss modality gets boosted weight. Normalize only
+        # over active modalities so inactive ones (e.g. threed in stage2,
+        # frozen at the init value 1.0) don't distort the mean.
+        vals = [getattr(self, f'ema_{m}') for m in self.active_modalities]
+        val_stack = torch.stack(vals)
+        normalizer = val_stack.sum() / len(self.active_modalities)
+        return (getattr(self, attr) + 1e-8) / (normalizer + 1e-8)
 
 
 # --------------------------------------------------------------------------- #

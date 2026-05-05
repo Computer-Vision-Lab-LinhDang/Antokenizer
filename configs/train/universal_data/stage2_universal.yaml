@@ -59,7 +59,7 @@ model:
   use_semantic_distill: true
   siglip2_model_name: google/siglip2-base-patch16-224
   w_l1: 1.0
-  w_lpips: 0.1
+  w_lpips: 0.3
   w_kl: 1.0    # passthrough — KL pre-scaled by kl_weight=1e-4 in VAEHead
   w_clip: 0.0
   w_sem: 0.3
