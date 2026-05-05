@@ -117,26 +117,26 @@
   "hotPaths": [
     {
       "path": "src/mavt/training/lightning_module.py",
-      "accessCount": 17,
-      "lastAccessed": 1777868992395,
-      "type": "file"
-    },
-    {
-      "path": "configs/train/universal_data/stage1_universal.yaml",
-      "accessCount": 11,
-      "lastAccessed": 1777869039445,
-      "type": "file"
-    },
-    {
-      "path": "configs/train/universal_data/stage2_universal.yaml",
-      "accessCount": 10,
-      "lastAccessed": 1777869054055,
+      "accessCount": 20,
+      "lastAccessed": 1777938991592,
       "type": "file"
     },
     {
       "path": "src/mavt/losses/losses.py",
-      "accessCount": 9,
-      "lastAccessed": 1777868911758,
+      "accessCount": 13,
+      "lastAccessed": 1777938911637,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage1_universal.yaml",
+      "accessCount": 12,
+      "lastAccessed": 1777938478245,
+      "type": "file"
+    },
+    {
+      "path": "configs/train/universal_data/stage2_universal.yaml",
+      "accessCount": 12,
+      "lastAccessed": 1777939013145,
       "type": "file"
     },
     {
@@ -176,6 +176,12 @@
       "type": "file"
     },
     {
+      "path": "configs/model/mavt_base.yaml",
+      "accessCount": 4,
+      "lastAccessed": 1777938531992,
+      "type": "file"
+    },
+    {
       "path": "src/mavt/data/datasets.py",
       "accessCount": 3,
       "lastAccessed": 1777090992849,
@@ -185,12 +191,6 @@
       "path": "src/mavt/model/content_detail_split.py",
       "accessCount": 3,
       "lastAccessed": 1777105674739,
-      "type": "file"
-    },
-    {
-      "path": "configs/model/mavt_base.yaml",
-      "accessCount": 3,
-      "lastAccessed": 1777867344947,
       "type": "file"
     },
     {
@@ -206,15 +206,15 @@
       "type": "file"
     },
     {
-      "path": "configs/train/stage1_image.yaml",
-      "accessCount": 1,
-      "lastAccessed": 1776874072699,
+      "path": "src/mavt/model/backbone.py",
+      "accessCount": 2,
+      "lastAccessed": 1777872582106,
       "type": "file"
     },
     {
-      "path": "src/mavt/model/backbone.py",
+      "path": "configs/train/stage1_image.yaml",
       "accessCount": 1,
-      "lastAccessed": 1777017987108,
+      "lastAccessed": 1776874072699,
       "type": "file"
     },
     {

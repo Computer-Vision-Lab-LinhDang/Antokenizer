@@ -98,6 +98,22 @@ def slot_diversity_loss(slot_diversity_metric: torch.Tensor) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
+#  Temporal consistency loss (video)                                            #
+# --------------------------------------------------------------------------- #
+
+def temporal_consistency_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Match frame-to-frame motion between pred and target.
+
+    pred, target: (B, 3, T, H, W)
+    Computes L1 between temporal gradients so the model learns to reproduce
+    motion patterns, not just per-frame appearance.
+    """
+    pred_diff   = pred[:, :, 1:] - pred[:, :, :-1]
+    target_diff = target[:, :, 1:] - target[:, :, :-1]
+    return F.l1_loss(pred_diff, target_diff)
+
+
+# --------------------------------------------------------------------------- #
 #  Dynamic per-modality loss weighting                                          #
 # --------------------------------------------------------------------------- #
 
@@ -169,6 +185,7 @@ class MAVTLoss(nn.Module):
         w_clip: float = 0.0,    # InfoNCE(visual, text) — off by default
         w_sem: float  = 0.5,    # cosine distill from frozen vision teacher
         w_aux: float  = 0.01,
+        w_temp: float = 0.0,    # temporal consistency (video only); 0 = disabled
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
         active_modalities: tuple = ('image', 'video', 'threed'),
@@ -180,6 +197,7 @@ class MAVTLoss(nn.Module):
         self.w_clip = w_clip
         self.w_sem  = w_sem
         self.w_aux  = w_aux
+        self.w_temp = w_temp
         self.use_clip = use_clip
 
         self.lpips = LPIPSLoss() if use_lpips else None
@@ -220,12 +238,18 @@ class MAVTLoss(nn.Module):
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
 
+        # Temporal consistency (video only — 5-D pred with T > 1)
+        l_temp = torch.tensor(0.0, device=pred.device)
+        if self.w_temp > 0.0 and pred.ndim == 5 and pred.shape[2] > 1:
+            l_temp = temporal_consistency_loss(pred, target)
+
         total = (
             mod_w * l_recon
             + self.w_kl * loss_kl
             + self.w_clip * l_clip
             + self.w_sem * l_sem
             + self.w_aux * l_div
+            + self.w_temp * l_temp
         )
 
         return {
@@ -237,4 +261,5 @@ class MAVTLoss(nn.Module):
             'loss_clip':  l_clip,
             'loss_sem':   l_sem,
             'loss_div':   l_div,
+            'loss_temp':  l_temp,
         }

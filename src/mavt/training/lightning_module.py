@@ -55,6 +55,7 @@ class MAVTLightningModule(L.LightningModule):
         w_clip: float = 0.0,
         w_sem: float = 0.0,
         w_aux: float = 0.01,
+        w_temp: float = 0.0,    # temporal consistency weight (video only)
         use_lpips: bool = True,
         use_clip: bool = False,
         active_modalities: list = None,  # e.g. ['image', 'video']; None → all three
@@ -89,6 +90,7 @@ class MAVTLightningModule(L.LightningModule):
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
+            w_temp=w_temp,
             use_lpips=use_lpips, use_clip=use_clip,
             active_modalities=_active_mods,
         )

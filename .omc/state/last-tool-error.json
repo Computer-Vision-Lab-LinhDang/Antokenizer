@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"python -c \\\"import ast; ast.parse(open('src/mavt/data/datamodule.py').read()); print('OK syntax')\\\" && python -c \\\"import ast; ast.parse(open('src/mavt/data/datasets.py').read()); print('O...",
-  "error": "Exit code 127\n(eval):1: command not found: python",
-  "timestamp": "2026-04-25T04:24:21.891Z",
-  "retry_count": 1
-}

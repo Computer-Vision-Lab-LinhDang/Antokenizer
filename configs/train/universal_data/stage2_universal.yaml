@@ -64,6 +64,7 @@ model:
   w_clip: 0.0
   w_sem: 0.3
   w_aux: 0.0   # slot diversity disabled
+  w_temp: 0.1  # temporal consistency loss (video only)
   use_lpips: true
   use_clip: false
   warmup_steps: 500
