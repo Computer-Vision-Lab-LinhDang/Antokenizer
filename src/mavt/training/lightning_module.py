@@ -344,9 +344,17 @@ class MAVTLightningModule(L.LightningModule):
                 grid_in  = _to_grid(x)
                 grid_out = _to_grid(out.reconstruction)
             elif modality == 'video':
-                # Log first frame of each clip
-                grid_in  = _to_grid(x[:, :, 0])
-                grid_out = _to_grid(out.reconstruction[:, :, 0])
+                # Log a temporal strip: 4 evenly-spaced frames per clip stacked
+                # horizontally so reviewers can spot temporal coherence (vs.
+                # only a single first frame).
+                B, C, T, H, W = x.shape
+                Tp = out.reconstruction.shape[2]
+                t_in = torch.linspace(0, T - 1, 4).long()
+                t_out = torch.linspace(0, Tp - 1, 4).long()
+                in_strip  = x[:, :, t_in].permute(0, 2, 1, 3, 4).reshape(B * 4, C, H, W)
+                out_strip = out.reconstruction[:, :, t_out].permute(0, 2, 1, 3, 4).reshape(B * 4, C, H, W)
+                grid_in  = _to_grid(in_strip,  nrow=4)
+                grid_out = _to_grid(out_strip, nrow=4)
             elif modality == 'threed':
                 # Log XY plane (plane index 0)
                 grid_in  = _to_grid(x[:, 0])
