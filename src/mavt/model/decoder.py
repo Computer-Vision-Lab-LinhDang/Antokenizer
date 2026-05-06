@@ -57,14 +57,24 @@ class UnifiedDetailExpander(nn.Module):
     """Inverts C-D Split: cross-attends from target grid to compressed z.
 
     Uses 2 cross-attention layers from position-encoded queries into the
-    compressed VAE latent representation.
+    compressed VAE latent representation. When latent positions are supplied,
+    local residual detail tokens receive positional embeddings and a distance
+    bias so each output position prefers nearby detail while content stays
+    globally addressable.
     """
 
     def __init__(self, latent_dim: int = 32, dec_dim: int = 768,
-                 num_heads: int = 8, num_layers: int = 2):
+                 num_heads: int = 8, num_layers: int = 2,
+                 local_detail_bias: float = 0.25):
         super().__init__()
         self.query_enc = FourDQueryEncoding(dec_dim)
+        self.kv_pos_enc = FourDQueryEncoding(latent_dim)
+        self.token_type_embed = nn.Embedding(2, latent_dim)
+        nn.init.zeros_(self.token_type_embed.weight)
+        self.kv_pos_scale = nn.Parameter(torch.tensor(0.1))
+        self.token_type_scale = nn.Parameter(torch.tensor(0.1))
         self.norm_kv = nn.LayerNorm(latent_dim)
+        self.local_detail_bias = local_detail_bias
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 'norm_q':  nn.LayerNorm(dec_dim),
@@ -83,7 +93,33 @@ class UnifiedDetailExpander(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, z: torch.Tensor, target_positions: torch.Tensor) -> torch.Tensor:
+    def _detail_distance_bias(
+        self,
+        target_positions: torch.Tensor,
+        latent_positions: Optional[torch.Tensor],
+        latent_token_types: Optional[torch.Tensor],
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if latent_positions is None or latent_token_types is None:
+            return None
+        detail_mask = latent_token_types == 1
+        if not bool(detail_mask.any()):
+            return None
+
+        q_pos = target_positions.float()
+        kv_pos = latent_positions.float()
+        dist = (q_pos[:, None, :] - kv_pos[None, :, :]).abs().sum(dim=-1)
+        bias = torch.zeros_like(dist, dtype=dtype)
+        bias[:, detail_mask] = -self.local_detail_bias * dist[:, detail_mask].to(dtype)
+        return bias
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        target_positions: torch.Tensor,
+        latent_positions: Optional[torch.Tensor] = None,
+        latent_token_types: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         z               : (B, N_c+N_d, latent_dim)
         target_positions: (N_target, 4)
@@ -92,11 +128,31 @@ class UnifiedDetailExpander(nn.Module):
         """
         B = z.shape[0]
         q = self.query_enc(target_positions, B)   # (B, N_target, dec_dim)
-        kv = self.norm_kv(z)                       # (B, N_z, latent_dim)
+        kv = z
+        if latent_positions is not None:
+            latent_positions = latent_positions.to(device=z.device, dtype=torch.long)
+            kv = kv + (
+                self.kv_pos_scale.to(kv.dtype)
+                * self.kv_pos_enc(latent_positions).unsqueeze(0).to(kv.dtype)
+            )
+        if latent_token_types is not None:
+            latent_token_types = latent_token_types.to(device=z.device, dtype=torch.long)
+            kv = kv + (
+                self.token_type_scale.to(kv.dtype)
+                * self.token_type_embed(latent_token_types).unsqueeze(0).to(kv.dtype)
+            )
+        kv = self.norm_kv(kv)                       # (B, N_z, latent_dim)
+
+        attn_mask = self._detail_distance_bias(
+            target_positions.to(z.device),
+            latent_positions,
+            latent_token_types,
+            q.dtype,
+        )
 
         for layer in self.layers:
             q_n = layer['norm_q'](q)
-            out, _ = layer['cross_attn'](q_n, kv, kv)
+            out, _ = layer['cross_attn'](q_n, kv, kv, attn_mask=attn_mask)
             q = q + out
             q = q + layer['ff'](layer['norm_ff'](q))
 
@@ -171,10 +227,14 @@ class AsymmetricDecoder(nn.Module):
         positions: torch.Tensor,   # (N_grid, 4)
         H_grid: int,
         W_grid: int,
+        latent_positions: Optional[torch.Tensor] = None,
+        latent_token_types: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Decode a single 2D grid → (B, 3, H_out, W_out)."""
         B = z.shape[0]
-        expanded = self.expander(z, positions)  # (B, N_grid, dec_dim)
+        expanded = self.expander(
+            z, positions, latent_positions, latent_token_types
+        )  # (B, N_grid, dec_dim)
         for blk in self.self_attn_blocks:
             expanded = blk(expanded)
 
@@ -188,11 +248,17 @@ class AsymmetricDecoder(nn.Module):
         target_positions: torch.Tensor, # (N_target, 4)
         modality: str,
         grid_shape: tuple,              # (H_grid, W_grid) for image/3D; (Tp, H, W) for video
+        latent_positions: Optional[torch.Tensor] = None,
+        latent_token_types: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Decode z → reconstructed pixel-space tensor."""
         if modality == 'image':
             H, W = grid_shape
-            out = self._decode_grid(z, target_positions, H, W)
+            out = self._decode_grid(
+                z, target_positions, H, W,
+                latent_positions=latent_positions,
+                latent_token_types=latent_token_types,
+            )
             return out  # (B, 3, H_out, W_out)
 
         elif modality == 'video':
@@ -202,7 +268,11 @@ class AsymmetricDecoder(nn.Module):
             frames = []
             for t in range(Tp):
                 pos_t = target_positions[t * N_frame:(t + 1) * N_frame]
-                frame = self._decode_grid(z, pos_t, Hg, Wg)  # (B, 3, H, W)
+                frame = self._decode_grid(
+                    z, pos_t, Hg, Wg,
+                    latent_positions=latent_positions,
+                    latent_token_types=latent_token_types,
+                )  # (B, 3, H, W)
                 frames.append(frame)
             return torch.stack(frames, dim=2)   # (B, 3, Tp, H, W)
 
@@ -212,7 +282,11 @@ class AsymmetricDecoder(nn.Module):
             planes_out = []
             for p in range(3):
                 pos_p = target_positions[p * N_plane:(p + 1) * N_plane]
-                plane = self._decode_grid(z, pos_p, Hg, Wg)  # (B, 3, H, W)
+                plane = self._decode_grid(
+                    z, pos_p, Hg, Wg,
+                    latent_positions=latent_positions,
+                    latent_token_types=latent_token_types,
+                )  # (B, 3, H, W)
                 planes_out.append(plane)
             return torch.stack(planes_out, dim=1)  # (B, 3, 3, H, W)
 

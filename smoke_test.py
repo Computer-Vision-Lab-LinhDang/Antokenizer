@@ -119,12 +119,12 @@ def test_cd_split_residual(device):
     cd = ContentDetailSplit(dim=32, num_heads=4, num_slot_layers=1).to(device)
     x = torch.randn(2, 64, 32, device=device)
     with torch.no_grad():
-        compressed, metrics = cd(x, content_ratio=0.25, detail_ratio=0.10)
+        compressed, metrics = cd(x, content_ratio=0.25, detail_ratio=0.25)
     rr = metrics['residual_ratio'].item()
     # Spec target 0.3-0.5 after training. Untrained model may have higher rr.
     check('residual_ratio in (0.0, 1.05)', 0.0 < rr < 1.05, 'rr=%.3f' % rr)
     N_c = int(64 * 0.25)   # 16
-    N_d = int(64 * 0.10)   # 6
+    N_d = 16               # local 2x2 windows over an inferred 8x8 grid
     check('compressed shape (B, N_c+N_d, D)',
           compressed.shape == (2, N_c + N_d, 32),
           str(compressed.shape))
@@ -146,6 +146,9 @@ def test_forward(device):
     check('image recon shape == input shape',
           out.reconstruction.shape == x_img.shape, str(out.reconstruction.shape))
     check('image z last dim == latent_dim', out.z.shape[-1] == 8)
+    check('image latent positions match z tokens',
+          out.latent_positions.shape[0] == out.z.shape[1],
+          str(out.latent_positions.shape))
     check('image semantic shape', out.semantic.shape == (2, 32), str(out.semantic.shape))
     check('image loss_kl is scalar', out.loss_kl.ndim == 0)
 

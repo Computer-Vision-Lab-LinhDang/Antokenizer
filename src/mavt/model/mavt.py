@@ -26,9 +26,9 @@ from mavt.model.decoder import AsymmetricDecoder, UnderstandingDecoder
 
 # Compression ratios per modality (content, detail)
 _MODALITY_RATIOS = {
-    'image':  (0.25, 0.10),
-    'video':  (0.25, 0.10),
-    'threed': (0.35, 0.15),
+    'image':  (0.25, 0.25),
+    'video':  (0.25, 0.25),
+    'threed': (0.35, 0.25),
 }
 
 
@@ -38,6 +38,8 @@ class MAVTOutput:
     z: torch.Tensor                    # VAE latent
     mu: torch.Tensor
     logvar: torch.Tensor
+    latent_positions: torch.Tensor     # (N_z, 4), content zeros + local detail centers
+    latent_token_types: torch.Tensor    # (N_z,), 0=content, 1=detail
     semantic: torch.Tensor             # (B, semantic_dim)
     loss_kl: torch.Tensor
     cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
@@ -156,8 +158,13 @@ class MAVT(nn.Module):
 
         # Stage 3 — Content-Detail Split
         content_ratio, detail_ratio = _MODALITY_RATIOS[modality]
-        compressed, cd_metrics = self.cd_split(
-            features, content_ratio, detail_ratio
+        compressed, cd_metrics, latent_positions, latent_token_types = self.cd_split(
+            features,
+            positions=positions,
+            plane_ids=plane_ids,
+            content_ratio=content_ratio,
+            detail_ratio=detail_ratio,
+            return_metadata=True,
         )  # (B, N_c + N_d, D)
 
         # Stage 4 — VAE bottleneck (semantic now derives from z, not compressed)
@@ -169,7 +176,11 @@ class MAVT(nn.Module):
 
         # Stage 5b — Reconstruction head: z → pixel
         if decode:
-            recon = self.decoder(z, positions, modality, grid_shape)
+            recon = self.decoder(
+                z, positions, modality, grid_shape,
+                latent_positions=latent_positions,
+                latent_token_types=latent_token_types,
+            )
         else:
             recon = torch.zeros(1, device=x.device)  # placeholder
 
@@ -178,6 +189,8 @@ class MAVT(nn.Module):
             z=z,
             mu=mu,
             logvar=logvar,
+            latent_positions=latent_positions,
+            latent_token_types=latent_token_types,
             semantic=semantic,
             loss_kl=loss_kl,
             cd_metrics=cd_metrics,
