@@ -48,6 +48,9 @@ class MAVTLightningModule(L.LightningModule):
         use_gradient_checkpointing: bool = True,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        # C-D split (cd-split commit 6368dfb)
+        local_detail_window_size: int = 1,
+        local_detail_temporal_window_size: int = 1,
         # Loss
         w_l1: float = 1.0,
         w_lpips: float = 0.1,
@@ -84,6 +87,8 @@ class MAVTLightningModule(L.LightningModule):
             num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
             use_gradient_checkpointing=use_gradient_checkpointing,
             mlp_ratio=mlp_ratio, dropout=dropout,
+            local_detail_window_size=local_detail_window_size,
+            local_detail_temporal_window_size=local_detail_temporal_window_size,
         )
 
         _active_mods = tuple(active_modalities) if active_modalities else ('image', 'video', 'threed')
@@ -123,6 +128,9 @@ class MAVTLightningModule(L.LightningModule):
             self._load_weights_from_ckpt(hp.init_from_ckpt)
 
     def _load_weights_from_ckpt(self, path: str) -> None:
+        # weights_only=False is required because Lightning ckpts contain a
+        # full pickle (state_dict + hparams + callbacks). Source is our own
+        # filesystem so untrusted-pickle risk is N/A.
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         sd = ckpt.get('state_dict', ckpt)
         missing, unexpected = self.load_state_dict(sd, strict=False)
@@ -137,6 +145,9 @@ class MAVTLightningModule(L.LightningModule):
               f"+ {len(missing) - len(kept_missing)} expected (teacher/new poolers)")
         if unexpected:
             print(f"[init_from_ckpt] unexpected (dropped): {len(unexpected)} keys")
+        print("[init_from_ckpt] NOTE: optimizer state / LR scheduler / global_step are NOT "
+              "restored — this is a soft restart. For exact resume of the SAME stage, "
+              "use Lightning --ckpt_path instead.")
 
     def _prepare_cd_split_poolers(self) -> None:
         """Read active modality + resolution from the attached DataModule and

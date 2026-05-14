@@ -1,0 +1,12 @@
+{
+  "ckpt": "checkpoints/stage1_3/balanced/mavt-stage1_3-balanced-step=0040000-val/loss=0.1962.ckpt",
+  "image_shards_dir": "dataset/image10k/train",
+  "n_images": 1024,
+  "image_resolution": 256,
+  "psnr": 17.405241012573242,
+  "ssim": 0.48345646262168884,
+  "lpips_alex": 0.4621775462292135,
+  "fid_inception": 168.66384887695312,
+  "cos_sim_teacher": 0.8147852178663015,
+  "fid_feature_dim": 2048
+}

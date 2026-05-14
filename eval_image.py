@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Evaluate MAVT image reconstruction quality.
+"""Evaluate MAVT image reconstruction + understanding quality.
 
-Metrics:
+Reconstruction metrics:
   PSNR  (per-image, higher is better)
   SSIM  (per-image, higher is better)
   LPIPS (per-image, AlexNet, lower is better)
   FID   (Fréchet Inception Distance, Inception-V3 features, lower is better)
+
+Understanding metrics (vs frozen SigLIP2 teacher):
+  cos_sim_teacher : mean cosine similarity between MAVT.semantic and teacher
+                    pooler_output. This is the same signal as training's
+                    `loss_sem = 1 - cos_sim`, so a value of 1.0 = perfect
+                    distillation, 0.0 = random.
+  linear_probe_acc: optional — needs labels (skipped in default eval set)
 
 Pipeline mirrors eval_video.py: load Lightning ckpt, pre-create cd_split
 poolers found in the ckpt, then run forward over WDSImageDataset and
@@ -61,6 +68,8 @@ def main() -> None:
     ap.add_argument('--fid_feature', type=int, default=2048,
                     choices=[64, 192, 768, 2048],
                     help='Inception feature dim for FID (2048 = pool3 default)')
+    ap.add_argument('--semantic', action=argparse.BooleanOptionalAction, default=True,
+                    help='Compute cosine similarity to frozen SigLIP2 teacher')
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -110,13 +119,31 @@ def main() -> None:
         collate_fn=_collate, drop_last=False,
     )
 
-    # --- Metrics ------------------------------------------------------------
+    # --- Reconstruction metrics --------------------------------------------
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     lpips_fn = lpips.LPIPS(net='alex', verbose=False).to(device).eval()
     fid_metric = FrechetInceptionDistance(
         feature=args.fid_feature, normalize=True,
     ).to(device)
+
+    # --- Understanding metric: load frozen SigLIP2 teacher ------------------
+    teacher = None
+    teacher_input_size = 224
+    if args.semantic:
+        teacher_name = hparams.get('siglip2_model_name', 'google/siglip2-base-patch16-224')
+        print(f'[eval] loading semantic teacher: {teacher_name}')
+        from transformers import AutoModel
+        siglip = AutoModel.from_pretrained(teacher_name)
+        teacher = siglip.vision_model.to(device).eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        try:
+            teacher_input_size = int(siglip.config.vision_config.image_size)
+        except AttributeError:
+            teacher_input_size = 224
+        print(f'[eval] teacher input size: {teacher_input_size}')
+    cos_sim_sum, cos_sim_n = 0.0, 0
 
     lpips_sum, lpips_n = 0.0, 0
     autocast_dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
@@ -147,11 +174,30 @@ def main() -> None:
         fid_metric.update(tgt01, real=True)
         fid_metric.update(rec01, real=False)
 
+        # Understanding: cosine sim between MAVT.semantic and teacher's
+        # pooler_output on the SAME input image.
+        if teacher is not None:
+            with torch.no_grad(), torch.amp.autocast(
+                    device_type=device.type, dtype=autocast_dtype, enabled=device.type == 'cuda'):
+                # Resize input to teacher's expected size
+                if x.shape[-1] != teacher_input_size:
+                    teacher_in = torch.nn.functional.interpolate(
+                        x, size=teacher_input_size, mode='bilinear', align_corners=False)
+                else:
+                    teacher_in = x
+                t_emb = teacher(pixel_values=teacher_in).pooler_output  # (B, D)
+                m_emb = out.semantic.float()                             # (B, D)
+            cos = torch.nn.functional.cosine_similarity(
+                m_emb.float(), t_emb.float(), dim=-1)
+            cos_sim_sum += cos.sum().item()
+            cos_sim_n += cos.numel()
+
         if (bi + 1) % 10 == 0 or (bi + 1) == len(loader):
+            cos_str = f'  cos_sim={cos_sim_sum / max(1, cos_sim_n):.4f}' if cos_sim_n else ''
             print(f'[eval] {bi + 1}/{len(loader)} batches  '
                   f'PSNR={psnr_metric.compute().item():.3f}  '
                   f'SSIM={ssim_metric.compute().item():.4f}  '
-                  f'LPIPS={lpips_sum / max(1, lpips_n):.4f}')
+                  f'LPIPS={lpips_sum / max(1, lpips_n):.4f}{cos_str}')
 
     fid = float(fid_metric.compute().item())
 
@@ -164,6 +210,7 @@ def main() -> None:
         'ssim': float(ssim_metric.compute().item()),
         'lpips_alex': lpips_sum / max(1, lpips_n),
         'fid_inception': fid,
+        'cos_sim_teacher': cos_sim_sum / cos_sim_n if cos_sim_n else None,
         'fid_feature_dim': args.fid_feature,
     }
     print(json.dumps(results, indent=2))

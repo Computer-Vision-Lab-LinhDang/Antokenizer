@@ -95,10 +95,10 @@ class ContentDetailSplit(nn.Module):
 
     def __init__(
         self,
-        dim: int = 1152,
+        dim: int = 768,
         num_heads: int = 8,
         num_slot_layers: int = 2,
-        local_detail_window_size: int = 2,
+        local_detail_window_size: int = 1,
         local_detail_temporal_window_size: int = 1,
     ):
         super().__init__()

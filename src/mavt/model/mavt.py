@@ -61,6 +61,8 @@ class MAVT(nn.Module):
         # C-D Split
         num_slot_heads: int = 8,
         num_slot_layers: int = 2,
+        local_detail_window_size: int = 1,
+        local_detail_temporal_window_size: int = 1,
         # VAE
         latent_dim: int = 32,
         kl_weight: float = 1e-4,
@@ -96,7 +98,10 @@ class MAVT(nn.Module):
 
         # Stage 3
         self.cd_split = ContentDetailSplit(
-            dim=embed_dim, num_heads=num_slot_heads, num_slot_layers=num_slot_layers)
+            dim=embed_dim, num_heads=num_slot_heads, num_slot_layers=num_slot_layers,
+            local_detail_window_size=local_detail_window_size,
+            local_detail_temporal_window_size=local_detail_temporal_window_size,
+        )
 
         # Stage 4 — VAE bottleneck only (semantic moved downstream of z)
         self.vae_head = VAEHead(embed_dim, latent_dim, kl_weight)

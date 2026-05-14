@@ -29,10 +29,17 @@ Usage examples:
     --trainer.logger.init_args.name stage1-image
 """
 
+import torch.multiprocessing as mp
+
 from lightning.pytorch.cli import LightningCLI
 
 from mavt.training.lightning_module import MAVTLightningModule
 from mavt.data.datamodule import MAVTDataModule
+
+# Use file_system sharing strategy: file_descriptor (default) leaks FDs across
+# DataLoader workers and exhausts the system-wide ENFILE limit on busy nodes
+# (saw "OSError: Too many open files in system" mid-training with 8 workers).
+mp.set_sharing_strategy('file_system')
 
 
 def main():

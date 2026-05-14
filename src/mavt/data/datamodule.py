@@ -141,6 +141,8 @@ class MAVTDataModule(L.LightningDataModule):
         batch_size: int = 8,
         num_workers: int = 4,
         pin_memory: bool = True,
+        persistent_workers: bool = False,
+        prefetch_factor: Optional[int] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -232,6 +234,15 @@ class MAVTDataModule(L.LightningDataModule):
             self._test_ds = None
             self._test_batch_sampler = None
 
+    def _loader_extras(self) -> Dict:
+        hp = self.hparams
+        kw = {}
+        if hp.num_workers > 0:
+            kw['persistent_workers'] = bool(hp.persistent_workers)
+            if hp.prefetch_factor is not None:
+                kw['prefetch_factor'] = int(hp.prefetch_factor)
+        return kw
+
     def train_dataloader(self) -> DataLoader:
         hp = self.hparams
         if self._batch_sampler is not None:
@@ -241,6 +252,7 @@ class MAVTDataModule(L.LightningDataModule):
                 num_workers=hp.num_workers,
                 pin_memory=hp.pin_memory,
                 collate_fn=_collate,
+                **self._loader_extras(),
             )
         return DataLoader(
             self._train_ds,
@@ -250,6 +262,7 @@ class MAVTDataModule(L.LightningDataModule):
             pin_memory=hp.pin_memory,
             collate_fn=_collate,
             drop_last=True,
+            **self._loader_extras(),
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -261,11 +274,13 @@ class MAVTDataModule(L.LightningDataModule):
                 num_workers=hp.num_workers,
                 pin_memory=hp.pin_memory,
                 collate_fn=_collate,
+                **self._loader_extras(),
             )
         return DataLoader(
             self._val_ds, batch_size=hp.batch_size, shuffle=False,
             num_workers=hp.num_workers, pin_memory=hp.pin_memory,
             collate_fn=_collate, drop_last=False,
+            **self._loader_extras(),
         )
 
     def test_dataloader(self) -> Optional[DataLoader]:
@@ -279,6 +294,7 @@ class MAVTDataModule(L.LightningDataModule):
                 num_workers=hp.num_workers,
                 pin_memory=hp.pin_memory,
                 collate_fn=_collate,
+                **self._loader_extras(),
             )
         return DataLoader(
             self._test_ds, batch_size=hp.batch_size, shuffle=False,

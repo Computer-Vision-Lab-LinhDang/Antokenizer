@@ -1,0 +1,46 @@
+{
+  "ckpt": "checkpoints/stage2_3/balanced/mavt-stage2_3-balanced-step=0000125-val/loss=0.1044.ckpt",
+  "image": {
+    "shape": [
+      1,
+      3,
+      256,
+      256
+    ],
+    "caption": "maillot",
+    "cos_sim_teacher": 0.8680331707000732,
+    "recon_psnr_single": 31.805915841607806,
+    "recon_l1_single": 0.015618681907653809,
+    "files": {
+      "input": "results/eval_stage2_decoder_v2_step125/image_input.png",
+      "recon": "results/eval_stage2_decoder_v2_step125/image_recon.png",
+      "side_by_side": "results/eval_stage2_decoder_v2_step125/image_side_by_side.png"
+    }
+  },
+  "video": {
+    "input_shape": [
+      1,
+      3,
+      16,
+      256,
+      256
+    ],
+    "recon_shape": [
+      1,
+      3,
+      8,
+      256,
+      256
+    ],
+    "caption": "Fun clown - 3d animation",
+    "cos_sim_teacher_midframe": 0.7206010818481445,
+    "recon_psnr_single": 5.109652443533344,
+    "recon_l1_single": 0.3785398006439209,
+    "caveat": "stage1 ckpt has no trained video pooler \u2014 recon is roughly random",
+    "files": {
+      "input_strip": "results/eval_stage2_decoder_v2_step125/video_input_strip.png",
+      "recon_strip": "results/eval_stage2_decoder_v2_step125/video_recon_strip.png",
+      "gt_subsampled_strip": "results/eval_stage2_decoder_v2_step125/video_gt_subsampled_strip.png"
+    }
+  }
+}

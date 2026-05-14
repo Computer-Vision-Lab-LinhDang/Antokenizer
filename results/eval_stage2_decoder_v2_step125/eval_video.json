@@ -1,0 +1,13 @@
+{
+  "ckpt": "checkpoints/stage2_3/balanced/mavt-stage2_3-balanced-step=0000125-val/loss=0.1044.ckpt",
+  "video_shards_dir": "dataset/dataset_10m",
+  "n_videos": 128,
+  "video_frames": 16,
+  "video_resolution": 256,
+  "t_patch": 2,
+  "psnr": 15.876496315002441,
+  "ssim": 0.5975585579872131,
+  "lpips_alex": 0.37666061078198254,
+  "rfvd_r3d18": 111.4548900398766,
+  "feature_extractor": "torchvision r3d_18 KINETICS400_V1 (pre-fc 512-d)"
+}

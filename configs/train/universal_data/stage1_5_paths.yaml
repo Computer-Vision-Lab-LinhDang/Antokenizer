@@ -1,0 +1,32 @@
+# Override for cd-split + decoder-v2 (Tanh + ICNR + ResBlock + WindowedAttn)
+# saves under checkpoints/stage1_5/
+trainer:
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage1_5/balanced
+        filename: mavt-stage1_5-balanced-{step:07d}-{val/loss:.4f}
+        save_top_k: 1
+        monitor: val/loss
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage1_5/recon
+        filename: mavt-stage1_5-recon-{step:07d}-{val/loss_recon:.4f}
+        save_top_k: 1
+        monitor: val/loss_recon
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage1_5/sem
+        filename: mavt-stage1_5-sem-{step:07d}-{val/loss_sem:.4f}
+        save_top_k: 1
+        monitor: val/loss_sem
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar

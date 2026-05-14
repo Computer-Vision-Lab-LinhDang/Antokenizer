@@ -133,7 +133,7 @@ class UnifiedDetailExpander(nn.Module):
             latent_positions = latent_positions.to(device=z.device, dtype=torch.long)
             kv = kv + (
                 self.kv_pos_scale.to(kv.dtype)
-                * self.kv_pos_enc(latent_positions).unsqueeze(0).to(kv.dtype)
+                * self.kv_pos_enc(latent_positions, B).to(kv.dtype)
             )
         if latent_token_types is not None:
             latent_token_types = latent_token_types.to(device=z.device, dtype=torch.long)
@@ -163,36 +163,159 @@ class UnifiedDetailExpander(nn.Module):
 #  PixelShuffle CNN decoder                                                     #
 # --------------------------------------------------------------------------- #
 
+class ResBlock2D(nn.Module):
+    """GroupNorm-GELU pre-activation residual block."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        groups = min(32, dim)
+        self.norm1 = nn.GroupNorm(groups, dim)
+        self.conv1 = nn.Conv2d(dim, dim, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, dim)
+        self.conv2 = nn.Conv2d(dim, dim, 3, padding=1)
+        nn.init.zeros_(self.conv2.weight)
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.gelu(self.norm1(x)))
+        h = self.conv2(F.gelu(self.norm2(h)))
+        return x + h
+
+
+class WindowedSelfAttn2D(nn.Module):
+    """Pre-LN windowed self-attention + MLP for 2D feature maps.
+
+    Partitions (B, C, H, W) into non-overlapping spatial windows of size
+    `window_size × window_size`. Attention runs INSIDE each window only, so
+    cost is O(B · nW · ws² · C) — feasible at 32²–64² where global attention
+    would be too heavy.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8,
+                 window_size: int = 8, mlp_ratio: float = 2.0):
+        super().__init__()
+        self.window_size = window_size
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads,
+            batch_first=True, bias=True,
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, dim),
+        )
+        # Zero-init last MLP linear so block starts as identity (residual only).
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        ws = self.window_size
+        # Pad spatial dims if not divisible by window_size.
+        Hp = (H + ws - 1) // ws * ws
+        Wp = (W + ws - 1) // ws * ws
+        # Permute to channels-last for layernorm/attention.
+        xp = x.permute(0, 2, 3, 1)  # (B, H, W, C)
+        if (Hp, Wp) != (H, W):
+            xp = F.pad(xp, (0, 0, 0, Wp - W, 0, Hp - H))
+        # Window partition: (B, nH, ws, nW, ws, C) → (B*nH*nW, ws*ws, C)
+        nH, nW = Hp // ws, Wp // ws
+        xp = xp.reshape(B, nH, ws, nW, ws, C)
+        xp = xp.permute(0, 1, 3, 2, 4, 5).reshape(-1, ws * ws, C)
+        # Pre-LN attention + MLP, both residual.
+        h = self.norm1(xp)
+        out, _ = self.attn(h, h, h)
+        xp = xp + out
+        xp = xp + self.mlp(self.norm2(xp))
+        # Reverse window partition.
+        xp = xp.reshape(B, nH, nW, ws, ws, C)
+        xp = xp.permute(0, 5, 1, 3, 2, 4).reshape(B, C, Hp, Wp)
+        return xp[..., :H, :W]
+
+
 class PixelShuffleCNNDecoder(nn.Module):
-    """4-stage PixelShuffle CNN: 16× spatial upsampling.
+    """4-stage progressive upsampler with CNN + windowed attention refinement.
 
     Input : (B, in_channels, H_grid, W_grid)   e.g. (B, 768, 16, 16)
-    Output: (B, 3, H_out, W_out)               e.g. (B, 3, 256, 256)
+    Output: (B, 3, H_out, W_out)               e.g. (B, 3, 256, 256), in [-1, 1]
+
+    Each stage upsamples 2× via Conv → PixelShuffle → GELU. Between stages we
+    insert ResBlock2D + WindowedSelfAttn2D so the model can refine features at
+    32², 64², 128² instead of leaving all high-freq generation to the final
+    Conv → PS layer alone (which previously had ~LPIPS bottleneck).
+
+    Param overhead vs flat CNN: ~+8 M (~30 M total).
     """
 
     def __init__(self, in_channels: int = 768):
         super().__init__()
-        # Each block: Conv2d → PixelShuffle(2) → GELU  ⇒ 2× spatial
-        self.up = nn.Sequential(
-            # Block 1: 768 → 512·4, ÷4 ch after PS → 512, ×2 spatial
+        # 16×16 → 32×32
+        self.up1 = nn.Sequential(
             nn.Conv2d(in_channels, 512 * 4, 3, padding=1),
             nn.PixelShuffle(2),
             nn.GELU(),
-            # Block 2: 512 → 256·4, → 256, ×2
+        )
+        self.refine1 = nn.Sequential(
+            ResBlock2D(512),
+            WindowedSelfAttn2D(512, num_heads=8, window_size=8),
+        )
+        # 32×32 → 64×64
+        self.up2 = nn.Sequential(
             nn.Conv2d(512, 256 * 4, 3, padding=1),
             nn.PixelShuffle(2),
             nn.GELU(),
-            # Block 3: 256 → 128·4, → 128, ×2
+        )
+        self.refine2 = nn.Sequential(
+            ResBlock2D(256),
+            WindowedSelfAttn2D(256, num_heads=8, window_size=8),
+        )
+        # 64×64 → 128×128 (no attn here — 16×16 windows = 256² tokens × 128 ch
+        # would dominate compute. ResBlock only.)
+        self.up3 = nn.Sequential(
             nn.Conv2d(256, 128 * 4, 3, padding=1),
             nn.PixelShuffle(2),
             nn.GELU(),
-            # Block 4: 128 → 3·4, → 3, ×2  (output layer, no GELU)
+        )
+        self.refine3 = ResBlock2D(128)
+        # 128×128 → 256×256 (output, bounded to [-1, 1]).
+        self.up4 = nn.Sequential(
             nn.Conv2d(128, 3 * 4, 3, padding=1),
             nn.PixelShuffle(2),
+            nn.Tanh(),
         )
+        self._icnr_init()
+
+    def _icnr_init(self) -> None:
+        """ICNR (Aitken et al., 2017): initialise the r² sub-pixel filters of
+        each conv-before-PixelShuffle block identically so init acts like
+        nearest-neighbour upsample → no checkerboard artifact early on.
+        """
+        r = 2  # PixelShuffle factor used in every block
+        for module in [self.up1, self.up2, self.up3, self.up4]:
+            for m in module:
+                if isinstance(m, nn.Conv2d) and m.out_channels % (r * r) == 0:
+                    ni = m.in_channels
+                    no = m.out_channels // (r * r)
+                    kh, kw = m.kernel_size
+                    kernel = m.weight.new_empty(no, ni, kh, kw)
+                    nn.init.kaiming_normal_(kernel, nonlinearity='relu')
+                    m.weight.data.copy_(kernel.repeat_interleave(r * r, dim=0))
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.up(x)
+        x = self.up1(x)
+        x = self.refine1(x)
+        x = self.up2(x)
+        x = self.refine2(x)
+        x = self.up3(x)
+        x = self.refine3(x)
+        x = self.up4(x)
+        return x
 
 
 # --------------------------------------------------------------------------- #

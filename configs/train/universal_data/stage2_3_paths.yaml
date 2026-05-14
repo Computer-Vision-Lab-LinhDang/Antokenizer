@@ -1,0 +1,48 @@
+# Override stage2 ckpt save dir → checkpoints/stage2_3/
+trainer:
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage2_3/balanced
+        filename: mavt-stage2_3-balanced-{step:07d}-{val/loss:.4f}
+        save_top_k: 1
+        monitor: val/loss
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage2_3/recon
+        filename: mavt-stage2_3-recon-{step:07d}-{val/loss_recon:.4f}
+        save_top_k: 1
+        monitor: val/loss_recon
+        mode: min
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage2_3/sem
+        filename: mavt-stage2_3-sem-{step:07d}-{val/loss_sem:.4f}
+        save_top_k: 1
+        monitor: val/loss_sem
+        mode: min
+        every_n_train_steps: 5000
+    # P0 fix: always keep the latest ckpt so we can resume from any crash.
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/stage2_3/last
+        filename: mavt-stage2_3-last-{step:07d}
+        save_top_k: -1
+        every_n_train_steps: 5000
+        save_last: true
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    # Stop if val/loss flat for 30 val cycles (~60k train steps).
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val/loss
+        mode: min
+        patience: 30
+        min_delta: 0.0005
+        check_finite: true
+        verbose: true
+    - class_path: lightning.pytorch.callbacks.RichProgressBar
