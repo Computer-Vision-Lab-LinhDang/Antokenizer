@@ -215,3 +215,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .claude
+# Large data & training artifacts (kept out of version control)
+data/
+checkpoints/
+outputs/
+
+# graphify internal extraction cache (regenerable)
+graphify-out/cache/
