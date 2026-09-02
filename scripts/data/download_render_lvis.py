@@ -66,7 +66,7 @@ def download_batch(uids, glb_root, procs, timeout_s):
         try:
             os.killpg(proc.pid, signal.SIGKILL)   # child called setsid() → pid == pgid
         except ProcessLookupError:
-            pass
+            proc.kill()
         proc.join(10)
     found = glb_paths_for(uids, glb_root)
     if not found and proc.exitcode not in (0, None):
