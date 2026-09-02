@@ -55,3 +55,17 @@ def test_default_behaviour_unchanged_without_new_args():
     batches = list(s)
     assert len(batches) == 16 and all(len(b) == 10 for b in batches)
     assert len(s) == 16
+
+
+def test_unshuffled_batches_interleave_modalities_round_robin():
+    """Validation uses shuffle=False; with modality-blocked order and limit_val_batches the last
+    modality (3D) was never validated. Unshuffled order must interleave modalities."""
+    cds = _cat([100, 40, 20])
+    s = ModalityGroupedBatchSampler(cds, batch_size=10, shuffle=False, drop_last=False,
+                                    modalities=("image", "video", "threed"))
+    batches = list(s)
+    mods = ["image" if b[0] < 100 else "video" if b[0] < 140 else "threed" for b in batches]
+    assert mods[:3] == ["image", "video", "threed"], mods[:6]
+    assert mods.count("threed") == 2 and mods.count("video") == 4 and mods.count("image") == 10
+    # within a modality the order stays sorted (deterministic validation set)
+    assert [b for b, m in zip(batches, mods) if m == "threed"][0] == list(range(140, 150))

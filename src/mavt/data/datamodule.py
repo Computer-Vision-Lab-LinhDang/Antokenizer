@@ -120,16 +120,25 @@ class ModalityGroupedBatchSampler(Sampler):
         return 0, 1
 
     def _make_batches(self) -> List[List[int]]:
-        all_batches: List[List[int]] = []
+        per_mod: List[List[List[int]]] = []
         for indices, bs, target in zip(self.groups, self.batch_sizes, self._target_counts()):
             if not indices or target <= 0:
                 continue
             batches = self._chunk(indices, bs)
             while len(batches) < target:                     # oversample: fresh shuffle + re-chunk
                 batches.extend(self._chunk(indices, bs))
-            all_batches.extend(batches[:target])
+            per_mod.append(batches[:target])
         if self.shuffle:
+            all_batches = [b for batches in per_mod for b in batches]
             random.shuffle(all_batches)
+            return all_batches
+        # Deterministic (validation): interleave modalities round-robin so that
+        # limit_val_batches / per-rank slicing never drops a whole modality.
+        all_batches = []
+        for i in range(max(len(b) for b in per_mod)):
+            for batches in per_mod:
+                if i < len(batches):
+                    all_batches.append(batches[i])
         return all_batches
 
     def __iter__(self) -> Iterator[List[int]]:
