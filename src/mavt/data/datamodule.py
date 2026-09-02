@@ -135,6 +135,7 @@ class MAVTDataModule(L.LightningDataModule):
         # Data params
         image_resolution: int = 256,
         video_frames: int = 16,
+        video_frame_stride: int = 2,
         video_resolution: int = 256,
         triplane_res: int = 256,
         # Synthetic (smoke test)
@@ -159,7 +160,8 @@ class MAVTDataModule(L.LightningDataModule):
         if modality == 'image' and hp.image_manifest:
             return ManifestImageDataset(hp.image_manifest, hp.image_resolution)
         if modality == 'video' and hp.video_manifest:
-            return ManifestVideoDataset(hp.video_manifest, hp.video_frames, hp.video_resolution)
+            return ManifestVideoDataset(hp.video_manifest, hp.video_frames, hp.video_resolution,
+                                        frame_stride=hp.video_frame_stride)
         # Per-modality shard roots take precedence over universal_data_root
         if modality == 'image' and hp.image_shards_dir:
             return WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
