@@ -416,11 +416,22 @@ class MAVTLightningModule(L.LightningModule):
 
         optimizer = torch.optim.AdamW(param_groups, weight_decay=hp.weight_decay)
 
-        # Linear warmup + cosine decay
+        # Linear warmup + cosine decay over the *actual* run length. `trainer.max_steps`
+        # is what this invocation asked for; `hp.total_steps` can be stale when a run is
+        # resumed with --ckpt_path (hparams come back from the checkpoint), which once
+        # continued a 5k run to 10k at lr ~1e-9.
+        total_steps = hp.total_steps
+        max_steps = getattr(getattr(self, "_trainer", None), "max_steps", -1)
+        if isinstance(max_steps, int) and max_steps > 0:
+            total_steps = max_steps
+        if total_steps != hp.total_steps:
+            print(f"[configure_optimizers] LR schedule length = trainer.max_steps={total_steps} "
+                  f"(hparam total_steps={hp.total_steps} ignored)", flush=True)
+
         def lr_lambda(step: int) -> float:
             if step < hp.warmup_steps:
                 return step / max(1, hp.warmup_steps)
-            progress = (step - hp.warmup_steps) / max(1, hp.total_steps - hp.warmup_steps)
+            progress = (step - hp.warmup_steps) / max(1, total_steps - hp.warmup_steps)
             return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item()))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
