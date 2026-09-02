@@ -128,6 +128,12 @@ class MAVT(nn.Module):
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
+        # Parameters that only exist after prepare_for_modalities() / init_from_siglip2()
+        # (content poolers per (N_c, N_d), SigLIP2-inherited pos2d) must be re-created
+        # before a checkpoint is loaded into a fresh model — otherwise strict=False
+        # loads drop them silently and the model runs without its learned position table.
+        self.register_load_state_dict_pre_hook(self._materialize_dynamic_params)
+
 
     def _grid_shape(self, modality: str, x: torch.Tensor) -> tuple:
         """Return (H_grid, W_grid) or (Tp, Hg, Wg) based on input shape."""
@@ -210,6 +216,28 @@ class MAVT(nn.Module):
         """Convenience: return (z, semantic) without decoding."""
         out = self.forward(x, modality, decode=False)
         return out.z, out.semantic
+
+    # ------------------------------------------------------------------ #
+    #  Checkpoint loading                                                  #
+    # ------------------------------------------------------------------ #
+    def _materialize_dynamic_params(self, module, state_dict, prefix, local_metadata, strict,
+                                    missing_keys, unexpected_keys, error_msgs) -> None:
+        """load_state_dict pre-hook: create pos2d / content poolers that the checkpoint carries.
+
+        Fires for any load path (direct ``MAVT.load_state_dict``, Lightning's parent
+        module load with prefix ``model.``, cross-stage ``init_from_ckpt``).
+        """
+        k = prefix + "patchify.pos2d"
+        if k in state_dict and self.patchify.pos2d is None:
+            self.patchify.set_pos2d(torch.zeros_like(state_dict[k], dtype=torch.float32))
+        pre = prefix + "cd_split._content_poolers."
+        dev = self.patchify.proj.weight.device
+        for key in sorted({name[len(pre):].split(".")[0] for name in state_dict if name.startswith(pre)}):
+            if key in self.cd_split._content_poolers:
+                continue
+            n_c, n_d = (int(v) for v in key.split("_"))
+            self.cd_split.prepare_poolers(n_c, n_d)
+            self.cd_split._content_poolers[key].to(dev)
 
     def load_siglip2_weights(self, model_name: str = "google/siglip2-so400m-patch16-384",
                               freeze_stages: int = 10, strict: bool = True,

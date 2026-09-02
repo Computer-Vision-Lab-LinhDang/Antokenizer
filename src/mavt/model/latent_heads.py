@@ -39,7 +39,9 @@ class VAEHead(nn.Module):
         mu, logvar = stats.chunk(2, dim=-1)          # each (B, N, L)
         logvar = logvar.clamp(-30, 20)               # numerical stability
         std = (0.5 * logvar).exp()
-        z = mu + std * torch.randn_like(std)
+        # Reparameterised sample while training; the posterior mean at eval so that
+        # validation / gate evals are deterministic (a VAE tokenizer is decoded from mu).
+        z = mu + std * torch.randn_like(std) if self.training else mu
 
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
         loss_kl = self.kl_weight * kl.mean()

@@ -29,6 +29,8 @@ def build_model(args, dev):
         sd = {k[len("model."):]: v for k, v in ck["state_dict"].items() if k.startswith("model.")}
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[ckpt] loaded {args.ckpt} | missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+        if missing or unexpected:   # never evaluate a partially-loaded model (pos2d was silently dropped once)
+            raise RuntimeError(f"checkpoint/model mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
     else:
         model = MAVT(**kw)
         model.prepare_for_modalities([{"modality": "image", "resolution": args.resolution}])

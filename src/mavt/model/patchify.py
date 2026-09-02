@@ -99,10 +99,21 @@ class PatchifyEncoder(nn.Module):
             self.proj.bias.copy_(conv2d.bias)
             table = emb.position_embedding.weight                      # (G*G, D)
             G = int(round(table.shape[0] ** 0.5))
-            self.pos2d = nn.Parameter(table.view(1, G, G, D).permute(0, 3, 1, 2).contiguous().clone())
+            self.set_pos2d(table.view(1, G, G, D).permute(0, 3, 1, 2))
             nn.init.zeros_(self.pos_embed.proj.weight)
             nn.init.zeros_(self.pos_embed.proj.bias)
         self.siglip2_inherited = True
+
+    def set_pos2d(self, table: torch.Tensor) -> None:
+        """Install (or replace) the learned 2D position table, shape (1, D, G, G).
+
+        Created dynamically (by ``init_from_siglip2`` or by ``MAVT`` when a checkpoint
+        carries ``patchify.pos2d``) — it lives on the same device as ``proj``.
+        """
+        if table.dim() != 4 or table.shape[0] != 1 or table.shape[1] != self.proj.weight.shape[0]:
+            raise ValueError(f"pos2d must be (1, {self.proj.weight.shape[0]}, G, G), got {tuple(table.shape)}")
+        dev = self.proj.weight.device
+        self.pos2d = nn.Parameter(table.detach().to(dev, torch.float32).contiguous().clone())
 
     def _pos2d_flat(self, Hp: int, Wp: int, device) -> Optional[torch.Tensor]:
         if self.pos2d is None:
