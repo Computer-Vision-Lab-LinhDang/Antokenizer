@@ -93,7 +93,10 @@ def main() -> int:
         for u in paths:
             if rendered(a.out, u):
                 cap_out[u] = caps.get(u) or uid2cat[u].replace("_", " ")   # fall back to the LVIS category name
-        json.dump(cap_out, open(cap_path, "w"))
+        tmp = cap_path + ".tmp"                      # atomic: a training job may read 3d.json at any time
+        with open(tmp, "w") as f:
+            json.dump(cap_out, f)
+        os.replace(tmp, cap_path)
         if not a.keep_glb:
             for p in paths.values():
                 try:
