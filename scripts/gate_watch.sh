@@ -2,7 +2,8 @@
 # Evaluate every new checkpoint with scripts/eval_gates.py on one GPU (default 7). Idempotent.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-export HF_HOME="${HF_HOME:-/scratch/vunguyen13/hf_cache}" HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME}"
+export HF_HOME="${HF_HOME:-/scratch/vunguyen13/hf_cache}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME}"
 PY="${PY:-$HOME/miniforge3/envs/mavt/bin/python}"; GPU="${GPU:-7}"
 mkdir -p runs/gates
 while true; do
