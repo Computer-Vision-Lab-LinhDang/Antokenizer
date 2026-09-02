@@ -55,10 +55,35 @@ def build_webvid(root: str, out_path: str, limit: int = 0, require_complete: boo
     return n
 
 
+def build_openvid(videos_root: str, caption_csv: str, out_path: str, limit: int = 0) -> int:
+    """OpenVid-1M layout: videos/**/<name>.mp4 + OpenVid-1M.csv (columns: video, caption, ...)."""
+    import csv
+    captions = {}
+    with open(caption_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            captions[row["video"]] = row.get("caption", "")
+    n = 0
+    with open(out_path, "w") as out:
+        for dirpath, _, filenames in os.walk(videos_root):
+            for fn in filenames:
+                if not fn.endswith(".mp4"):
+                    continue
+                rec = {"path": os.path.join(dirpath, fn)}
+                if fn in captions:
+                    rec["caption"] = captions[fn]
+                out.write(json.dumps(rec) + "\n")
+                n += 1
+                if limit and n >= limit:
+                    return n
+    return n
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--openimages-root")
     ap.add_argument("--webvid-root")
+    ap.add_argument("--openvid-root", help="OpenVid videos/ dir")
+    ap.add_argument("--openvid-csv", help="OpenVid-1M.csv")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--allow-incomplete", action="store_true")
@@ -70,6 +95,9 @@ def main() -> None:
     if a.webvid_root:
         out = os.path.join(a.out_dir, "webvid.jsonl")
         print(f"webvid: {build_webvid(a.webvid_root, out, a.limit, not a.allow_incomplete)} -> {out}")
+    if a.openvid_root:
+        out = os.path.join(a.out_dir, "openvid.jsonl")
+        print(f"openvid: {build_openvid(a.openvid_root, a.openvid_csv, out, a.limit)} -> {out}")
 
 
 if __name__ == "__main__":

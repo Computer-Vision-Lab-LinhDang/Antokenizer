@@ -123,3 +123,16 @@ def test_mavt_loss_exposes_vic_and_lr_override():
     sig = inspect.signature(MAVTLightningModule.__init__).parameters
     for k in ("lr", "w_vic", "distill_center", "init_siglip2_patchify", "rgat_impl"):
         assert k in sig, k
+
+
+def test_openvid_manifest_builder_joins_captions(tmp_path):
+    from mavt.data.manifest import build_openvid
+    vids = tmp_path / "videos" / "sub"; vids.mkdir(parents=True)
+    (vids / "clip_a.mp4").write_bytes(b"x"); (vids / "clip_b.mp4").write_bytes(b"x")
+    csv_path = tmp_path / "OpenVid-1M.csv"
+    csv_path.write_text("video,caption,frame,fps\nclip_a.mp4,\"a dog runs\",120,24\nclip_b.mp4,\"a cat sits\",96,24\n")
+    out = tmp_path / "openvid.jsonl"
+    n = build_openvid(str(tmp_path / "videos"), str(csv_path), str(out))
+    recs = [json.loads(l) for l in out.read_text().splitlines()]
+    assert n == 2 and {r["caption"] for r in recs} == {"a dog runs", "a cat sits"}
+    assert all(r["path"].endswith(".mp4") for r in recs)
