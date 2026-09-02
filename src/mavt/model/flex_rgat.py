@@ -9,6 +9,11 @@ import torch.nn as nn
 from mavt.model.graph_attention import GraphStructure, SparseRGAT4D, _dense_masks, graph_from_dense
 
 _FLEX = None
+try:  # a few distinct graphs (image/video/3D layouts) each compile once
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+except Exception:  # noqa: BLE001
+    pass
 
 
 def _compiled_flex():
@@ -84,19 +89,21 @@ class FlexRGAT4D(SparseRGAT4D):
     def __init__(self, dim=1152, num_heads=16, mlp_ratio=4.0, dropout=0.0, r_s=2, r_t=1):
         super().__init__(dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout,
                          per_type_kv=False, r_s=r_s, r_t=r_t)
+        self._score_mods: dict = {}          # (id(graph), device) -> closure (not a submodule)
 
-    def forward(self, x: torch.Tensor, g) -> torch.Tensor:
-        if isinstance(g, GraphStructure):
-            return super().forward(x, g)
-        if not x.is_cuda:
-            return super().forward(x, g.sparse())
-        B, N, D = x.shape
-        H, d = self.num_heads, self.head_dim
-        dev = x.device
-        xn = self.norm1(x)
-        q = self.q_proj(xn).view(B, N, H, d).transpose(1, 2)
-        k = self.k_proj(xn).view(B, N, H, d).transpose(1, 2)
-        v = self.v_proj(xn).view(B, N, H, d).transpose(1, 2)
+    def _score_mod_for(self, g, dev):
+        """One score_mod closure per (graph, device), reused across forward calls.
+
+        torch.compile guards on the score_mod function object: a fresh closure
+        every forward would trigger a recompile per step and, past dynamo's
+        cache limit, silently fall back to the eager (very slow) path.
+        Captured tensors are the module's own Parameters (stable identity) and
+        the graph's cached tables, so one compile per graph is enough.
+        """
+        key = (id(g), str(dev))
+        sm = self._score_mods.get(key)
+        if sm is not None:
+            return sm
         etype = g.etype().to(dev)
         pos = g.positions.to(dev)
         pt, px, py, pz = pos[:, 0], pos[:, 1], pos[:, 2], pos[:, 3]
@@ -111,6 +118,22 @@ class FlexRGAT4D(SparseRGAT4D):
             dz = torch.clamp(pz[ki] - pz[qi], -Rs, Rs) + Rs
             return score + eb[e, h] + rt[dt, h] + rx[dx, h] + ry[dy, h] + rz[dz, h]
 
+        self._score_mods[key] = score_mod
+        return score_mod
+
+    def forward(self, x: torch.Tensor, g) -> torch.Tensor:
+        if isinstance(g, GraphStructure):
+            return super().forward(x, g)
+        if not x.is_cuda:
+            return super().forward(x, g.sparse())
+        B, N, D = x.shape
+        H, d = self.num_heads, self.head_dim
+        dev = x.device
+        xn = self.norm1(x)
+        q = self.q_proj(xn).view(B, N, H, d).transpose(1, 2)
+        k = self.k_proj(xn).view(B, N, H, d).transpose(1, 2)
+        v = self.v_proj(xn).view(B, N, H, d).transpose(1, 2)
+        score_mod = self._score_mod_for(g, dev)
         out = _compiled_flex()(q, k, v, score_mod=score_mod, block_mask=g.block_mask(dev), scale=self.scale)
         out = out.transpose(1, 2).reshape(B, N, D)
         x = x + self.out_proj(out)

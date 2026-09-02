@@ -82,3 +82,22 @@ def test_backbone_flex_flag_runs():
                         edge_plane_local=True, edge_cross_mode="projection")
     tok, pos, pid = _tokens(torch.randn(2, 3, 3, 128, 128), "threed", dim)
     assert bb(tok, pos, pid, "threed").shape == tok.shape
+
+
+@cuda
+def test_repeated_forward_does_not_recompile_and_is_fast():
+    """Same graph, many steps: score_mod identity is stable so flex compiles once."""
+    import time
+    dim, heads = 1152, 16
+    _, pos, pid = _tokens(torch.randn(1, 3, 256, 256), "image", dim)
+    blk = FlexRGAT4D(dim, heads).cuda(); g = build_flex_graph(pos, pid, "image", 2, 1)
+    x = torch.randn(8, 256, dim, device="cuda", requires_grad=True)
+    assert blk._score_mod_for(g, x.device) is blk._score_mod_for(g, x.device)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        blk(x, g).float().mean().backward()                      # compile
+        torch.cuda.synchronize(); t0 = time.time()
+        for _ in range(10):
+            blk(x, g).float().mean().backward()
+        torch.cuda.synchronize()
+    per_step_ms = (time.time() - t0) / 10 * 1000
+    assert per_step_ms < 100, f"{per_step_ms:.0f} ms/step — recompiling or eager fallback"
