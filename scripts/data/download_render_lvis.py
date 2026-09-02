@@ -16,14 +16,12 @@ import argparse
 import csv
 import glob
 import json
-import multiprocessing as mp
 import os
 import shutil
 import socket
 import sys
 import time
 
-socket.setdefaulttimeout(120)          # objaverse downloads via urllib with no timeout → hung request = hung batch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import render_triplanes as rt  # noqa: E402
@@ -31,15 +29,14 @@ import render_triplanes as rt  # noqa: E402
 PLANES = rt.PLANES
 
 
-def _download_child(uids, glb_root, procs):
-    os.setsid()                       # own process group → the parent can kill the whole download tree on timeout
+def _load_objects(uids, glb_root, procs):
+    """In-process objaverse download (fork pool). A spawn-child wrapper was tried on 2026-09-02 and
+    silently downloaded nothing; the plain call works (5 objects in 4 s). socket.setdefaulttimeout()
+    above makes a stuck request raise inside the pool instead of hanging the batch forever."""
     import objaverse as ov
     ov.BASE_PATH = glb_root
     ov._VERSIONED_PATH = os.path.join(glb_root, "hf-objaverse-v1")
-    try:
-        ov.load_objects(uids=uids, download_processes=procs)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[download] load_objects raised {exc!r} — using whatever was fetched", flush=True)
+    return ov.load_objects(uids=uids, download_processes=procs)
 
 
 def glb_paths_for(uids, glb_root):
@@ -53,24 +50,17 @@ def glb_paths_for(uids, glb_root):
     return found
 
 
-def download_batch(uids, glb_root, procs, timeout_s):
-    """Download a batch in a separate process with a hard timeout (2026-09-02: one stuck request left
-    the objaverse pool waiting forever with 383/384 files done). Returns uid → path for what exists."""
-    import signal
-    ctx = mp.get_context("spawn")
-    # NOT daemon: objaverse spawns its own multiprocessing.Pool inside (daemonic processes may not have children)
-    proc = ctx.Process(target=_download_child, args=(uids, glb_root, procs), daemon=False)
-    proc.start(); proc.join(timeout_s)
-    if proc.is_alive():
-        print(f"[download] batch timed out after {timeout_s}s — killing downloader, rendering the {len(glb_paths_for(uids, glb_root))} files present", flush=True)
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)   # child called setsid() → pid == pgid
-        except ProcessLookupError:
-            proc.kill()
-        proc.join(10)
-    found = glb_paths_for(uids, glb_root)
-    if not found and proc.exitcode not in (0, None):
-        print(f"[download] downloader exited with code {proc.exitcode} and fetched nothing — check the log above", flush=True)
+def download_batch(uids, glb_root, procs, timeout_s=None):
+    """Download a batch; on any error (timeouts raise thanks to the socket default timeout) fall back
+    to whatever GLBs are on disk for these uids so the batch still renders."""
+    try:
+        paths = _load_objects(uids, glb_root, procs)
+        found = {u: p for u, p in paths.items() if p and os.path.exists(p) and os.path.getsize(p) > 0}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[download] load_objects raised {exc!r} — rendering the files present", flush=True)
+        found = {}
+    if len(found) < len(uids):
+        found.update(glb_paths_for([u for u in uids if u not in found], glb_root))
     return found
 
 
@@ -101,8 +91,9 @@ def main() -> int:
     ap.add_argument("--res", type=int, default=256)
     ap.add_argument("--points", type=int, default=200_000)
     ap.add_argument("--keep-glb", action="store_true")
-    ap.add_argument("--download-timeout", type=int, default=900, help="hard timeout (s) per batch download")
+    ap.add_argument("--download-timeout", type=int, default=120, help="socket timeout (s) per request; a stuck request raises instead of hanging")
     a = ap.parse_args()
+    socket.setdefaulttimeout(max(10, a.download_timeout))   # objaverse uses urllib with no timeout → a hung request would hang the batch
 
     import objaverse
     glb_root = os.path.join(a.out, "_glb_tmp")
