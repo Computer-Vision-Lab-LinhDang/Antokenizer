@@ -32,6 +32,7 @@ PLANES = rt.PLANES
 
 
 def _download_child(uids, glb_root, procs):
+    os.setsid()                       # own process group → the parent can kill the whole download tree on timeout
     import objaverse as ov
     ov.BASE_PATH = glb_root
     ov._VERSIONED_PATH = os.path.join(glb_root, "hf-objaverse-v1")
@@ -55,13 +56,22 @@ def glb_paths_for(uids, glb_root):
 def download_batch(uids, glb_root, procs, timeout_s):
     """Download a batch in a separate process with a hard timeout (2026-09-02: one stuck request left
     the objaverse pool waiting forever with 383/384 files done). Returns uid → path for what exists."""
+    import signal
     ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_download_child, args=(uids, glb_root, procs), daemon=True)
+    # NOT daemon: objaverse spawns its own multiprocessing.Pool inside (daemonic processes may not have children)
+    proc = ctx.Process(target=_download_child, args=(uids, glb_root, procs), daemon=False)
     proc.start(); proc.join(timeout_s)
     if proc.is_alive():
         print(f"[download] batch timed out after {timeout_s}s — killing downloader, rendering the {len(glb_paths_for(uids, glb_root))} files present", flush=True)
-        proc.kill(); proc.join(10)
-    return glb_paths_for(uids, glb_root)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)   # child called setsid() → pid == pgid
+        except ProcessLookupError:
+            pass
+        proc.join(10)
+    found = glb_paths_for(uids, glb_root)
+    if not found and proc.exitcode not in (0, None):
+        print(f"[download] downloader exited with code {proc.exitcode} and fetched nothing — check the log above", flush=True)
+    return found
 
 
 def rendered(out_root: str, uid: str) -> bool:
@@ -114,10 +124,14 @@ def main() -> int:
     cap_out = json.load(open(cap_path)) if os.path.exists(cap_path) else {}
     fail_log = open(os.path.join(a.out, "render_failures.jsonl"), "a")
 
-    t0 = time.time(); done = 0; failed = 0
+    t0 = time.time(); done = 0; failed = 0; empty_batches = 0
     for i in range(0, len(todo), a.batch):
         batch = todo[i: i + a.batch]
         paths = download_batch(batch, glb_root, a.download_procs, a.download_timeout)
+        empty_batches = empty_batches + 1 if not paths else 0
+        if empty_batches >= 3:
+            print("[download] 3 consecutive batches fetched nothing — aborting (network/objaverse problem, uids stay unrendered for the next run)", flush=True)
+            break
         missing = [u for u in batch if u not in paths]
         if missing:
             for u in missing:
