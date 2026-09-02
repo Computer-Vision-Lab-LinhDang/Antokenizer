@@ -14,16 +14,54 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
+import multiprocessing as mp
 import os
 import shutil
+import socket
 import sys
 import time
+
+socket.setdefaulttimeout(120)          # objaverse downloads via urllib with no timeout → hung request = hung batch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import render_triplanes as rt  # noqa: E402
 
 PLANES = rt.PLANES
+
+
+def _download_child(uids, glb_root, procs):
+    import objaverse as ov
+    ov.BASE_PATH = glb_root
+    ov._VERSIONED_PATH = os.path.join(glb_root, "hf-objaverse-v1")
+    try:
+        ov.load_objects(uids=uids, download_processes=procs)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[download] load_objects raised {exc!r} — using whatever was fetched", flush=True)
+
+
+def glb_paths_for(uids, glb_root):
+    """uid → path for GLBs already on disk (objaverse layout: <root>/hf-objaverse-v1/glbs/<shard>/<uid>.glb)."""
+    found = {}
+    want = set(uids)
+    for p in glob.glob(os.path.join(glb_root, "hf-objaverse-v1", "glbs", "*", "*.glb")):
+        u = os.path.splitext(os.path.basename(p))[0]
+        if u in want and os.path.getsize(p) > 0:
+            found[u] = p
+    return found
+
+
+def download_batch(uids, glb_root, procs, timeout_s):
+    """Download a batch in a separate process with a hard timeout (2026-09-02: one stuck request left
+    the objaverse pool waiting forever with 383/384 files done). Returns uid → path for what exists."""
+    ctx = mp.get_context("spawn")
+    proc = ctx.Process(target=_download_child, args=(uids, glb_root, procs), daemon=True)
+    proc.start(); proc.join(timeout_s)
+    if proc.is_alive():
+        print(f"[download] batch timed out after {timeout_s}s — killing downloader, rendering the {len(glb_paths_for(uids, glb_root))} files present", flush=True)
+        proc.kill(); proc.join(10)
+    return glb_paths_for(uids, glb_root)
 
 
 def rendered(out_root: str, uid: str) -> bool:
@@ -53,6 +91,7 @@ def main() -> int:
     ap.add_argument("--res", type=int, default=256)
     ap.add_argument("--points", type=int, default=200_000)
     ap.add_argument("--keep-glb", action="store_true")
+    ap.add_argument("--download-timeout", type=int, default=900, help="hard timeout (s) per batch download")
     a = ap.parse_args()
 
     import objaverse
@@ -78,12 +117,12 @@ def main() -> int:
     t0 = time.time(); done = 0; failed = 0
     for i in range(0, len(todo), a.batch):
         batch = todo[i: i + a.batch]
-        try:
-            paths = objaverse.load_objects(uids=batch, download_processes=a.download_procs)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[download] batch {i // a.batch} failed: {exc!r} — retrying once", flush=True)
-            time.sleep(10)
-            paths = objaverse.load_objects(uids=batch, download_processes=a.download_procs)
+        paths = download_batch(batch, glb_root, a.download_procs, a.download_timeout)
+        missing = [u for u in batch if u not in paths]
+        if missing:
+            for u in missing:
+                fail_log.write(json.dumps({"uid": u, "error": "download missing/timeout"}) + "\n")
+            print(f"[download] {len(missing)} of {len(batch)} objects not fetched this batch", flush=True)
         items = [(p, os.path.join(a.out, "3d_objects", "renders", u)) for u, p in paths.items() if p and os.path.exists(p)]
         ok, errs = rt.render_many(items, a.res, a.points, a.workers)
         for u, e in errs.items():
