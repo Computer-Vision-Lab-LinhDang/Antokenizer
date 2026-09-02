@@ -29,14 +29,49 @@ import render_triplanes as rt  # noqa: E402
 PLANES = rt.PLANES
 
 
-def _load_objects(uids, glb_root, procs):
-    """In-process objaverse download (fork pool). A spawn-child wrapper was tried on 2026-09-02 and
-    silently downloaded nothing; the plain call works (5 objects in 4 s). socket.setdefaulttimeout()
-    above makes a stuck request raise inside the pool instead of hanging the batch forever."""
+HF_OBJAVERSE = "https://huggingface.co/datasets/allenai/objaverse/resolve/main/"
+
+
+def _fetch_one(uid, rel_path, glb_root, timeout_s, retries=2):
+    """Download one GLB to <glb_root>/hf-objaverse-v1/<rel_path> (atomic rename). Returns (uid, path|None)."""
+    import urllib.request
+    dst = os.path.join(glb_root, "hf-objaverse-v1", rel_path)
+    if os.path.exists(dst) and os.path.getsize(dst) > 0:
+        return uid, dst
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = dst + ".part"
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(HF_OBJAVERSE + rel_path, timeout=timeout_s) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f, 1 << 20)
+            if os.path.getsize(tmp) > 0:
+                os.replace(tmp, dst)
+                return uid, dst
+        except Exception:  # noqa: BLE001  (404, timeout, reset — retry then give up)
+            time.sleep(1 + attempt)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return uid, None
+
+
+def _load_objects(uids, glb_root, procs, timeout_s=120):
+    """Own threaded downloader. objaverse.load_objects() hangs forever when any file in the batch
+    fails (its Pool never delivers the missing results — seen twice on 2026-09-02 at 383/384 and
+    380/384). We only use objaverse for the uid → path mapping."""
+    from concurrent.futures import ThreadPoolExecutor
     import objaverse as ov
     ov.BASE_PATH = glb_root
     ov._VERSIONED_PATH = os.path.join(glb_root, "hf-objaverse-v1")
-    return ov.load_objects(uids=uids, download_processes=procs)
+    rel = ov._load_object_paths()
+    jobs = [(u, rel[u]) for u in uids if u in rel]
+    out = {}
+    with ThreadPoolExecutor(max_workers=procs) as ex:
+        for uid, path in ex.map(lambda j: _fetch_one(j[0], j[1], glb_root, timeout_s), jobs):
+            if path:
+                out[uid] = path
+    return out
 
 
 def glb_paths_for(uids, glb_root):
@@ -50,11 +85,11 @@ def glb_paths_for(uids, glb_root):
     return found
 
 
-def download_batch(uids, glb_root, procs, timeout_s=None):
+def download_batch(uids, glb_root, procs, timeout_s=120):
     """Download a batch; on any error (timeouts raise thanks to the socket default timeout) fall back
     to whatever GLBs are on disk for these uids so the batch still renders."""
     try:
-        paths = _load_objects(uids, glb_root, procs)
+        paths = _load_objects(uids, glb_root, procs, timeout_s or 120)
         found = {u: p for u, p in paths.items() if p and os.path.exists(p) and os.path.getsize(p) > 0}
     except Exception as exc:  # noqa: BLE001
         print(f"[download] load_objects raised {exc!r} — rendering the files present", flush=True)
