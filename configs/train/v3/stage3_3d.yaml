@@ -70,6 +70,7 @@ data:
   modality_batch_sizes: {video: 8, threed: 8}      # video = 4x image tokens, 3D = 3 planes
   modality_weights: {image: 0.5, video: 0.35, threed: 0.15}
   num_workers: 12
+  loader_timeout: 900                 # a stuck decode raises after 15 min instead of hanging the DDP group
   pin_memory: true
   val_split: 0.002
   test_split: 0.0

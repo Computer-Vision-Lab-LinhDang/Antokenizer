@@ -518,6 +518,15 @@ class ManifestVideoDataset(Dataset):
         return [start + i * stride for i in range(T)]
 
     # -- decoding ---------------------------------------------------------------
+    @staticmethod
+    def _configure_stream(stream) -> None:
+        """Single-threaded libav decode. Frame threading (thread_type=AUTO → 16 ``av:h264:df*``
+        threads per worker) deadlocked inside forked DataLoader workers on 2026-09-02: five workers
+        stuck in futex_wait, the rank never delivered its batch and the other DDP ranks spun in
+        all-reduce for 20+ minutes. One decode thread per worker is slower per clip but safe."""
+        stream.thread_type = "NONE"
+        stream.thread_count = 1
+
     def _target_size(self, w: int, h: int) -> Tuple[int, int]:
         r = self.resolution
         if w >= h:
@@ -529,7 +538,7 @@ class ManifestVideoDataset(Dataset):
         import numpy as np
         with av.open(path) as container:
             stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
+            self._configure_stream(stream)
             n_total = int(stream.frames or 0)
             frames: List[np.ndarray] = []
             if n_total > 0:

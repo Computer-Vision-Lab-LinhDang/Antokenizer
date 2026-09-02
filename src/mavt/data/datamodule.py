@@ -181,6 +181,7 @@ class MAVTDataModule(L.LightningDataModule):
         video_frames: int = 16,
         video_frame_stride: int = 2,
         modality_batch_sizes: Optional[Dict[str, int]] = None,   # e.g. {video: 8, threed: 8}
+        loader_timeout: int = 0,          # seconds a rank waits for a worker batch before raising (0 = forever)
         modality_weights: Optional[Dict[str, float]] = None,     # e.g. {image: .5, video: .35, threed: .15}
         video_resolution: int = 256,
         triplane_res: int = 256,
@@ -301,6 +302,8 @@ class MAVTDataModule(L.LightningDataModule):
             kw['persistent_workers'] = bool(hp.persistent_workers)
             if hp.prefetch_factor is not None:
                 kw['prefetch_factor'] = int(hp.prefetch_factor)
+            if hp.loader_timeout and hp.loader_timeout > 0:
+                kw['timeout'] = int(hp.loader_timeout)   # a hung worker must fail loudly, not stall the DDP group
         return kw
 
     def train_dataloader(self) -> DataLoader:

@@ -85,3 +85,25 @@ def test_video_loader_does_not_materialise_whole_clip(video_manifest, monkeypatc
     monkeypatch.setattr(tvio, "read_video", boom, raising=False)
     ds = ManifestVideoDataset(str(video_manifest), n_frames=4, resolution=16)
     assert ds[0]["data"].shape == (3, 4, 16, 16)
+
+
+def test_video_decode_is_single_threaded(video_manifest):
+    """libav frame threading deadlocked inside forked DataLoader workers (2026-09-02)."""
+    import av
+    from mavt.data.datasets import ManifestVideoDataset
+    ds = ManifestVideoDataset(str(video_manifest), n_frames=4, resolution=16)
+    path = ds.records[0]["path"]
+    with av.open(path) as c:
+        st = c.streams.video[0]
+        ds._configure_stream(st)
+        assert st.thread_count == 1 and st.thread_type != "AUTO"
+    assert ds[0]["data"].shape == (3, 4, 16, 16)         # decode still works
+
+
+def test_loader_timeout_hparam_reaches_dataloader(tmp_path):
+    from mavt.data.datamodule import MAVTDataModule
+    dm = MAVTDataModule(active_modalities=["image"], num_workers=2, loader_timeout=123, batch_size=2)
+    extras = dm._loader_extras()
+    assert extras.get("timeout") == 123
+    dm0 = MAVTDataModule(active_modalities=["image"], num_workers=0, loader_timeout=123, batch_size=2)
+    assert "timeout" not in dm0._loader_extras()
