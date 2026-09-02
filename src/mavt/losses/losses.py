@@ -78,11 +78,42 @@ def infonce_loss(
 def cosine_distill_loss(
     student: torch.Tensor,   # (B, D)
     teacher: torch.Tensor,   # (B, D) — frozen vision teacher (e.g. SigLIP2)
+    center: bool = False,
 ) -> torch.Tensor:
-    """1 - mean cosine similarity. Teacher is detached (no gradient flows back)."""
+    """1 - mean cosine similarity. Teacher is detached (no gradient flows back).
+
+    center=True subtracts each side's batch mean first, so the loss rewards
+    matching the per-sample (discriminative) deviation rather than the teacher's
+    shared mean direction — which plain cosine would otherwise fit first and
+    collapse onto (pair_cos 0.95 in the pilot).
+    """
+    teacher = teacher.detach()
+    if center and student.shape[0] > 1:
+        student = student - student.mean(0, keepdim=True)
+        teacher = teacher - teacher.mean(0, keepdim=True)
     s = F.normalize(student, dim=-1)
-    t = F.normalize(teacher.detach(), dim=-1)
+    t = F.normalize(teacher, dim=-1)
     return (1.0 - (s * t).sum(dim=-1)).mean()
+
+
+def vicreg_loss(e: torch.Tensor, std_target: float = 1.0, w_var: float = 1.0,
+                w_cov: float = 0.04) -> torch.Tensor:
+    """Variance + covariance regulariser (VICReg) on a (B, D) embedding.
+
+    var: hinge pushing every dimension's std above `std_target`;
+    cov: off-diagonal covariance pushed to zero (de-correlate dimensions).
+    Prevents the pooled embedding from collapsing while distillation pulls it.
+    """
+    if e.shape[0] < 2:
+        return e.new_zeros(())
+    e = e.float()
+    std = torch.sqrt(e.var(dim=0, unbiased=False) + 1e-4)
+    var_loss = F.relu(std_target - std).mean()
+    c = e - e.mean(0, keepdim=True)
+    cov = (c.T @ c) / (e.shape[0] - 1)
+    off = cov - torch.diag(torch.diag(cov))
+    cov_loss = (off ** 2).sum() / e.shape[1]
+    return w_var * var_loss + w_cov * cov_loss
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +219,8 @@ class MAVTLoss(nn.Module):
         w_sem: float  = 0.5,    # cosine distill from frozen vision teacher
         w_aux: float  = 0.01,
         w_temp: float = 0.0,    # temporal consistency (video only); 0 = disabled
+        w_vic: float  = 0.0,    # VICReg anti-collapse on the pooled semantic embedding
+        distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
         active_modalities: tuple = ('image', 'video', 'threed'),
@@ -200,6 +233,8 @@ class MAVTLoss(nn.Module):
         self.w_sem  = w_sem
         self.w_aux  = w_aux
         self.w_temp = w_temp
+        self.w_vic = w_vic
+        self.distill_center = distill_center
         self.use_clip = use_clip
 
         self.lpips = LPIPSLoss() if use_lpips else None
@@ -218,6 +253,12 @@ class MAVTLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
 
         # Reconstruction
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"MAVTLoss: pred/target shape mismatch {tuple(pred.shape)} vs {tuple(target.shape)} "
+                "(modality={modality}). Decoders must return the full target shape — no silent "
+                "truncation/alignment here."
+            )
         l1   = F.l1_loss(pred, target)
         lpips_val = self.lpips(pred, target) if self.lpips is not None else torch.tensor(0.0, device=pred.device)
         l_recon = self.w_l1 * l1 + self.w_lpips * lpips_val
@@ -235,7 +276,12 @@ class MAVTLoss(nn.Module):
         # Vision-vision distillation (default semantic supervision)
         l_sem = torch.tensor(0.0, device=pred.device)
         if self.w_sem > 0.0 and semantic_embed is not None and teacher_embed is not None:
-            l_sem = cosine_distill_loss(semantic_embed, teacher_embed)
+            l_sem = cosine_distill_loss(semantic_embed, teacher_embed, center=self.distill_center)
+
+        # VICReg anti-collapse on the pooled embedding
+        l_vic = torch.tensor(0.0, device=pred.device)
+        if self.w_vic > 0.0 and semantic_embed is not None:
+            l_vic = vicreg_loss(semantic_embed)
 
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
@@ -252,6 +298,7 @@ class MAVTLoss(nn.Module):
             + self.w_sem * l_sem
             + self.w_aux * l_div
             + self.w_temp * l_temp
+            + self.w_vic * l_vic
         )
 
         return {
@@ -264,4 +311,5 @@ class MAVTLoss(nn.Module):
             'loss_sem':   l_sem,
             'loss_div':   l_div,
             'loss_temp':  l_temp,
+            'loss_vic':   l_vic,
         }

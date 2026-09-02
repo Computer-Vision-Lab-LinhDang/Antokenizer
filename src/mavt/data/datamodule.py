@@ -6,7 +6,7 @@ import random
 from typing import Dict, Iterator, List, Optional
 
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, DistributedSampler, Sampler, random_split
 import lightning as L
 
 from pathlib import Path
@@ -18,6 +18,8 @@ from mavt.data.datasets import (
     UniversalThreeDDataset,
     WDSImageDataset,
     ShardVideoDataset,
+    ManifestImageDataset,
+    ManifestVideoDataset,
 )
 
 
@@ -126,6 +128,9 @@ class MAVTDataModule(L.LightningDataModule):
         # Per-modality shard roots (override universal_data_root when set)
         image_shards_dir: Optional[str] = None,
         video_shards_dir: Optional[str] = None,
+        # Manifest-backed datasets (.jsonl from mavt.data.manifest) — highest precedence
+        image_manifest: Optional[str] = None,
+        video_manifest: Optional[str] = None,
         video_max_shards: Optional[int] = None,
         # Data params
         image_resolution: int = 256,
@@ -151,6 +156,10 @@ class MAVTDataModule(L.LightningDataModule):
 
     def _make_dataset(self, modality: str) -> Dataset:
         hp = self.hparams
+        if modality == 'image' and hp.image_manifest:
+            return ManifestImageDataset(hp.image_manifest, hp.image_resolution)
+        if modality == 'video' and hp.video_manifest:
+            return ManifestVideoDataset(hp.video_manifest, hp.video_frames, hp.video_resolution)
         # Per-modality shard roots take precedence over universal_data_root
         if modality == 'image' and hp.image_shards_dir:
             return WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
@@ -254,10 +263,18 @@ class MAVTDataModule(L.LightningDataModule):
                 collate_fn=_collate,
                 **self._loader_extras(),
             )
+        # Single modality: shard across DDP ranks ourselves (the YAML disables
+        # Lightning's sampler replacement for the multi-modality batch sampler).
+        sampler = None
+        shuffle = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = DistributedSampler(self._train_ds, shuffle=True, drop_last=True)
+            shuffle = False
         return DataLoader(
             self._train_ds,
             batch_size=hp.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=hp.num_workers,
             pin_memory=hp.pin_memory,
             collate_fn=_collate,

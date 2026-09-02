@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Training job file for the GPU server (job files on this host are named `deepseek`).
+#   ./deepseek                                            # stage-1: 8 GPUs, b160/GPU (1280 eff.), 20k steps
+#   STAGE=2 INIT_CKPT=checkpoints/v3/stage1/x.ckpt ./deepseek   # stage-2
+#   GPUS=4 BATCH=320 HIP_VISIBLE_DEVICES=1,2,3,4 ./deepseek    # any GPU subset
+set -euo pipefail
+cd "$(dirname "$0")"
+export HF_HOME="${HF_HOME:-/scratch/vunguyen13/hf_cache}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME}"
+export TORCH_HOME="${TORCH_HOME:-/scratch/vunguyen13/torch_cache}"
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+PY="${PY:-$HOME/miniforge3/envs/mavt/bin/python}"
+GPUS="${GPUS:-8}"; BATCH="${BATCH:-160}"; STEPS="${STEPS:-20000}"; CKPT_EVERY="${CKPT_EVERY:-2000}"
+STAGE="${STAGE:-1}"; INIT_CKPT="${INIT_CKPT:-}"
+case "$STAGE" in
+  1) CFG=configs/train/v3/stage1_image.yaml ;;
+  2) CFG=configs/train/v3/stage2_video.yaml ;;
+  3) CFG=configs/train/v3/stage3_3d.yaml ;;
+  *) echo "STAGE must be 1|2|3" >&2; exit 2 ;;
+esac
+RUN="${RUN:-runs/deepseek/s${STAGE}}"
+mkdir -p "$RUN"
+STRATEGY_ARGS=(); [ "$GPUS" = "1" ] && STRATEGY_ARGS=(--trainer.strategy auto)
+echo "[deepseek] stage=$STAGE gpus=$GPUS batch/gpu=$BATCH steps=$STEPS run=$RUN cfg=$CFG"
+exec "$PY" train.py fit --config configs/model/mavt_base.yaml --config "$CFG" \
+  --trainer.devices "$GPUS" "${STRATEGY_ARGS[@]}" \
+  --trainer.max_steps "$STEPS" --trainer.default_root_dir "$RUN" \
+  --trainer.callbacks+=lightning.pytorch.callbacks.ModelCheckpoint \
+  --trainer.callbacks.dirpath "$RUN/checkpoints" --trainer.callbacks.filename "mavt-v3-s${STAGE}-{step:07d}" \
+  --trainer.callbacks.every_n_train_steps "$CKPT_EVERY" --trainer.callbacks.save_top_k -1 \
+  --model.total_steps "$STEPS" --data.batch_size "$BATCH" \
+  ${INIT_CKPT:+--model.init_from_ckpt "$INIT_CKPT"} "$@" 2>&1 | tee -a "$RUN/train.log"

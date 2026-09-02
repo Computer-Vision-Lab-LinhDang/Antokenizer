@@ -405,3 +405,124 @@ class ShardVideoDataset(Dataset):
             'caption': caption,
             'id': obj_id,
         }
+
+
+# --------------------------------------------------------------------------- #
+#  Manifest-backed datasets (v3)                                               #
+# --------------------------------------------------------------------------- #
+
+def _load_manifest(path: str) -> List[Dict]:
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _record_caption(rec: Dict) -> str:
+    if rec.get("caption"):
+        return str(rec["caption"])
+    cp = rec.get("caption_path")
+    if cp:
+        try:
+            with open(cp) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+class ManifestImageDataset(Dataset):
+    """Images listed in a .jsonl manifest ({"path", "caption"?, "caption_path"?}).
+
+    No filesystem scan at init; fail-loud: a decode failure retries a substitute
+    sample up to 3 times, counts errors, then raises. Never yields zero tensors.
+    """
+
+    _MAX_RETRIES = 3
+
+    def __init__(self, manifest_path: str, resolution: int = 256):
+        self.records = _load_manifest(manifest_path)
+        if not self.records:
+            raise FileNotFoundError(f"Empty manifest: {manifest_path}")
+        self.transform = transforms.Compose([
+            transforms.Resize(resolution),
+            transforms.CenterCrop(resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+        self.n_errors = 0
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _load_one(self, idx: int) -> Dict:
+        from PIL import Image as PILImage
+        rec = self.records[idx]
+        img = PILImage.open(rec["path"]).convert("RGB")
+        return {"data": self.transform(img), "modality": "image",
+                "caption": _record_caption(rec), "id": Path(rec["path"]).stem}
+
+    def __getitem__(self, idx: int) -> Dict:
+        import random
+        for _ in range(self._MAX_RETRIES):
+            try:
+                return self._load_one(idx)
+            except Exception as exc:  # noqa: BLE001
+                self.n_errors += 1
+                if self.n_errors <= 3 or self.n_errors % 100 == 0:
+                    print(f"[ManifestImageDataset] error #{self.n_errors}: {exc!r}")
+                idx = random.randrange(len(self.records))
+        raise RuntimeError(f"Image load failed {self._MAX_RETRIES}x (total errors={self.n_errors})")
+
+
+class ManifestVideoDataset(Dataset):
+    """Video clips from a manifest: random start + uniform stride covering the whole clip.
+
+    Decodes with torchvision (PyAV backend). Fail-loud like ManifestImageDataset —
+    a broken file never turns into a static repeated frame.
+    """
+
+    _MAX_RETRIES = 3
+
+    def __init__(self, manifest_path: str, n_frames: int = 16, resolution: int = 256):
+        self.records = _load_manifest(manifest_path)
+        if not self.records:
+            raise FileNotFoundError(f"Empty manifest: {manifest_path}")
+        self.n_frames = n_frames
+        self.resolution = resolution
+        self.n_errors = 0
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _load_one(self, idx: int) -> Dict:
+        import random
+        import torch.nn.functional as F
+        import torchvision.io as tvio
+        rec = self.records[idx]
+        frames, _, _ = tvio.read_video(rec["path"], pts_unit="sec", output_format="TCHW")
+        T_total = frames.shape[0]
+        if T_total == 0:
+            raise ValueError("empty video")
+        T = self.n_frames
+        stride = max(1, T_total // T)
+        start = random.randint(0, max(0, T_total - (T - 1) * stride - 1))
+        idxs = torch.arange(start, T_total, stride)[:T]
+        clip = frames[idxs].float() / 255.0
+        if clip.shape[0] < T:
+            clip = torch.cat([clip, clip[-1:].expand(T - clip.shape[0], -1, -1, -1)], 0)
+        clip = F.interpolate(clip, size=(self.resolution, self.resolution), mode="bilinear",
+                             align_corners=False)
+        clip = (clip - 0.5) / 0.5
+        return {"data": clip.permute(1, 0, 2, 3).contiguous(), "modality": "video",
+                "caption": _record_caption(rec), "id": Path(rec["path"]).stem}
+
+    def __getitem__(self, idx: int) -> Dict:
+        import random
+        for _ in range(self._MAX_RETRIES):
+            try:
+                return self._load_one(idx)
+            except Exception as exc:  # noqa: BLE001
+                self.n_errors += 1
+                if self.n_errors <= 3 or self.n_errors % 100 == 0:
+                    print(f"[ManifestVideoDataset] error #{self.n_errors}: {exc!r}")
+                idx = random.randrange(len(self.records))
+        raise RuntimeError(f"Video load failed {self._MAX_RETRIES}x (total errors={self.n_errors})")

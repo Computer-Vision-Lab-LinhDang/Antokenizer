@@ -74,6 +74,9 @@ class MAVT(nn.Module):
         # RGAT
         r_s: int = 2,
         r_t: int = 1,
+        rgat_impl: str = "dense",
+        edge_plane_local: bool = False,
+        edge_cross_mode: str = "shared_axis",
         # Training
         use_gradient_checkpointing: bool = False,
         mlp_ratio: float = 4.0,
@@ -94,6 +97,8 @@ class MAVT(nn.Module):
             mlp_ratio=mlp_ratio, dropout=dropout,
             r_s=r_s, r_t=r_t,
             use_gradient_checkpointing=use_gradient_checkpointing,
+            rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
+            edge_cross_mode=edge_cross_mode,
         )
 
         # Stage 3
@@ -111,7 +116,7 @@ class MAVT(nn.Module):
         self.decoder = AsymmetricDecoder(
             latent_dim=latent_dim, dec_dim=dec_dim,
             num_attn_blocks=num_dec_attn_blocks, num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
+            mlp_ratio=mlp_ratio, t_patch=t_patch,
         )
         # 5b. Understanding head: z → semantic vector aligned with vision teacher
         self.understanding_decoder = UnderstandingDecoder(
@@ -206,9 +211,12 @@ class MAVT(nn.Module):
         out = self.forward(x, modality, decode=False)
         return out.z, out.semantic
 
-    def load_siglip2_weights(self, model_name: str = "google/siglip2-base-patch16-224",
-                              freeze_stages: int = 10) -> None:
-        self.backbone.load_siglip2_weights(model_name, freeze_stages)
+    def load_siglip2_weights(self, model_name: str = "google/siglip2-so400m-patch16-384",
+                              freeze_stages: int = 10, strict: bool = True,
+                              init_patchify: bool = False) -> None:
+        if init_patchify:
+            self.patchify.init_from_siglip2(model_name)
+        self.backbone.load_siglip2_weights(model_name, freeze_stages, strict=strict)
 
     # ------------------------------------------------------------------ #
     #  Eager pre-creation of slot poolers                                 #

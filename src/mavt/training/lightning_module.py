@@ -45,6 +45,9 @@ class MAVTLightningModule(L.LightningModule):
         num_dec_attn_blocks: int = 4,
         r_s: int = 2,
         r_t: int = 1,
+        rgat_impl: str = "dense",             # dense | sparse | flex (graph attention)
+        edge_plane_local: bool = False,
+        edge_cross_mode: str = "shared_axis",
         use_gradient_checkpointing: bool = True,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -59,14 +62,17 @@ class MAVTLightningModule(L.LightningModule):
         w_sem: float = 0.0,
         w_aux: float = 0.01,
         w_temp: float = 0.0,    # temporal consistency weight (video only)
+        w_vic: float = 0.0,     # VICReg anti-collapse on pooled embedding
+        distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool = False,
         active_modalities: list = None,  # e.g. ['image', 'video']; None → all three
         # Curriculum
         training_stage: int = 1,
-        siglip2_model_name: str = "google/siglip2-base-patch16-224",
+        siglip2_model_name: str = "google/siglip2-so400m-patch16-384",
         init_siglip2: bool = True,
-        use_semantic_distill: bool = False,
+        init_siglip2_patchify: bool = False,   # inherit Conv2d kernel + 24x24 pos table
+        use_semantic_distill: bool = True,
         # Cross-stage weight transfer (loads model weights only, NOT optimizer
         # / scheduler / step state — use --ckpt_path for true resume instead).
         init_from_ckpt: Optional[str] = None,
@@ -75,9 +81,14 @@ class MAVTLightningModule(L.LightningModule):
         grad_clip: float = 1.0,
         warmup_steps: int = 1000,
         total_steps: int = 200_000,
+        lr: Optional[float] = None,          # override the per-stage default LR
     ):
         super().__init__()
-        self.save_hyperparameters()
+        # active_modalities is owned by the DataModule (single source of truth);
+        # keeping it out of the model hparams avoids Lightning's duplicate-key
+        # merge error when both modules would log it with different values.
+        self.save_hyperparameters(ignore=["active_modalities"])
+        self._active_modalities_cfg = tuple(active_modalities) if active_modalities else None
 
         self.model = MAVT(
             embed_dim=embed_dim, num_heads=num_heads, num_blocks=num_blocks,
@@ -85,6 +96,8 @@ class MAVTLightningModule(L.LightningModule):
             latent_dim=latent_dim, kl_weight=kl_weight,
             semantic_dim=semantic_dim, dec_dim=dec_dim,
             num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
+            rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
+            edge_cross_mode=edge_cross_mode,
             use_gradient_checkpointing=use_gradient_checkpointing,
             mlp_ratio=mlp_ratio, dropout=dropout,
             local_detail_window_size=local_detail_window_size,
@@ -95,7 +108,7 @@ class MAVTLightningModule(L.LightningModule):
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
-            w_temp=w_temp,
+            w_temp=w_temp, w_vic=w_vic, distill_center=distill_center,
             use_lpips=use_lpips, use_clip=use_clip,
             active_modalities=_active_mods,
         )
@@ -119,7 +132,8 @@ class MAVTLightningModule(L.LightningModule):
         self._sync_ema_modalities()
         if hp.init_siglip2:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
-            self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
+            self.model.load_siglip2_weights(hp.siglip2_model_name, frozen, strict=True,
+                                            init_patchify=hp.init_siglip2_patchify)
         if hp.use_semantic_distill and self.semantic_teacher is None:
             self._load_semantic_teacher(hp.siglip2_model_name)
         # Cross-stage weight transfer (after siglip2 / teacher are in place so
@@ -192,7 +206,7 @@ class MAVTLightningModule(L.LightningModule):
                 self.loss_fn.ema_weighter.active_modalities = tuple(active)
                 return
         # Fallback: use model config param if DataModule not available
-        fallback = getattr(self.hparams, 'active_modalities', None)
+        fallback = self._active_modalities_cfg
         if fallback:
             self.loss_fn.ema_weighter.active_modalities = tuple(fallback)
 
@@ -211,9 +225,9 @@ class MAVTLightningModule(L.LightningModule):
             except AttributeError:
                 self._teacher_image_size = 224
         except Exception as exc:  # noqa: BLE001
-            print(f"[lightning_module] semantic teacher load failed ({exc}); "
-                  f"distillation disabled this run")
-            self.semantic_teacher = None
+            # use_semantic_distill was requested: failing loud beats silently training
+            # without the objective the whole design depends on.
+            raise RuntimeError(f"semantic teacher {model_name!r} failed to load: {exc}") from exc
 
     def train(self, mode: bool = True):  # type: ignore[override]
         """Keep frozen teacher in eval mode regardless of train()/eval() calls."""
@@ -258,13 +272,10 @@ class MAVTLightningModule(L.LightningModule):
 
         out = self.model(x, modality, decode=True)
 
-        # For video: decoder reconstructs in patch-grid temporal space (Tp = T//t_patch).
-        # Target must match. Use first frame of each temporal patch group.
-        if modality == 'video':
-            t_patch = self.hparams.t_patch
-            target = x[:, :, ::t_patch]  # (B, 3, Tp, H, W)
-        else:
-            target = x  # image and threed pass through as-is
+        # The decoder now returns the full input shape for every modality (video:
+        # every frame via temporal expansion; 3D: all three planes). Any mismatch
+        # is a bug and MAVTLoss raises instead of aligning silently.
+        target = x
 
         # Vision-vision distillation: forward x_proxy through frozen teacher.
         teacher_embed: Optional[torch.Tensor] = None
@@ -387,7 +398,7 @@ class MAVTLightningModule(L.LightningModule):
 
     def configure_optimizers(self):
         hp = self.hparams
-        lr = _STAGE_LR[hp.training_stage]
+        lr = hp.lr if hp.lr is not None else _STAGE_LR[hp.training_stage]
 
         # Separate RGAT params for potential different LR (currently same LR)
         rgat_params, other_params = [], []

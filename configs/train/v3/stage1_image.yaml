@@ -1,0 +1,68 @@
+# MAVT v3 — Stage 1 (image) on the Open Images manifest, 8 GPUs.
+# Launch: ./deepseek            (STAGE=1 default)
+trainer:
+  max_steps: 20000
+  devices: auto
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  log_every_n_steps: 50
+  val_check_interval: 2000
+  limit_val_batches: 32
+  enable_checkpointing: true
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
+      gradient_as_bucket_view: true
+  use_distributed_sampler: false      # datamodule shards per rank (DistributedSampler / batch sampler)
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/v3/stage1
+        filename: mavt-v3-s1-{step:07d}
+        save_top_k: -1
+        every_n_train_steps: 2000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar
+
+model:
+  training_stage: 1
+  embed_dim: 1152
+  num_heads: 16
+  mlp_ratio: 3.7361111111111112     # 4304/1152 — SigLIP2 SO400M MLP width, exact copy
+  semantic_dim: 1152                # teacher pooled dim (SO400M)
+  local_detail_window_size: 2       # real token compression (~0.5N)
+  t_patch: 2
+  init_siglip2: true
+  init_siglip2_patchify: true       # Conv2d kernel + 24x24 pos table inherited
+  siglip2_model_name: google/siglip2-so400m-patch16-384
+  use_semantic_distill: true
+  distill_center: true              # match per-sample deviations, not the teacher mean
+  w_vic: 0.05                       # VICReg anti-collapse on pooled embedding
+  rgat_impl: flex                   # graph attention on FlexAttention (block-sparse)
+  edge_plane_local: true            # spatial edges in each plane's own frame
+  edge_cross_mode: projection       # cross-plane edges along the shared projection axis
+  use_gradient_checkpointing: false # 256 GB HBM: speed over memory
+  w_l1: 1.0
+  w_lpips: 0.25
+  w_kl: 1.0
+  w_sem: 0.3
+  w_aux: 0.01
+  use_lpips: true
+  lr: 4.0e-4                        # 1e-4 * sqrt(1280/32) for effective batch 1280
+  warmup_steps: 2000
+  total_steps: 20000
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+data:
+  active_modalities: [image]
+  image_manifest: data/manifests/openimages.jsonl
+  image_resolution: 256
+  batch_size: 160                   # per GPU x 8 = 1280 effective
+  num_workers: 16
+  pin_memory: true
+  val_split: 0.002
+  test_split: 0.0
