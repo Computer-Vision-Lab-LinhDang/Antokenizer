@@ -59,3 +59,19 @@ def test_render_many_reports_failures(tmp_path):
     bad = tmp_path / "bad.glb"; bad.write_bytes(b"not a mesh")
     ok, errs = rt.render_many([(str(bad), str(tmp_path / "ds/3d_objects/renders/bad"))], res=32, n_points=1000, workers=2)
     assert ok == 0 and "bad" in errs
+
+
+def test_degenerate_visuals_fall_back_instead_of_raising():
+    """Objaverse GLBs with a single RGBA / broken visuals crashed trimesh's copy(); we rebuild geometry defensively."""
+    class BrokenVisual:
+        def to_color(self):
+            raise IndexError("index 4 is out of bounds for axis 0 with size 4")
+        @property
+        def face_colors(self):
+            raise IndexError("broken")
+    box = trimesh.creation.box(extents=(1, 1, 1))
+    class Geom:  # minimal stand-in exposing what _geom_to_coloured reads
+        vertices, faces, visual = box.vertices, box.faces, BrokenVisual()
+    m = rt._geom_to_coloured(Geom(), np.eye(4))
+    assert m.vertices.shape == box.vertices.shape and m.visual.vertex_colors.shape == (len(box.vertices), 4)
+    assert (m.visual.vertex_colors[:, :3] == 180).all()          # grey fallback

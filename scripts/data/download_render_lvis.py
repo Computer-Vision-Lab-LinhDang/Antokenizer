@@ -51,7 +51,7 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--download-procs", type=int, default=16)
     ap.add_argument("--res", type=int, default=256)
-    ap.add_argument("--points", type=int, default=300_000)
+    ap.add_argument("--points", type=int, default=200_000)
     ap.add_argument("--keep-glb", action="store_true")
     a = ap.parse_args()
 

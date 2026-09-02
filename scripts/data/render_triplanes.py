@@ -29,33 +29,58 @@ _PLANE_DEF = {"oxoy": (0, +1, 1, +1, 2), "oxoz": (0, +1, 2, -1, 1), "oyoz": (2, 
 _VIEW_DIR = {"oxoy": np.array([0, 0, 1.0]), "oxoz": np.array([0, 1.0, 0]), "oyoz": np.array([1.0, 0, 0])}
 
 
+def _geom_to_coloured(geom, T=None):
+    """Rebuild a geometry as a plain Trimesh with a valid (n_vertices, 4) vertex-colour array.
+
+    Objaverse GLBs often carry degenerate visuals (a single RGBA instead of per-face colours,
+    materials without textures); trimesh's own copy()/to_color() then raises. We never copy
+    the visual object — we extract colours defensively and fall back to grey.
+    """
+    import trimesh
+    v = np.asarray(geom.vertices, dtype=np.float64)
+    if T is not None:
+        v = trimesh.transform_points(v, T)
+    f = np.asarray(geom.faces)
+    vc = None
+    try:
+        vis = geom.visual
+        if hasattr(vis, "to_color"):
+            vis = vis.to_color()
+        vc = np.asarray(vis.vertex_colors)
+        if vc.ndim != 2 or vc.shape[0] != len(v) or vc.shape[1] < 3:
+            vc = None
+    except Exception:  # noqa: BLE001
+        vc = None
+    if vc is None:
+        try:                                            # single face colour → broadcast
+            fc = np.asarray(geom.visual.face_colors)
+            if fc.ndim == 2 and fc.shape[0] == len(f) and fc.shape[1] >= 3:
+                vc = np.zeros((len(v), 4), np.uint8); vc[f.reshape(-1)] = np.repeat(fc[:, :4], 3, axis=0)
+        except Exception:  # noqa: BLE001
+            vc = None
+    if vc is None:
+        vc = np.tile(np.array([180, 180, 180, 255], np.uint8), (len(v), 1))
+    if vc.shape[1] == 3:
+        vc = np.concatenate([vc, np.full((len(v), 1), 255, vc.dtype)], 1)
+    return trimesh.Trimesh(vertices=v, faces=f, vertex_colors=vc[:, :4].astype(np.uint8), process=False)
+
+
 def load_mesh(path: str):
-    """Load any trimesh-readable file (glb/gltf/obj/ply) as a single Trimesh with per-vertex colours."""
+    """Load any trimesh-readable file (glb/gltf/obj/ply) as one Trimesh with per-vertex colours."""
     import trimesh
     obj = trimesh.load(path, force="scene")
+    geoms = []
     if isinstance(obj, trimesh.Scene):
-        geoms = []
-        for name, geom in obj.geometry.items():
-            if not isinstance(geom, trimesh.Trimesh) or geom.faces.shape[0] == 0:
-                continue
-            g = geom.copy()
-            try:
-                g.visual = g.visual.to_color()          # bake textures into vertex colours
-            except Exception:  # noqa: BLE001
-                pass
-            for node in obj.graph.nodes_geometry:
-                T, gname = obj.graph[node]
-                if gname == name:
-                    gg = g.copy(); gg.apply_transform(T); geoms.append(gg)
-        if not geoms:
-            raise ValueError("no triangle geometry")
-        mesh = trimesh.util.concatenate(geoms)
-    else:
-        mesh = obj
-        try:
-            mesh.visual = mesh.visual.to_color()
-        except Exception:  # noqa: BLE001
-            pass
+        for node in obj.graph.nodes_geometry:
+            T, gname = obj.graph[node]
+            geom = obj.geometry.get(gname)
+            if isinstance(geom, trimesh.Trimesh) and geom.faces.shape[0] > 0:
+                geoms.append(_geom_to_coloured(geom, T))
+    elif isinstance(obj, trimesh.Trimesh) and obj.faces.shape[0] > 0:
+        geoms.append(_geom_to_coloured(obj))
+    if not geoms:
+        raise ValueError("no triangle geometry")
+    mesh = geoms[0] if len(geoms) == 1 else trimesh.util.concatenate(geoms)
     if mesh.faces.shape[0] == 0:
         raise ValueError("empty mesh")
     return mesh
@@ -93,9 +118,9 @@ def splat_plane(pts, cols, normals, plane: str, res: int, margin: float = 0.05) 
     shade = 0.55 + 0.45 * np.abs(normals @ _VIEW_DIR[plane])
     shaded = np.clip(cols.astype(np.float32) * shade[:, None], 0, 255).astype(np.uint8)
     img = np.full((R, R, 3), 255, np.uint8)
-    # 3x3 neighbourhood splat closes sampling holes; nearest sample wins per pixel
-    for du in (-1, 0, 1):
-        for dv in (-1, 0, 1):
+    # 5-point cross splat closes sampling holes at 2x res; nearest sample wins per pixel
+    for du, dv in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+        if True:
             uu = np.clip(ui + du, 0, R - 1); vv = np.clip(vi + dv, 0, R - 1)
             lin = vv * R + uu
             order = np.lexsort((depth, lin))                  # by pixel, then far→near
@@ -107,7 +132,7 @@ def splat_plane(pts, cols, normals, plane: str, res: int, margin: float = 0.05) 
     return np.rint(small).astype(np.uint8)
 
 
-def render_object(mesh_path: str, out_dir: str, res: int = 256, n_points: int = 300_000) -> Dict[str, str]:
+def render_object(mesh_path: str, out_dir: str, res: int = 256, n_points: int = 200_000) -> Dict[str, str]:
     from PIL import Image
     mesh = load_mesh(mesh_path)
     pts, cols, normals = sample_coloured_points(mesh, n_points)
@@ -156,7 +181,7 @@ def main() -> int:
     ap.add_argument("meshes", nargs="+", help="mesh files (glb/gltf/obj/ply)")
     ap.add_argument("--out", required=True, help="dataset root; renders go to <out>/3d_objects/renders/<stem>/")
     ap.add_argument("--res", type=int, default=256)
-    ap.add_argument("--points", type=int, default=300_000)
+    ap.add_argument("--points", type=int, default=200_000)
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
     items = [(m, os.path.join(a.out, "3d_objects", "renders", os.path.splitext(os.path.basename(m))[0])) for m in a.meshes]
