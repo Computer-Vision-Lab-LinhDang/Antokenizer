@@ -32,8 +32,13 @@ PLANES = rt.PLANES
 HF_OBJAVERSE = "https://huggingface.co/datasets/allenai/objaverse/resolve/main/"
 
 
-def _fetch_one(uid, rel_path, glb_root, timeout_s, retries=2):
-    """Download one GLB to <glb_root>/hf-objaverse-v1/<rel_path> (atomic rename). Returns (uid, path|None)."""
+MAX_GLB_BYTES = 64 * 1024 * 1024     # a 256 px triplane render never needs a 360 MB model (seen: 360 MB @ 100 KB/s = 1 h stall)
+FILE_TIME_BUDGET_S = 240
+
+
+def _fetch_one(uid, rel_path, glb_root, timeout_s, retries=2, max_bytes=MAX_GLB_BYTES, budget_s=FILE_TIME_BUDGET_S):
+    """Download one GLB to <glb_root>/hf-objaverse-v1/<rel_path> (atomic rename). Returns (uid, path|None).
+    Skips files larger than max_bytes (Content-Length) and aborts a transfer exceeding budget_s."""
     import urllib.request
     dst = os.path.join(glb_root, "hf-objaverse-v1", rel_path)
     if os.path.exists(dst) and os.path.getsize(dst) > 0:
@@ -42,12 +47,25 @@ def _fetch_one(uid, rel_path, glb_root, timeout_s, retries=2):
     tmp = dst + ".part"
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(HF_OBJAVERSE + rel_path, timeout=timeout_s) as r, open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f, 1 << 20)
+            with urllib.request.urlopen(HF_OBJAVERSE + rel_path, timeout=timeout_s) as r:
+                clen = int(r.headers.get("Content-Length") or 0)
+                if clen > max_bytes:
+                    return uid, None                                    # too large: skip for good
+                t0 = time.time(); got = 0
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk); got += len(chunk)
+                        if got > max_bytes or time.time() - t0 > budget_s:
+                            raise TimeoutError(f"{uid[:8]}: {got/1e6:.0f} MB in {time.time()-t0:.0f}s — over budget")
             if os.path.getsize(tmp) > 0:
                 os.replace(tmp, dst)
                 return uid, dst
-        except Exception:  # noqa: BLE001  (404, timeout, reset — retry then give up)
+        except TimeoutError:
+            break                                                        # over budget: do not retry
+        except Exception:  # noqa: BLE001  (404, socket timeout, reset — retry then give up)
             time.sleep(1 + attempt)
     try:
         os.remove(tmp)
