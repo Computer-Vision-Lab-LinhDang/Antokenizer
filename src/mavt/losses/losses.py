@@ -7,7 +7,7 @@ receive proportionally more gradient.
 """
 
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -74,6 +74,40 @@ def infonce_loss(
 # --------------------------------------------------------------------------- #
 #  Vision-vision cosine distillation loss                                       #
 # --------------------------------------------------------------------------- #
+
+
+def pool_teacher_tokens(hidden: torch.Tensor, grid: Tuple[int, int]) -> torch.Tensor:
+    """Resample teacher patch tokens (B, Gt*Gt, D) onto the student grid (Hp, Wp) → (B, Hp*Wp, D).
+
+    SigLIP2-SO400M at 384/16 gives a 24×24 map; the student works on 16×16 at 256 px.
+    Bilinear (antialiased) resampling of the token map keeps each student token aligned
+    with the teacher's features at the same image location.
+    """
+    B, N, D = hidden.shape
+    g = int(round(N ** 0.5))
+    if g * g != N:
+        raise ValueError(f"teacher tokens must form a square grid, got N={N}")
+    Hp, Wp = grid
+    if (g, g) == (Hp, Wp):
+        return hidden
+    m = hidden.transpose(1, 2).reshape(B, D, g, g)
+    m = F.interpolate(m.float(), size=(Hp, Wp), mode="bilinear", align_corners=False, antialias=True)
+    return m.reshape(B, D, Hp * Wp).transpose(1, 2).to(hidden.dtype)
+
+
+def dense_distill_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+    """Per-token cosine distillation (REPA-style): 1 - mean_{b,n} cos(student[b,n], teacher[b,n]).
+
+    student : (B, N, D) backbone tokens (after the learnable dense projection)
+    teacher : (B, N, D) frozen teacher patch tokens resampled to the same grid (detached)
+    Supervises every token of the trunk directly — N× more signal per image than the
+    pooled cosine target, which the 2026-09-02 probe showed cannot make the trunk semantic.
+    """
+    if student.shape != teacher.shape:
+        raise ValueError(f"dense distill shape mismatch: student {tuple(student.shape)} vs teacher {tuple(teacher.shape)}")
+    cos = F.cosine_similarity(student.float(), teacher.detach().float(), dim=-1)
+    return 1.0 - cos.mean()
+
 
 def cosine_distill_loss(
     student: torch.Tensor,   # (B, D)
@@ -220,6 +254,7 @@ class MAVTLoss(nn.Module):
         w_aux: float  = 0.01,
         w_temp: float = 0.0,    # temporal consistency (video only); 0 = disabled
         w_vic: float  = 0.0,    # VICReg anti-collapse on the pooled semantic embedding
+        w_dense: float = 0.0,   # per-token cosine distillation of backbone tokens to teacher patch tokens
         distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
@@ -234,6 +269,7 @@ class MAVTLoss(nn.Module):
         self.w_aux  = w_aux
         self.w_temp = w_temp
         self.w_vic = w_vic
+        self.w_dense = w_dense
         self.distill_center = distill_center
         self.use_clip = use_clip
 
@@ -250,6 +286,8 @@ class MAVTLoss(nn.Module):
         semantic_embed: Optional[torch.Tensor] = None,
         text_embed: Optional[torch.Tensor] = None,
         teacher_embed: Optional[torch.Tensor] = None,
+        dense_student: Optional[torch.Tensor] = None,   # (B, N, D) backbone tokens (projected)
+        dense_teacher: Optional[torch.Tensor] = None,   # (B, N, D) teacher patch tokens on the student grid
     ) -> Dict[str, torch.Tensor]:
 
         # Reconstruction
@@ -283,6 +321,10 @@ class MAVTLoss(nn.Module):
         if self.w_vic > 0.0 and semantic_embed is not None:
             l_vic = vicreg_loss(semantic_embed)
 
+        l_dense = torch.tensor(0.0, device=pred.device)
+        if self.w_dense > 0.0 and dense_student is not None and dense_teacher is not None:
+            l_dense = dense_distill_loss(dense_student, dense_teacher)
+
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
 
@@ -299,6 +341,7 @@ class MAVTLoss(nn.Module):
             + self.w_aux * l_div
             + self.w_temp * l_temp
             + self.w_vic * l_vic
+            + self.w_dense * l_dense
         )
 
         return {
@@ -312,4 +355,5 @@ class MAVTLoss(nn.Module):
             'loss_div':   l_div,
             'loss_temp':  l_temp,
             'loss_vic':   l_vic,
+            'loss_dense': l_dense,
         }

@@ -41,6 +41,8 @@ model:
   use_semantic_distill: true
   distill_center: true              # match per-sample deviations, not the teacher mean
   w_vic: 0.05                       # VICReg anti-collapse on pooled embedding
+  w_dense: 0.5                      # per-token distillation: backbone tokens → SigLIP2 patch tokens (REPA-style)
+  semantic_content_only: true       # understanding head reads the 64 content slots only
   rgat_impl: flex                   # graph attention on FlexAttention (block-sparse)
   edge_plane_local: true            # spatial edges in each plane's own frame
   edge_cross_mode: projection       # cross-plane edges along the shared projection axis

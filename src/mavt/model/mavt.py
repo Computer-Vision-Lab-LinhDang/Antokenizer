@@ -41,6 +41,7 @@ class MAVTOutput:
     latent_positions: torch.Tensor     # (N_z, 4), content zeros + local detail centers
     latent_token_types: torch.Tensor    # (N_z,), 0=content, 1=detail
     semantic: torch.Tensor             # (B, semantic_dim)
+    backbone_tokens: torch.Tensor      # (B, N, D) trunk output before the content/detail split
     loss_kl: torch.Tensor
     cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
 
@@ -74,6 +75,7 @@ class MAVT(nn.Module):
         # RGAT
         r_s: int = 2,
         r_t: int = 1,
+        semantic_content_only: bool = False,
         rgat_impl: str = "dense",
         edge_plane_local: bool = False,
         edge_cross_mode: str = "shared_axis",
@@ -123,6 +125,7 @@ class MAVT(nn.Module):
             latent_dim=latent_dim, dec_dim=dec_dim,
             semantic_dim=semantic_dim, num_heads=8, num_layers=2,
             mlp_ratio=mlp_ratio,
+            content_only=semantic_content_only,
         )
 
     # ------------------------------------------------------------------ #
@@ -188,7 +191,7 @@ class MAVT(nn.Module):
 
         # Stage 5a — Understanding head: z → semantic
         # Always run (cheap, gives semantic supervision signal even when decode=False)
-        semantic = self.understanding_decoder(z)
+        semantic = self.understanding_decoder(z, latent_token_types)
 
         # Stage 5b — Reconstruction head: z → pixel
         if decode:
@@ -208,6 +211,7 @@ class MAVT(nn.Module):
             latent_positions=latent_positions,
             latent_token_types=latent_token_types,
             semantic=semantic,
+            backbone_tokens=features,
             loss_kl=loss_kl,
             cd_metrics=cd_metrics,
         )

@@ -467,8 +467,13 @@ class UnderstandingDecoder(nn.Module):
         num_heads: int = 8,
         num_layers: int = 2,
         mlp_ratio: float = 4.0,
+        content_only: bool = False,
     ):
         super().__init__()
+        # content_only: read only the content slots (token_type 0). The 2026-09-02 probe
+        # showed the head pooling over 256 non-semantic detail tokens loses information
+        # (kNN 0.378 on content-mu → 0.335 at the head output).
+        self.content_only = content_only
         self.in_proj = nn.Linear(latent_dim, dec_dim)
         self.norm_in = nn.LayerNorm(dec_dim)
 
@@ -485,8 +490,12 @@ class UnderstandingDecoder(nn.Module):
         self.norm_out = nn.LayerNorm(dec_dim)
         self.proj = nn.Linear(dec_dim, semantic_dim)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, Nz, latent_dim) → semantic: (B, semantic_dim)"""
+    def forward(self, z: torch.Tensor, token_types: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """z: (B, Nz, latent_dim), token_types: (Nz,) 0=content/1=detail → semantic: (B, semantic_dim)"""
+        if self.content_only and token_types is not None:
+            keep = token_types == 0
+            if keep.any():
+                z = z[:, keep]
         x = self.norm_in(self.in_proj(z))
         for blk in self.self_attn_blocks:
             x = blk(x)

@@ -19,7 +19,7 @@ import lightning as L
 from lightning.pytorch.utilities import grad_norm
 
 from mavt.model.mavt import MAVT
-from mavt.losses.losses import MAVTLoss
+from mavt.losses.losses import MAVTLoss, pool_teacher_tokens
 
 
 _STAGE_LR = {1: 1e-4, 2: 5e-5, 3: 2e-5}
@@ -63,6 +63,7 @@ class MAVTLightningModule(L.LightningModule):
         w_aux: float = 0.01,
         w_temp: float = 0.0,    # temporal consistency weight (video only)
         w_vic: float = 0.0,     # VICReg anti-collapse on pooled embedding
+        w_dense: float = 0.0,   # per-token distillation of backbone tokens → teacher patch tokens (image)
         distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool = False,
@@ -73,6 +74,7 @@ class MAVTLightningModule(L.LightningModule):
         init_siglip2: bool = True,
         init_siglip2_patchify: bool = False,   # inherit Conv2d kernel + 24x24 pos table
         use_semantic_distill: bool = True,
+        semantic_content_only: bool = False,  # understanding head reads content slots only
         # Cross-stage weight transfer (loads model weights only, NOT optimizer
         # / scheduler / step state — use --ckpt_path for true resume instead).
         init_from_ckpt: Optional[str] = None,
@@ -95,6 +97,7 @@ class MAVTLightningModule(L.LightningModule):
             patch_size=patch_size, t_patch=t_patch,
             latent_dim=latent_dim, kl_weight=kl_weight,
             semantic_dim=semantic_dim, dec_dim=dec_dim,
+            semantic_content_only=semantic_content_only,
             num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
             rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
             edge_cross_mode=edge_cross_mode,
@@ -108,10 +111,18 @@ class MAVTLightningModule(L.LightningModule):
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
-            w_temp=w_temp, w_vic=w_vic, distill_center=distill_center,
+            w_temp=w_temp, w_vic=w_vic, w_dense=w_dense, distill_center=distill_center,
             use_lpips=use_lpips, use_clip=use_clip,
             active_modalities=_active_mods,
         )
+
+        # Learnable projection for dense distillation (identity init; lets the trunk keep its
+        # own basis while matching the teacher's patch features up to a linear map).
+        self.dense_proj: Optional[nn.Linear] = None
+        if w_dense > 0.0:
+            self.dense_proj = nn.Linear(embed_dim, embed_dim)
+            with torch.no_grad():
+                self.dense_proj.weight.copy_(torch.eye(embed_dim)); self.dense_proj.bias.zero_()
 
         # Frozen vision teacher (loaded lazily in setup() to keep __init__ light)
         self.semantic_teacher: Optional[nn.Module] = None
@@ -279,10 +290,17 @@ class MAVTLightningModule(L.LightningModule):
 
         # Vision-vision distillation: forward x_proxy through frozen teacher.
         teacher_embed: Optional[torch.Tensor] = None
+        dense_student = dense_teacher = None
         if self.semantic_teacher is not None:
             with torch.no_grad():
                 proxy = self._make_teacher_input(x, modality, self._teacher_image_size)
-                teacher_embed = self.semantic_teacher(pixel_values=proxy).pooler_output
+                t_out = self.semantic_teacher(pixel_values=proxy)
+                teacher_embed = t_out.pooler_output
+                if self.dense_proj is not None and modality == 'image':
+                    grid = self.model._grid_shape(modality, x)
+                    dense_teacher = pool_teacher_tokens(t_out.last_hidden_state, grid)
+            if dense_teacher is not None:
+                dense_student = self.dense_proj(out.backbone_tokens)
 
         losses = self.loss_fn(
             pred=out.reconstruction,
@@ -292,6 +310,8 @@ class MAVTLightningModule(L.LightningModule):
             modality=modality,
             semantic_embed=out.semantic,
             teacher_embed=teacher_embed,
+            dense_student=dense_student,
+            dense_teacher=dense_teacher,
         )
 
         # Logging — aggregate (all modalities combined)
