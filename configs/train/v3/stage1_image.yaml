@@ -59,7 +59,7 @@ model:
 
 data:
   active_modalities: [image]
-  image_manifest: data/manifests/openimages.jsonl
+  image_manifest: data/manifests/openimages_v2.jsonl   # scan-verified (check_data.py), w/h/mode enriched
   image_resolution: 256
   batch_size: 160                   # per GPU x 8 = 1280 effective
   num_workers: 16

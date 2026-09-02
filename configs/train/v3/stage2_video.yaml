@@ -58,11 +58,12 @@ model:
 
 data:
   active_modalities: [image, video]
-  image_manifest: data/manifests/openimages.jsonl
-  video_manifest: data/manifests/webvid_clean.jsonl   # 177k decode-verified clips (raw manifest is 93% HTML junk)
+  image_manifest: data/manifests/openimages_v2.jsonl   # scan-verified (check_data.py), w/h/mode enriched
+  video_manifest: data/manifests/openvid_v2.jsonl      # 35,105 OpenVid clips, scan-verified, <16-frame dropped, csv motion/aesthetic joined
   image_resolution: 256
   video_resolution: 256
   video_frames: 8
+  video_frame_stride: 2             # contiguous window: 8 frames = 16 source frames ~0.67 s @24fps
   batch_size: 16
   num_workers: 8
   pin_memory: true
