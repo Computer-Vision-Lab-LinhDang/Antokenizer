@@ -75,3 +75,17 @@ def test_degenerate_visuals_fall_back_instead_of_raising():
     m = rt._geom_to_coloured(Geom(), np.eye(4))
     assert m.vertices.shape == box.vertices.shape and m.visual.vertex_colors.shape == (len(box.vertices), 4)
     assert (m.visual.vertex_colors[:, :3] == 180).all()          # grey fallback
+
+
+def test_sparse_sampling_leaves_no_speckle_inside_flat_surfaces(tmp_path):
+    """A dark box seen face-on with few sample points: interior must not show background speckle."""
+    glb = tmp_path / "dark.glb"
+    box = trimesh.creation.box(extents=(1.0, 1.0, 0.1))
+    box.visual.vertex_colors = np.tile(np.array([20, 20, 20, 255], np.uint8), (len(box.vertices), 1))
+    box.export(str(glb))
+    w = rt.render_object(str(glb), str(tmp_path / "ds/3d_objects/renders/dark"), res=128, n_points=15_000)
+    from PIL import Image
+    im = np.asarray(Image.open(w["oxoy"]).convert("RGB"))
+    inner = im[40:88, 40:88]                                  # well inside the face
+    speckle = (inner > 200).all(-1).mean()
+    assert speckle < 0.01, f"background speckle inside surface: {speckle:.3f}"

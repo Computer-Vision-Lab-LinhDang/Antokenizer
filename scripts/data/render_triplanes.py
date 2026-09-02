@@ -128,8 +128,36 @@ def splat_plane(pts, cols, normals, plane: str, res: int, margin: float = 0.05) 
             last = np.r_[lin_s[1:] != lin_s[:-1], True]       # last (nearest) sample per pixel
             sel = order[last]
             img.reshape(-1, 3)[lin[sel]] = shaded[sel]
+    img = fill_holes(img, passes=2)
     small = img.reshape(res, 2, res, 2, 3).mean(axis=(1, 3))
     return np.rint(small).astype(np.uint8)
+
+
+def fill_holes(img: np.ndarray, passes: int = 2, min_neighbours: int = 5) -> np.ndarray:
+    """Fill background pixels that are surrounded by ≥ min_neighbours foreground pixels (3x3)
+    with the mean colour of those neighbours. Removes the white speckle that sparse point
+    sampling leaves on large flat surfaces (dark objects showed it most)."""
+    out = img.copy()
+    for _ in range(passes):
+        fg = (out < 255).any(-1)
+        if fg.all() or not fg.any():
+            return out
+        pad = np.pad(out.astype(np.float32), ((1, 1), (1, 1), (0, 0)), mode="edge")
+        fpad = np.pad(fg, 1, mode="edge")
+        acc = np.zeros(out.shape, np.float32); cnt = np.zeros(out.shape[:2], np.float32)
+        H, W = fg.shape
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                m = fpad[1 + dy: 1 + dy + H, 1 + dx: 1 + dx + W]
+                acc += pad[1 + dy: 1 + dy + H, 1 + dx: 1 + dx + W] * m[..., None]
+                cnt += m
+        holes = (~fg) & (cnt >= min_neighbours)
+        if not holes.any():
+            return out
+        out[holes] = np.rint(acc[holes] / cnt[holes][:, None]).astype(np.uint8)
+    return out
 
 
 def render_object(mesh_path: str, out_dir: str, res: int = 256, n_points: int = 200_000) -> Dict[str, str]:
