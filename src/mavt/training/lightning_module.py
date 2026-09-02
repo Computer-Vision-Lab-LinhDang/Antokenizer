@@ -314,22 +314,32 @@ class MAVTLightningModule(L.LightningModule):
             dense_teacher=dense_teacher,
         )
 
-        # Logging — aggregate (all modalities combined)
-        for k, v in losses.items():
+        self._log_losses(losses, out.cd_metrics, modality, log_prefix)
+        return losses['loss']
+
+    def _log_losses(self, losses: Dict[str, torch.Tensor], cd_metrics: Dict[str, torch.Tensor],
+                    modality: str, log_prefix: str) -> None:
+        """Log aggregate metrics with a cross-rank reduction and per-modality metrics rank-locally.
+
+        Under DDP each rank trains its own single-modality batch, so a key such as
+        ``loss_l1_video`` exists on some ranks and not others at the same step. With
+        ``sync_dist=True`` every rank issues one all-reduce per logged key; different key
+        sets → the collectives pair up wrongly (silently mixed numbers) or their counts
+        differ (validation with a modality missing on a rank) → **deadlock**. The 3-modality
+        Stage-3 run hung at its first validation exactly this way (2026-09-02). Only keys that
+        every rank logs on every step may use sync_dist=True.
+        """
+        for k, v in losses.items():                       # same key set on every rank
             self.log(f'{log_prefix}/{k}', v, on_step=True, on_epoch=True,
                      prog_bar=(k == 'loss'), sync_dist=True)
-        # Per-modality breakdown (diagnose image vs video separately)
-        for k in ('loss', 'loss_recon', 'loss_l1', 'loss_kl'):
+        for k in ('loss', 'loss_recon', 'loss_l1', 'loss_kl'):   # modality-specific → rank-local
             if k in losses:
                 self.log(f'{log_prefix}/{k}_{modality}', losses[k],
-                         on_step=True, on_epoch=True, sync_dist=True)
-        for k, v in out.cd_metrics.items():
-            self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True,
-                     sync_dist=True)
+                         on_step=True, on_epoch=True, sync_dist=False)
+        for k, v in cd_metrics.items():                   # values depend on the modality → rank-local
+            self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True, sync_dist=False)
         self.log(f'{log_prefix}/modality_{modality}', 1.0,
                  on_step=False, on_epoch=True, sync_dist=False)
-
-        return losses['loss']
 
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         return self._step(batch, 'train')
