@@ -29,10 +29,10 @@ class StandardTransformerBlock(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.attn_drop = nn.Dropout(dropout)
 
-        mlp_dim = int(dim * mlp_ratio)
+        mlp_dim = round(dim * mlp_ratio)   # e.g. 1152*4304/1152 -> 4304 exactly (SigLIP2 SO400M)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
-            nn.GELU(),
+            nn.GELU(approximate='tanh'),      # SigLIP2 uses gelu_pytorch_tanh
             nn.Dropout(dropout),
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),

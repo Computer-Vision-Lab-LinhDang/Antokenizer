@@ -19,7 +19,7 @@ import lightning as L
 from lightning.pytorch.utilities import grad_norm
 
 from mavt.model.mavt import MAVT
-from mavt.losses.losses import MAVTLoss
+from mavt.losses.losses import MAVTLoss, pool_teacher_tokens
 
 
 _STAGE_LR = {1: 1e-4, 2: 5e-5, 3: 2e-5}
@@ -45,6 +45,9 @@ class MAVTLightningModule(L.LightningModule):
         num_dec_attn_blocks: int = 4,
         r_s: int = 2,
         r_t: int = 1,
+        rgat_impl: str = "dense",             # dense | sparse | flex (graph attention)
+        edge_plane_local: bool = False,
+        edge_cross_mode: str = "shared_axis",
         use_gradient_checkpointing: bool = True,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -59,14 +62,19 @@ class MAVTLightningModule(L.LightningModule):
         w_sem: float = 0.0,
         w_aux: float = 0.01,
         w_temp: float = 0.0,    # temporal consistency weight (video only)
+        w_vic: float = 0.0,     # VICReg anti-collapse on pooled embedding
+        w_dense: float = 0.0,   # per-token distillation of backbone tokens → teacher patch tokens (image)
+        distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool = False,
         active_modalities: list = None,  # e.g. ['image', 'video']; None → all three
         # Curriculum
         training_stage: int = 1,
-        siglip2_model_name: str = "google/siglip2-base-patch16-224",
+        siglip2_model_name: str = "google/siglip2-so400m-patch16-384",
         init_siglip2: bool = True,
-        use_semantic_distill: bool = False,
+        init_siglip2_patchify: bool = False,   # inherit Conv2d kernel + 24x24 pos table
+        use_semantic_distill: bool = True,
+        semantic_content_only: bool = False,  # understanding head reads content slots only
         # Cross-stage weight transfer (loads model weights only, NOT optimizer
         # / scheduler / step state — use --ckpt_path for true resume instead).
         init_from_ckpt: Optional[str] = None,
@@ -75,16 +83,24 @@ class MAVTLightningModule(L.LightningModule):
         grad_clip: float = 1.0,
         warmup_steps: int = 1000,
         total_steps: int = 200_000,
+        lr: Optional[float] = None,          # override the per-stage default LR
     ):
         super().__init__()
-        self.save_hyperparameters()
+        # active_modalities is owned by the DataModule (single source of truth);
+        # keeping it out of the model hparams avoids Lightning's duplicate-key
+        # merge error when both modules would log it with different values.
+        self.save_hyperparameters(ignore=["active_modalities"])
+        self._active_modalities_cfg = tuple(active_modalities) if active_modalities else None
 
         self.model = MAVT(
             embed_dim=embed_dim, num_heads=num_heads, num_blocks=num_blocks,
             patch_size=patch_size, t_patch=t_patch,
             latent_dim=latent_dim, kl_weight=kl_weight,
             semantic_dim=semantic_dim, dec_dim=dec_dim,
+            semantic_content_only=semantic_content_only,
             num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
+            rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
+            edge_cross_mode=edge_cross_mode,
             use_gradient_checkpointing=use_gradient_checkpointing,
             mlp_ratio=mlp_ratio, dropout=dropout,
             local_detail_window_size=local_detail_window_size,
@@ -95,10 +111,18 @@ class MAVTLightningModule(L.LightningModule):
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
-            w_temp=w_temp,
+            w_temp=w_temp, w_vic=w_vic, w_dense=w_dense, distill_center=distill_center,
             use_lpips=use_lpips, use_clip=use_clip,
             active_modalities=_active_mods,
         )
+
+        # Learnable projection for dense distillation (identity init; lets the trunk keep its
+        # own basis while matching the teacher's patch features up to a linear map).
+        self.dense_proj: Optional[nn.Linear] = None
+        if w_dense > 0.0:
+            self.dense_proj = nn.Linear(embed_dim, embed_dim)
+            with torch.no_grad():
+                self.dense_proj.weight.copy_(torch.eye(embed_dim)); self.dense_proj.bias.zero_()
 
         # Frozen vision teacher (loaded lazily in setup() to keep __init__ light)
         self.semantic_teacher: Optional[nn.Module] = None
@@ -119,7 +143,8 @@ class MAVTLightningModule(L.LightningModule):
         self._sync_ema_modalities()
         if hp.init_siglip2:
             frozen = _STAGE_SIGLIP2_FROZEN_BLOCKS[hp.training_stage]
-            self.model.load_siglip2_weights(hp.siglip2_model_name, frozen)
+            self.model.load_siglip2_weights(hp.siglip2_model_name, frozen, strict=True,
+                                            init_patchify=hp.init_siglip2_patchify)
         if hp.use_semantic_distill and self.semantic_teacher is None:
             self._load_semantic_teacher(hp.siglip2_model_name)
         # Cross-stage weight transfer (after siglip2 / teacher are in place so
@@ -192,7 +217,7 @@ class MAVTLightningModule(L.LightningModule):
                 self.loss_fn.ema_weighter.active_modalities = tuple(active)
                 return
         # Fallback: use model config param if DataModule not available
-        fallback = getattr(self.hparams, 'active_modalities', None)
+        fallback = self._active_modalities_cfg
         if fallback:
             self.loss_fn.ema_weighter.active_modalities = tuple(fallback)
 
@@ -211,9 +236,9 @@ class MAVTLightningModule(L.LightningModule):
             except AttributeError:
                 self._teacher_image_size = 224
         except Exception as exc:  # noqa: BLE001
-            print(f"[lightning_module] semantic teacher load failed ({exc}); "
-                  f"distillation disabled this run")
-            self.semantic_teacher = None
+            # use_semantic_distill was requested: failing loud beats silently training
+            # without the objective the whole design depends on.
+            raise RuntimeError(f"semantic teacher {model_name!r} failed to load: {exc}") from exc
 
     def train(self, mode: bool = True):  # type: ignore[override]
         """Keep frozen teacher in eval mode regardless of train()/eval() calls."""
@@ -258,20 +283,24 @@ class MAVTLightningModule(L.LightningModule):
 
         out = self.model(x, modality, decode=True)
 
-        # For video: decoder reconstructs in patch-grid temporal space (Tp = T//t_patch).
-        # Target must match. Use first frame of each temporal patch group.
-        if modality == 'video':
-            t_patch = self.hparams.t_patch
-            target = x[:, :, ::t_patch]  # (B, 3, Tp, H, W)
-        else:
-            target = x  # image and threed pass through as-is
+        # The decoder now returns the full input shape for every modality (video:
+        # every frame via temporal expansion; 3D: all three planes). Any mismatch
+        # is a bug and MAVTLoss raises instead of aligning silently.
+        target = x
 
         # Vision-vision distillation: forward x_proxy through frozen teacher.
         teacher_embed: Optional[torch.Tensor] = None
+        dense_student = dense_teacher = None
         if self.semantic_teacher is not None:
             with torch.no_grad():
                 proxy = self._make_teacher_input(x, modality, self._teacher_image_size)
-                teacher_embed = self.semantic_teacher(pixel_values=proxy).pooler_output
+                t_out = self.semantic_teacher(pixel_values=proxy)
+                teacher_embed = t_out.pooler_output
+                if self.dense_proj is not None and modality == 'image':
+                    grid = self.model._grid_shape(modality, x)
+                    dense_teacher = pool_teacher_tokens(t_out.last_hidden_state, grid)
+            if dense_teacher is not None:
+                dense_student = self.dense_proj(out.backbone_tokens)
 
         losses = self.loss_fn(
             pred=out.reconstruction,
@@ -281,24 +310,36 @@ class MAVTLightningModule(L.LightningModule):
             modality=modality,
             semantic_embed=out.semantic,
             teacher_embed=teacher_embed,
+            dense_student=dense_student,
+            dense_teacher=dense_teacher,
         )
 
-        # Logging — aggregate (all modalities combined)
-        for k, v in losses.items():
+        self._log_losses(losses, out.cd_metrics, modality, log_prefix)
+        return losses['loss']
+
+    def _log_losses(self, losses: Dict[str, torch.Tensor], cd_metrics: Dict[str, torch.Tensor],
+                    modality: str, log_prefix: str) -> None:
+        """Log aggregate metrics with a cross-rank reduction and per-modality metrics rank-locally.
+
+        Under DDP each rank trains its own single-modality batch, so a key such as
+        ``loss_l1_video`` exists on some ranks and not others at the same step. With
+        ``sync_dist=True`` every rank issues one all-reduce per logged key; different key
+        sets → the collectives pair up wrongly (silently mixed numbers) or their counts
+        differ (validation with a modality missing on a rank) → **deadlock**. The 3-modality
+        Stage-3 run hung at its first validation exactly this way (2026-09-02). Only keys that
+        every rank logs on every step may use sync_dist=True.
+        """
+        for k, v in losses.items():                       # same key set on every rank
             self.log(f'{log_prefix}/{k}', v, on_step=True, on_epoch=True,
                      prog_bar=(k == 'loss'), sync_dist=True)
-        # Per-modality breakdown (diagnose image vs video separately)
-        for k in ('loss', 'loss_recon', 'loss_l1', 'loss_kl'):
+        for k in ('loss', 'loss_recon', 'loss_l1', 'loss_kl'):   # modality-specific → rank-local
             if k in losses:
                 self.log(f'{log_prefix}/{k}_{modality}', losses[k],
-                         on_step=True, on_epoch=True, sync_dist=True)
-        for k, v in out.cd_metrics.items():
-            self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True,
-                     sync_dist=True)
+                         on_step=True, on_epoch=True, sync_dist=False)
+        for k, v in cd_metrics.items():                   # values depend on the modality → rank-local
+            self.log(f'{log_prefix}/cd_{k}', v, on_step=False, on_epoch=True, sync_dist=False)
         self.log(f'{log_prefix}/modality_{modality}', 1.0,
                  on_step=False, on_epoch=True, sync_dist=False)
-
-        return losses['loss']
 
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         return self._step(batch, 'train')
@@ -387,7 +428,7 @@ class MAVTLightningModule(L.LightningModule):
 
     def configure_optimizers(self):
         hp = self.hparams
-        lr = _STAGE_LR[hp.training_stage]
+        lr = hp.lr if hp.lr is not None else _STAGE_LR[hp.training_stage]
 
         # Separate RGAT params for potential different LR (currently same LR)
         rgat_params, other_params = [], []
@@ -405,11 +446,22 @@ class MAVTLightningModule(L.LightningModule):
 
         optimizer = torch.optim.AdamW(param_groups, weight_decay=hp.weight_decay)
 
-        # Linear warmup + cosine decay
+        # Linear warmup + cosine decay over the *actual* run length. `trainer.max_steps`
+        # is what this invocation asked for; `hp.total_steps` can be stale when a run is
+        # resumed with --ckpt_path (hparams come back from the checkpoint), which once
+        # continued a 5k run to 10k at lr ~1e-9.
+        total_steps = hp.total_steps
+        max_steps = getattr(getattr(self, "_trainer", None), "max_steps", -1)
+        if isinstance(max_steps, int) and max_steps > 0:
+            total_steps = max_steps
+        if total_steps != hp.total_steps:
+            print(f"[configure_optimizers] LR schedule length = trainer.max_steps={total_steps} "
+                  f"(hparam total_steps={hp.total_steps} ignored)", flush=True)
+
         def lr_lambda(step: int) -> float:
             if step < hp.warmup_steps:
                 return step / max(1, hp.warmup_steps)
-            progress = (step - hp.warmup_steps) / max(1, hp.total_steps - hp.warmup_steps)
+            progress = (step - hp.warmup_steps) / max(1, total_steps - hp.warmup_steps)
             return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress)).item()))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

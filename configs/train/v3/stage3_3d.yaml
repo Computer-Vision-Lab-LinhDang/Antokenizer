@@ -1,0 +1,76 @@
+# MAVT v3 — Stage 3: image + video + 3D (triplane) jointly. Soft-restart from the Stage-1 window-1
+# checkpoint (INIT_CKPT). Launch: STAGE=3 INIT_CKPT=<s1_w1 ckpt> BATCH=32 GPUS=4 ./deepseek
+trainer:
+  max_steps: 10000
+  devices: auto
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+  log_every_n_steps: 10
+  check_val_every_n_epoch: null
+  val_check_interval: 1000
+  limit_val_batches: 24
+  enable_checkpointing: true
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
+      gradient_as_bucket_view: true
+  use_distributed_sampler: false      # ModalityGroupedBatchSampler shards per rank itself
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar
+
+model:
+  training_stage: 3                   # all SigLIP2-initialised blocks trainable
+  embed_dim: 1152
+  num_heads: 16
+  mlp_ratio: 3.7361111111111112
+  semantic_dim: 1152
+  local_detail_window_size: 1         # same detail budget as s1_w1 (PSNR 28 dB); video/3D inherit it
+  local_detail_temporal_window_size: 1
+  t_patch: 2
+  init_siglip2: true
+  init_siglip2_patchify: true
+  siglip2_model_name: google/siglip2-so400m-patch16-384
+  use_semantic_distill: true          # teacher proxy: image as-is / video middle frame / 3D XY plane
+  distill_center: true
+  w_vic: 0.05
+  w_dense: 0.0
+  semantic_content_only: false
+  rgat_impl: flex
+  edge_plane_local: true
+  edge_cross_mode: projection
+  use_gradient_checkpointing: false
+  w_l1: 1.0
+  w_lpips: 0.25
+  w_kl: 1.0
+  w_sem: 0.3
+  w_aux: 0.01
+  w_temp: 0.1                         # temporal consistency on video reconstructions
+  use_lpips: true
+  lr: 5.0e-5                          # fine-tune from s1_w1@10k with two new modalities
+  warmup_steps: 500
+  total_steps: 10000
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+data:
+  active_modalities: [image, video, threed]
+  image_manifest: data/manifests/openimages_v2.jsonl
+  video_manifest: data/manifests/openvid_v2.jsonl
+  universal_data_root: data/datasets/objaverse_lvis   # threed: <root>/3d_objects/renders/<uid>/{oxoy,oxoz,oyoz}.png + captions/3d.json
+  image_resolution: 256
+  video_resolution: 256
+  triplane_res: 256
+  video_frames: 8
+  video_frame_stride: 2
+  batch_size: 32                      # image (per GPU); overridden per modality below
+  modality_batch_sizes: {video: 8, threed: 8}      # video = 4x image tokens, 3D = 3 planes
+  modality_weights: {image: 0.5, video: 0.35, threed: 0.15}
+  num_workers: 12
+  loader_timeout: 900                 # a stuck decode raises after 15 min instead of hanging the DDP group
+  pin_memory: true
+  val_split: 0.002
+  test_split: 0.0

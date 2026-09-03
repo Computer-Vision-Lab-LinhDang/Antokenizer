@@ -3,10 +3,10 @@
 from __future__ import annotations
 import os
 import random
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Sequence
 
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, DistributedSampler, Sampler, random_split
 import lightning as L
 
 from pathlib import Path
@@ -18,6 +18,8 @@ from mavt.data.datasets import (
     UniversalThreeDDataset,
     WDSImageDataset,
     ShardVideoDataset,
+    ManifestImageDataset,
+    ManifestVideoDataset,
 )
 
 
@@ -47,7 +49,19 @@ class ModalityGroupedBatchSampler(Sampler):
     """
 
     def __init__(self, concat_dataset: ConcatDataset, batch_size: int,
-                 drop_last: bool = True, shuffle: bool = True):
+                 drop_last: bool = True, shuffle: bool = True,
+                 modalities: Optional[Sequence[str]] = None,
+                 modality_batch_sizes: Optional[Dict[str, int]] = None,
+                 modality_weights: Optional[Dict[str, float]] = None):
+        """
+        batch_size           : default batch size (per modality unless overridden)
+        modalities           : name of each sub-dataset, in ConcatDataset order
+        modality_batch_sizes : per-modality override, e.g. {"video": 8, "threed": 8}
+        modality_weights     : share of batches per modality, e.g. {"image": .5, "video": .35, "threed": .15}.
+                               The epoch length is set by the modality that would be under-sampled
+                               most (max over n_batches/weight); smaller modalities are oversampled
+                               (re-shuffled and re-chunked) to reach their share. None = proportional.
+        """
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle = shuffle
@@ -59,6 +73,44 @@ class ModalityGroupedBatchSampler(Sampler):
             n = len(ds)
             self.groups.append(list(range(offset, offset + n)))
             offset += n
+        self.modalities = list(modalities) if modalities else [f"ds{i}" for i in range(len(self.groups))]
+        if len(self.modalities) != len(self.groups):
+            raise ValueError(f"{len(self.modalities)} modality names for {len(self.groups)} datasets")
+        mbs = modality_batch_sizes or {}
+        self.batch_sizes = [int(mbs.get(m, batch_size)) for m in self.modalities]
+        self.weights: Optional[List[float]] = None
+        if modality_weights:
+            w = [float(modality_weights.get(m, 0.0)) for m in self.modalities]
+            if min(w) <= 0:
+                raise ValueError(f"modality_weights must be > 0 for every active modality: {modality_weights}")
+            tot = sum(w); self.weights = [x / tot for x in w]
+
+    def _natural_counts(self) -> List[int]:
+        """Batches per modality when each dataset is seen exactly once."""
+        out = []
+        for indices, bs in zip(self.groups, self.batch_sizes):
+            n = len(indices) // bs if self.drop_last else -(-len(indices) // bs)
+            out.append(n)
+        return out
+
+    def _target_counts(self) -> List[int]:
+        nat = self._natural_counts()
+        if not self.weights:
+            return nat
+        total = max(n / w for n, w in zip(nat, self.weights))
+        return [int(round(w * total)) for w in self.weights]
+
+    def _chunk(self, indices: List[int], bs: int) -> List[List[int]]:
+        idx = indices[:]
+        if self.shuffle:
+            random.shuffle(idx)
+        out = []
+        for start in range(0, len(idx), bs):
+            batch = idx[start: start + bs]
+            if self.drop_last and len(batch) < bs:
+                continue
+            out.append(batch)
+        return out
 
     @staticmethod
     def _dist_info() -> tuple:
@@ -68,18 +120,25 @@ class ModalityGroupedBatchSampler(Sampler):
         return 0, 1
 
     def _make_batches(self) -> List[List[int]]:
-        all_batches: List[List[int]] = []
-        for indices in self.groups:
-            idx = indices[:]
-            if self.shuffle:
-                random.shuffle(idx)
-            for start in range(0, len(idx), self.batch_size):
-                batch = idx[start: start + self.batch_size]
-                if self.drop_last and len(batch) < self.batch_size:
-                    continue
-                all_batches.append(batch)
+        per_mod: List[List[List[int]]] = []
+        for indices, bs, target in zip(self.groups, self.batch_sizes, self._target_counts()):
+            if not indices or target <= 0:
+                continue
+            batches = self._chunk(indices, bs)
+            while len(batches) < target:                     # oversample: fresh shuffle + re-chunk
+                batches.extend(self._chunk(indices, bs))
+            per_mod.append(batches[:target])
         if self.shuffle:
+            all_batches = [b for batches in per_mod for b in batches]
             random.shuffle(all_batches)
+            return all_batches
+        # Deterministic (validation): interleave modalities round-robin so that
+        # limit_val_batches / per-rank slicing never drops a whole modality.
+        all_batches = []
+        for i in range(max(len(b) for b in per_mod)):
+            for batches in per_mod:
+                if i < len(batches):
+                    all_batches.append(batches[i])
         return all_batches
 
     def __iter__(self) -> Iterator[List[int]]:
@@ -97,12 +156,8 @@ class ModalityGroupedBatchSampler(Sampler):
         # If DDP not yet initialised (e.g. called during DataLoader construction),
         # fall back to WORLD_SIZE env var so the length matches what __iter__ yields.
         if world_size == 1:
-            world_size = int(os.environ.get('WORLD_SIZE', 1))
-        total = sum(
-            len(g) // self.batch_size if self.drop_last
-            else (len(g) + self.batch_size - 1) // self.batch_size
-            for g in self.groups
-        )
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        total = sum(self._target_counts())
         return total // world_size
 
 
@@ -126,10 +181,17 @@ class MAVTDataModule(L.LightningDataModule):
         # Per-modality shard roots (override universal_data_root when set)
         image_shards_dir: Optional[str] = None,
         video_shards_dir: Optional[str] = None,
+        # Manifest-backed datasets (.jsonl from mavt.data.manifest) — highest precedence
+        image_manifest: Optional[str] = None,
+        video_manifest: Optional[str] = None,
         video_max_shards: Optional[int] = None,
         # Data params
         image_resolution: int = 256,
         video_frames: int = 16,
+        video_frame_stride: int = 2,
+        modality_batch_sizes: Optional[Dict[str, int]] = None,   # e.g. {video: 8, threed: 8}
+        loader_timeout: int = 0,          # seconds a rank waits for a worker batch before raising (0 = forever)
+        modality_weights: Optional[Dict[str, float]] = None,     # e.g. {image: .5, video: .35, threed: .15}
         video_resolution: int = 256,
         triplane_res: int = 256,
         # Synthetic (smoke test)
@@ -151,6 +213,11 @@ class MAVTDataModule(L.LightningDataModule):
 
     def _make_dataset(self, modality: str) -> Dataset:
         hp = self.hparams
+        if modality == 'image' and hp.image_manifest:
+            return ManifestImageDataset(hp.image_manifest, hp.image_resolution)
+        if modality == 'video' and hp.video_manifest:
+            return ManifestVideoDataset(hp.video_manifest, hp.video_frames, hp.video_resolution,
+                                        frame_stride=hp.video_frame_stride)
         # Per-modality shard roots take precedence over universal_data_root
         if modality == 'image' and hp.image_shards_dir:
             return WDSImageDataset(hp.image_shards_dir, hp.image_resolution)
@@ -207,6 +274,8 @@ class MAVTDataModule(L.LightningDataModule):
             self._train_ds = ConcatDataset(train_splits)
             self._batch_sampler = ModalityGroupedBatchSampler(
                 self._train_ds, hp.batch_size,
+                modalities=list(hp.active_modalities),
+                modality_batch_sizes=hp.modality_batch_sizes, modality_weights=hp.modality_weights,
                 drop_last=True, shuffle=True,
             )
 
@@ -218,6 +287,7 @@ class MAVTDataModule(L.LightningDataModule):
             self._val_batch_sampler = ModalityGroupedBatchSampler(
                 self._val_ds, hp.batch_size,
                 drop_last=False, shuffle=False,
+                modalities=list(hp.active_modalities), modality_batch_sizes=hp.modality_batch_sizes,
             )
 
         if test_splits:
@@ -241,6 +311,8 @@ class MAVTDataModule(L.LightningDataModule):
             kw['persistent_workers'] = bool(hp.persistent_workers)
             if hp.prefetch_factor is not None:
                 kw['prefetch_factor'] = int(hp.prefetch_factor)
+            if hp.loader_timeout and hp.loader_timeout > 0:
+                kw['timeout'] = int(hp.loader_timeout)   # a hung worker must fail loudly, not stall the DDP group
         return kw
 
     def train_dataloader(self) -> DataLoader:
@@ -254,10 +326,18 @@ class MAVTDataModule(L.LightningDataModule):
                 collate_fn=_collate,
                 **self._loader_extras(),
             )
+        # Single modality: shard across DDP ranks ourselves (the YAML disables
+        # Lightning's sampler replacement for the multi-modality batch sampler).
+        sampler = None
+        shuffle = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = DistributedSampler(self._train_ds, shuffle=True, drop_last=True)
+            shuffle = False
         return DataLoader(
             self._train_ds,
             batch_size=hp.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=hp.num_workers,
             pin_memory=hp.pin_memory,
             collate_fn=_collate,

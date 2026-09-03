@@ -1,7 +1,7 @@
 """Stage 1: Unified Conv3d patchification for image, video, and 3D triplane inputs."""
 
 from __future__ import annotations
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -70,6 +70,58 @@ class PatchifyEncoder(nn.Module):
         self.pos_embed = FourDPositionEmbedding(
             embed_dim, max_t=max_t, max_x=max_x, max_y=max_y, max_z=max_z,
         )
+        # Dense 2-D spatial table (row, col) inherited from SigLIP2 (24x24 @384px),
+        # bicubic-resized to the working grid at forward time. None until
+        # init_from_siglip2() is called.
+        self.pos2d: Optional[nn.Parameter] = None
+        self.siglip2_inherited = False
+
+    def init_from_siglip2(self, model_name: str = "google/siglip2-so400m-patch16-384") -> None:
+        """Reproduce SigLIP2's embedding layer exactly for images.
+
+        * Conv3d kernel: zeros on every temporal slot except the LAST one, which gets
+          SigLIP2's Conv2d(16x16) weights. The image path zero-pads one frame BEFORE
+          the image, so the image lands on that last slot and the output equals
+          SigLIP2's patch embedding. Video tubelets start by reading their last frame.
+        * pos2d: SigLIP2's learned 24x24 position table.
+        * FourDPositionEmbedding: output projection zeroed -> (t,x,y,z) start at 0.
+        """
+        from transformers import AutoModel
+        emb = AutoModel.from_pretrained(model_name).vision_model.embeddings
+        conv2d = emb.patch_embedding
+        D, C, tp, p, _ = self.proj.weight.shape
+        if conv2d.weight.shape != (D, C, p, p):
+            raise RuntimeError(f"SigLIP2 patch kernel {tuple(conv2d.weight.shape)} does not match "
+                               f"Conv3d slot {(D, C, p, p)} — check embed_dim / patch_size")
+        with torch.no_grad():
+            self.proj.weight.zero_()
+            self.proj.weight[:, :, tp - 1] = conv2d.weight
+            self.proj.bias.copy_(conv2d.bias)
+            table = emb.position_embedding.weight                      # (G*G, D)
+            G = int(round(table.shape[0] ** 0.5))
+            self.set_pos2d(table.view(1, G, G, D).permute(0, 3, 1, 2))
+            nn.init.zeros_(self.pos_embed.proj.weight)
+            nn.init.zeros_(self.pos_embed.proj.bias)
+        self.siglip2_inherited = True
+
+    def set_pos2d(self, table: torch.Tensor) -> None:
+        """Install (or replace) the learned 2D position table, shape (1, D, G, G).
+
+        Created dynamically (by ``init_from_siglip2`` or by ``MAVT`` when a checkpoint
+        carries ``patchify.pos2d``) — it lives on the same device as ``proj``.
+        """
+        if table.dim() != 4 or table.shape[0] != 1 or table.shape[1] != self.proj.weight.shape[0]:
+            raise ValueError(f"pos2d must be (1, {self.proj.weight.shape[0]}, G, G), got {tuple(table.shape)}")
+        dev = self.proj.weight.device
+        self.pos2d = nn.Parameter(table.detach().to(dev, torch.float32).contiguous().clone())
+
+    def _pos2d_flat(self, Hp: int, Wp: int, device) -> Optional[torch.Tensor]:
+        if self.pos2d is None:
+            return None
+        t = self.pos2d.to(device)
+        if t.shape[-2:] != (Hp, Wp):
+            t = F.interpolate(t, size=(Hp, Wp), mode="bicubic", align_corners=False)
+        return t[0].permute(1, 2, 0).reshape(Hp * Wp, -1)
 
     # ------------------------------------------------------------------ #
     #  Position grid helpers                                               #
@@ -118,6 +170,9 @@ class PatchifyEncoder(nn.Module):
         tokens = out.permute(0, 2, 3, 4, 1).reshape(B, Hp * Wp, D)
         pos = self._image_positions(Hp, Wp, x.device)
         tokens = tokens + self.pos_embed(pos).unsqueeze(0)
+        p2 = self._pos2d_flat(Hp, Wp, x.device)
+        if p2 is not None:
+            tokens = tokens + p2.unsqueeze(0)
         plane_ids = torch.full((Hp * Wp,), -1, dtype=torch.long, device=x.device)
         return tokens, pos, plane_ids
 
@@ -128,6 +183,9 @@ class PatchifyEncoder(nn.Module):
         tokens = out.permute(0, 2, 3, 4, 1).reshape(B, Tp * Hp * Wp, D)
         pos = self._video_positions(Tp, Hp, Wp, x.device)
         tokens = tokens + self.pos_embed(pos).unsqueeze(0)
+        p2 = self._pos2d_flat(Hp, Wp, x.device)
+        if p2 is not None:
+            tokens = tokens + p2.repeat(Tp, 1).unsqueeze(0)
         plane_ids = torch.full((Tp * Hp * Wp,), -1, dtype=torch.long, device=x.device)
         return tokens, pos, plane_ids
 
@@ -172,6 +230,9 @@ class PatchifyEncoder(nn.Module):
 
         tokens = torch.cat([tok_xy, tok_xz, tok_yz], dim=1)  # (B, 3*Np, D)
         tokens = tokens + self.pos_embed(positions).unsqueeze(0)
+        p2 = self._pos2d_flat(Hp, Wp, device)
+        if p2 is not None:
+            tokens = tokens + p2.repeat(3, 1).unsqueeze(0)
         return tokens, positions, plane_ids
 
     def forward(self, x: torch.Tensor, modality: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

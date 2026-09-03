@@ -19,6 +19,8 @@ import torch.utils.checkpoint as cp
 
 from mavt.model.transformer import StandardTransformerBlock
 from mavt.model.rgat import RGAT4DBlock, build_adjacency
+from mavt.model.graph_attention import SparseRGAT4D, build_graph
+from mavt.model.flex_rgat import FlexRGAT4D, build_flex_graph
 
 
 RGAT_POSITIONS = {4, 8}   # which block indices are RGAT4D
@@ -37,17 +39,30 @@ class HybridBackbone(nn.Module):
         r_s: int = 2,
         r_t: int = 1,
         use_gradient_checkpointing: bool = False,
+        rgat_impl: str = "dense",          # dense | sparse | flex
+        edge_plane_local: bool = False,    # spatial edges in each plane's own frame
+        edge_cross_mode: str = "shared_axis",  # shared_axis | projection
     ):
         super().__init__()
         self.r_s = r_s
         self.r_t = r_t
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        if rgat_impl not in ("dense", "sparse", "flex"):
+            raise ValueError(f"rgat_impl must be dense|sparse|flex, got {rgat_impl!r}")
+        self.rgat_impl = rgat_impl
+        self.edge_plane_local = edge_plane_local
+        self.edge_cross_mode = edge_cross_mode
 
         self.blocks = nn.ModuleList()
         for i in range(num_blocks):
             if i in RGAT_POSITIONS:
-                self.blocks.append(RGAT4DBlock(dim, num_heads,
-                                               mlp_ratio=mlp_ratio, dropout=dropout))
+                if rgat_impl == "dense":
+                    blk = RGAT4DBlock(dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout)
+                elif rgat_impl == "sparse":
+                    blk = SparseRGAT4D(dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout, r_s=r_s, r_t=r_t)
+                else:
+                    blk = FlexRGAT4D(dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout, r_s=r_s, r_t=r_t)
+                self.blocks.append(blk)
             else:
                 self.blocks.append(StandardTransformerBlock(dim, num_heads,
                                                              mlp_ratio=mlp_ratio, dropout=dropout))
@@ -65,9 +80,14 @@ class HybridBackbone(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         key = (modality, positions.shape[0])
         if key not in self._mask_cache:
-            adj, etype_masks = build_adjacency(positions, plane_ids, modality,
-                                               self.r_s, self.r_t)
-            self._mask_cache[key] = (adj, etype_masks)
+            if self.rgat_impl == "dense":
+                self._mask_cache[key] = build_adjacency(positions, plane_ids, modality, self.r_s, self.r_t)
+            elif self.rgat_impl == "sparse":
+                self._mask_cache[key] = build_graph(positions, plane_ids, modality, self.r_s, self.r_t,
+                                                    self.edge_plane_local, self.edge_cross_mode)
+            else:
+                self._mask_cache[key] = build_flex_graph(positions, plane_ids, modality, self.r_s, self.r_t,
+                                                         self.edge_plane_local, self.edge_cross_mode)
         return self._mask_cache[key]
 
     # ------------------------------------------------------------------ #
@@ -77,16 +97,15 @@ class HybridBackbone(nn.Module):
             return cp.checkpoint(block, x, use_reentrant=False)
         return block(x)
 
-    def _run_rgat(
-        self,
-        block: RGAT4DBlock,
-        x: torch.Tensor,
-        adj_mask: torch.Tensor,
-        edge_type_masks: List[torch.Tensor],
-    ) -> torch.Tensor:
+    def _run_rgat(self, block: nn.Module, x: torch.Tensor, graph) -> torch.Tensor:
+        if self.rgat_impl == "dense":
+            adj_mask, edge_type_masks = graph
+            if self.use_gradient_checkpointing and self.training:
+                return cp.checkpoint(block, x, adj_mask, edge_type_masks, use_reentrant=False)
+            return block(x, adj_mask, edge_type_masks)
         if self.use_gradient_checkpointing and self.training:
-            return cp.checkpoint(block, x, adj_mask, edge_type_masks, use_reentrant=False)
-        return block(x, adj_mask, edge_type_masks)
+            return cp.checkpoint(block, x, graph, use_reentrant=False)
+        return block(x, graph)
 
     # ------------------------------------------------------------------ #
 
@@ -97,14 +116,14 @@ class HybridBackbone(nn.Module):
         plane_ids: torch.Tensor,  # (N,)
         modality: str,
     ) -> torch.Tensor:
-        adj_mask, edge_type_masks = self._get_masks(positions, plane_ids, modality)
-        # Move cached masks to current device if needed
-        adj_mask = adj_mask.to(x.device)
-        edge_type_masks = [m.to(x.device) for m in edge_type_masks]
+        graph = self._get_masks(positions, plane_ids, modality)
+        if self.rgat_impl == "dense":
+            adj_mask, edge_type_masks = graph
+            graph = (adj_mask.to(x.device), [m.to(x.device) for m in edge_type_masks])
 
         for i, block in enumerate(self.blocks):
             if i in RGAT_POSITIONS:
-                x = self._run_rgat(block, x, adj_mask, edge_type_masks)
+                x = self._run_rgat(block, x, graph)
             else:
                 x = self._run_transformer(block, x)
         return x
@@ -113,16 +132,18 @@ class HybridBackbone(nn.Module):
     #  SigLIP2 weight loading utility                                     #
     # ------------------------------------------------------------------ #
 
-    def load_siglip2_weights(self, model_name: str = "google/siglip2-base-patch16-224",
-                              freeze_stages: int = 0) -> None:
-        """Load SigLIP2 backbone weights into Transformer blocks (best-effort).
+    def load_siglip2_weights(self, model_name: str = "google/siglip2-so400m-patch16-384",
+                              freeze_stages: int = 0, strict: bool = True) -> None:
+        """Load SigLIP2 encoder layers into the Transformer blocks.
 
-        freeze_stages: number of initial Transformer blocks to freeze (stage 1: all,
-        stage 2: leave last 4 unfrozen, stage 3: none frozen).
+        strict=True (default): any failure — model unloadable, shape mismatch, zero
+        blocks copied — raises RuntimeError instead of silently training from
+        random init (which is what happened in every earlier run).
+        freeze_stages: number of initial Transformer blocks to freeze.
         """
+        copied = 0
         try:
             from transformers import AutoModel
-            import re
             siglip = AutoModel.from_pretrained(model_name)
             siglip_blocks = siglip.vision_model.encoder.layers
 
@@ -133,8 +154,13 @@ class HybridBackbone(nn.Module):
                 if transformer_idx >= len(siglip_blocks):
                     break
                 src = siglip_blocks[transformer_idx]
-                _copy_siglip2_block(src, block)
+                if _copy_siglip2_block(src, block, strict=strict):
+                    copied += 1
                 transformer_idx += 1
+            n_tf = sum(1 for i in range(len(self.blocks)) if i not in RGAT_POSITIONS)
+            print(f"[backbone] SigLIP2 init: copied {copied}/{n_tf} transformer blocks from {model_name}")
+            if strict and copied == 0:
+                raise RuntimeError("SigLIP2 init copied zero blocks")
 
             # Freeze early blocks
             frozen = 0
@@ -147,11 +173,13 @@ class HybridBackbone(nn.Module):
                     frozen += 1
 
         except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise RuntimeError(f"SigLIP2 weight loading failed for {model_name!r}: {exc}") from exc
             print(f"[backbone] SigLIP2 weight loading skipped: {exc}")
 
 
-def _copy_siglip2_block(src: nn.Module, dst: StandardTransformerBlock) -> None:
-    """Best-effort copy from a SigLIP2 encoder layer to our StandardTransformerBlock."""
+def _copy_siglip2_block(src: nn.Module, dst: StandardTransformerBlock, strict: bool = False) -> bool:
+    """Copy a SigLIP2 encoder layer into our StandardTransformerBlock. Returns True on success."""
     state = dst.state_dict()
     # SigLIP2 uses self_attn.{q,k,v,out}_proj; we use fused qkv + out_proj
     try:
@@ -178,5 +206,8 @@ def _copy_siglip2_block(src: nn.Module, dst: StandardTransformerBlock) -> None:
         state['mlp.3.weight'] = src.mlp.fc2.weight.data
         state['mlp.3.bias']   = src.mlp.fc2.bias.data
         dst.load_state_dict(state)
-    except (AttributeError, RuntimeError):
-        pass  # dimension mismatch or different naming — skip silently
+        return True
+    except (AttributeError, RuntimeError) as exc:
+        if strict:
+            raise RuntimeError(f"SigLIP2 block copy failed (dim/name mismatch): {exc}") from exc
+        return False

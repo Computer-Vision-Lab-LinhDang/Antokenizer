@@ -7,7 +7,7 @@ receive proportionally more gradient.
 """
 
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -75,14 +75,79 @@ def infonce_loss(
 #  Vision-vision cosine distillation loss                                       #
 # --------------------------------------------------------------------------- #
 
+
+def pool_teacher_tokens(hidden: torch.Tensor, grid: Tuple[int, int]) -> torch.Tensor:
+    """Resample teacher patch tokens (B, Gt*Gt, D) onto the student grid (Hp, Wp) → (B, Hp*Wp, D).
+
+    SigLIP2-SO400M at 384/16 gives a 24×24 map; the student works on 16×16 at 256 px.
+    Bilinear (antialiased) resampling of the token map keeps each student token aligned
+    with the teacher's features at the same image location.
+    """
+    B, N, D = hidden.shape
+    g = int(round(N ** 0.5))
+    if g * g != N:
+        raise ValueError(f"teacher tokens must form a square grid, got N={N}")
+    Hp, Wp = grid
+    if (g, g) == (Hp, Wp):
+        return hidden
+    m = hidden.transpose(1, 2).reshape(B, D, g, g)
+    m = F.interpolate(m.float(), size=(Hp, Wp), mode="bilinear", align_corners=False, antialias=True)
+    return m.reshape(B, D, Hp * Wp).transpose(1, 2).to(hidden.dtype)
+
+
+def dense_distill_loss(student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+    """Per-token cosine distillation (REPA-style): 1 - mean_{b,n} cos(student[b,n], teacher[b,n]).
+
+    student : (B, N, D) backbone tokens (after the learnable dense projection)
+    teacher : (B, N, D) frozen teacher patch tokens resampled to the same grid (detached)
+    Supervises every token of the trunk directly — N× more signal per image than the
+    pooled cosine target, which the 2026-09-02 probe showed cannot make the trunk semantic.
+    """
+    if student.shape != teacher.shape:
+        raise ValueError(f"dense distill shape mismatch: student {tuple(student.shape)} vs teacher {tuple(teacher.shape)}")
+    cos = F.cosine_similarity(student.float(), teacher.detach().float(), dim=-1)
+    return 1.0 - cos.mean()
+
+
 def cosine_distill_loss(
     student: torch.Tensor,   # (B, D)
     teacher: torch.Tensor,   # (B, D) — frozen vision teacher (e.g. SigLIP2)
+    center: bool = False,
 ) -> torch.Tensor:
-    """1 - mean cosine similarity. Teacher is detached (no gradient flows back)."""
+    """1 - mean cosine similarity. Teacher is detached (no gradient flows back).
+
+    center=True subtracts each side's batch mean first, so the loss rewards
+    matching the per-sample (discriminative) deviation rather than the teacher's
+    shared mean direction — which plain cosine would otherwise fit first and
+    collapse onto (pair_cos 0.95 in the pilot).
+    """
+    teacher = teacher.detach()
+    if center and student.shape[0] > 1:
+        student = student - student.mean(0, keepdim=True)
+        teacher = teacher - teacher.mean(0, keepdim=True)
     s = F.normalize(student, dim=-1)
-    t = F.normalize(teacher.detach(), dim=-1)
+    t = F.normalize(teacher, dim=-1)
     return (1.0 - (s * t).sum(dim=-1)).mean()
+
+
+def vicreg_loss(e: torch.Tensor, std_target: float = 1.0, w_var: float = 1.0,
+                w_cov: float = 0.04) -> torch.Tensor:
+    """Variance + covariance regulariser (VICReg) on a (B, D) embedding.
+
+    var: hinge pushing every dimension's std above `std_target`;
+    cov: off-diagonal covariance pushed to zero (de-correlate dimensions).
+    Prevents the pooled embedding from collapsing while distillation pulls it.
+    """
+    if e.shape[0] < 2:
+        return e.new_zeros(())
+    e = e.float()
+    std = torch.sqrt(e.var(dim=0, unbiased=False) + 1e-4)
+    var_loss = F.relu(std_target - std).mean()
+    c = e - e.mean(0, keepdim=True)
+    cov = (c.T @ c) / (e.shape[0] - 1)
+    off = cov - torch.diag(torch.diag(cov))
+    cov_loss = (off ** 2).sum() / e.shape[1]
+    return w_var * var_loss + w_cov * cov_loss
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +253,9 @@ class MAVTLoss(nn.Module):
         w_sem: float  = 0.5,    # cosine distill from frozen vision teacher
         w_aux: float  = 0.01,
         w_temp: float = 0.0,    # temporal consistency (video only); 0 = disabled
+        w_vic: float  = 0.0,    # VICReg anti-collapse on the pooled semantic embedding
+        w_dense: float = 0.0,   # per-token cosine distillation of backbone tokens to teacher patch tokens
+        distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
         active_modalities: tuple = ('image', 'video', 'threed'),
@@ -200,6 +268,9 @@ class MAVTLoss(nn.Module):
         self.w_sem  = w_sem
         self.w_aux  = w_aux
         self.w_temp = w_temp
+        self.w_vic = w_vic
+        self.w_dense = w_dense
+        self.distill_center = distill_center
         self.use_clip = use_clip
 
         self.lpips = LPIPSLoss() if use_lpips else None
@@ -215,9 +286,17 @@ class MAVTLoss(nn.Module):
         semantic_embed: Optional[torch.Tensor] = None,
         text_embed: Optional[torch.Tensor] = None,
         teacher_embed: Optional[torch.Tensor] = None,
+        dense_student: Optional[torch.Tensor] = None,   # (B, N, D) backbone tokens (projected)
+        dense_teacher: Optional[torch.Tensor] = None,   # (B, N, D) teacher patch tokens on the student grid
     ) -> Dict[str, torch.Tensor]:
 
         # Reconstruction
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"MAVTLoss: pred/target shape mismatch {tuple(pred.shape)} vs {tuple(target.shape)} "
+                "(modality={modality}). Decoders must return the full target shape — no silent "
+                "truncation/alignment here."
+            )
         l1   = F.l1_loss(pred, target)
         lpips_val = self.lpips(pred, target) if self.lpips is not None else torch.tensor(0.0, device=pred.device)
         l_recon = self.w_l1 * l1 + self.w_lpips * lpips_val
@@ -235,7 +314,16 @@ class MAVTLoss(nn.Module):
         # Vision-vision distillation (default semantic supervision)
         l_sem = torch.tensor(0.0, device=pred.device)
         if self.w_sem > 0.0 and semantic_embed is not None and teacher_embed is not None:
-            l_sem = cosine_distill_loss(semantic_embed, teacher_embed)
+            l_sem = cosine_distill_loss(semantic_embed, teacher_embed, center=self.distill_center)
+
+        # VICReg anti-collapse on the pooled embedding
+        l_vic = torch.tensor(0.0, device=pred.device)
+        if self.w_vic > 0.0 and semantic_embed is not None:
+            l_vic = vicreg_loss(semantic_embed)
+
+        l_dense = torch.tensor(0.0, device=pred.device)
+        if self.w_dense > 0.0 and dense_student is not None and dense_teacher is not None:
+            l_dense = dense_distill_loss(dense_student, dense_teacher)
 
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
@@ -252,6 +340,8 @@ class MAVTLoss(nn.Module):
             + self.w_sem * l_sem
             + self.w_aux * l_div
             + self.w_temp * l_temp
+            + self.w_vic * l_vic
+            + self.w_dense * l_dense
         )
 
         return {
@@ -264,4 +354,6 @@ class MAVTLoss(nn.Module):
             'loss_sem':   l_sem,
             'loss_div':   l_div,
             'loss_temp':  l_temp,
+            'loss_vic':   l_vic,
+            'loss_dense': l_dense,
         }

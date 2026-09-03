@@ -41,6 +41,7 @@ class MAVTOutput:
     latent_positions: torch.Tensor     # (N_z, 4), content zeros + local detail centers
     latent_token_types: torch.Tensor    # (N_z,), 0=content, 1=detail
     semantic: torch.Tensor             # (B, semantic_dim)
+    backbone_tokens: torch.Tensor      # (B, N, D) trunk output before the content/detail split
     loss_kl: torch.Tensor
     cd_metrics: Dict[str, torch.Tensor]  # slot_diversity, residual_ratio
 
@@ -74,6 +75,10 @@ class MAVT(nn.Module):
         # RGAT
         r_s: int = 2,
         r_t: int = 1,
+        semantic_content_only: bool = False,
+        rgat_impl: str = "dense",
+        edge_plane_local: bool = False,
+        edge_cross_mode: str = "shared_axis",
         # Training
         use_gradient_checkpointing: bool = False,
         mlp_ratio: float = 4.0,
@@ -94,6 +99,8 @@ class MAVT(nn.Module):
             mlp_ratio=mlp_ratio, dropout=dropout,
             r_s=r_s, r_t=r_t,
             use_gradient_checkpointing=use_gradient_checkpointing,
+            rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
+            edge_cross_mode=edge_cross_mode,
         )
 
         # Stage 3
@@ -111,18 +118,25 @@ class MAVT(nn.Module):
         self.decoder = AsymmetricDecoder(
             latent_dim=latent_dim, dec_dim=dec_dim,
             num_attn_blocks=num_dec_attn_blocks, num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
+            mlp_ratio=mlp_ratio, t_patch=t_patch,
         )
         # 5b. Understanding head: z → semantic vector aligned with vision teacher
         self.understanding_decoder = UnderstandingDecoder(
             latent_dim=latent_dim, dec_dim=dec_dim,
             semantic_dim=semantic_dim, num_heads=8, num_layers=2,
             mlp_ratio=mlp_ratio,
+            content_only=semantic_content_only,
         )
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
+        # Parameters that only exist after prepare_for_modalities() / init_from_siglip2()
+        # (content poolers per (N_c, N_d), SigLIP2-inherited pos2d) must be re-created
+        # before a checkpoint is loaded into a fresh model — otherwise strict=False
+        # loads drop them silently and the model runs without its learned position table.
+        self.register_load_state_dict_pre_hook(self._materialize_dynamic_params)
+
 
     def _grid_shape(self, modality: str, x: torch.Tensor) -> tuple:
         """Return (H_grid, W_grid) or (Tp, Hg, Wg) based on input shape."""
@@ -177,7 +191,7 @@ class MAVT(nn.Module):
 
         # Stage 5a — Understanding head: z → semantic
         # Always run (cheap, gives semantic supervision signal even when decode=False)
-        semantic = self.understanding_decoder(z)
+        semantic = self.understanding_decoder(z, latent_token_types)
 
         # Stage 5b — Reconstruction head: z → pixel
         if decode:
@@ -197,6 +211,7 @@ class MAVT(nn.Module):
             latent_positions=latent_positions,
             latent_token_types=latent_token_types,
             semantic=semantic,
+            backbone_tokens=features,
             loss_kl=loss_kl,
             cd_metrics=cd_metrics,
         )
@@ -206,9 +221,34 @@ class MAVT(nn.Module):
         out = self.forward(x, modality, decode=False)
         return out.z, out.semantic
 
-    def load_siglip2_weights(self, model_name: str = "google/siglip2-base-patch16-224",
-                              freeze_stages: int = 10) -> None:
-        self.backbone.load_siglip2_weights(model_name, freeze_stages)
+    # ------------------------------------------------------------------ #
+    #  Checkpoint loading                                                  #
+    # ------------------------------------------------------------------ #
+    def _materialize_dynamic_params(self, module, state_dict, prefix, local_metadata, strict,
+                                    missing_keys, unexpected_keys, error_msgs) -> None:
+        """load_state_dict pre-hook: create pos2d / content poolers that the checkpoint carries.
+
+        Fires for any load path (direct ``MAVT.load_state_dict``, Lightning's parent
+        module load with prefix ``model.``, cross-stage ``init_from_ckpt``).
+        """
+        k = prefix + "patchify.pos2d"
+        if k in state_dict and self.patchify.pos2d is None:
+            self.patchify.set_pos2d(torch.zeros_like(state_dict[k], dtype=torch.float32))
+        pre = prefix + "cd_split._content_poolers."
+        dev = self.patchify.proj.weight.device
+        for key in sorted({name[len(pre):].split(".")[0] for name in state_dict if name.startswith(pre)}):
+            if key in self.cd_split._content_poolers:
+                continue
+            n_c, n_d = (int(v) for v in key.split("_"))
+            self.cd_split.prepare_poolers(n_c, n_d)
+            self.cd_split._content_poolers[key].to(dev)
+
+    def load_siglip2_weights(self, model_name: str = "google/siglip2-so400m-patch16-384",
+                              freeze_stages: int = 10, strict: bool = True,
+                              init_patchify: bool = False) -> None:
+        if init_patchify:
+            self.patchify.init_from_siglip2(model_name)
+        self.backbone.load_siglip2_weights(model_name, freeze_stages, strict=strict)
 
     # ------------------------------------------------------------------ #
     #  Eager pre-creation of slot poolers                                 #

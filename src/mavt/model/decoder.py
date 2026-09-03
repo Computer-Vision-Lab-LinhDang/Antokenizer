@@ -335,13 +335,22 @@ class AsymmetricDecoder(nn.Module):
         num_attn_blocks: int = 4,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
+        t_patch: int = 2,
     ):
         super().__init__()
+        self.t_patch = t_patch
         self.expander = UnifiedDetailExpander(latent_dim, dec_dim, num_heads=num_heads)
         self.self_attn_blocks = nn.ModuleList([
             StandardTransformerBlock(dec_dim, num_heads, mlp_ratio)
             for _ in range(num_attn_blocks)
         ])
+        # Temporal expansion: one decoded chunk feature -> t_patch per-frame features.
+        # Initialised as a stacked identity so every sub-frame starts equal to the
+        # chunk decode (the previous T/τ behaviour), and the temporal detail is learned.
+        self.temporal_expand = nn.Linear(dec_dim, dec_dim * t_patch)
+        with torch.no_grad():
+            self.temporal_expand.weight.copy_(torch.eye(dec_dim).repeat(t_patch, 1))
+            self.temporal_expand.bias.zero_()
         self.cnn = PixelShuffleCNNDecoder(in_channels=dec_dim)
 
     def _decode_grid(
@@ -352,8 +361,10 @@ class AsymmetricDecoder(nn.Module):
         W_grid: int,
         latent_positions: Optional[torch.Tensor] = None,
         latent_token_types: Optional[torch.Tensor] = None,
+        t_expand: int = 1,
     ) -> torch.Tensor:
-        """Decode a single 2D grid → (B, 3, H_out, W_out)."""
+        """Decode one 2D grid → (B, 3, H_out, W_out), or with t_expand>1 the
+        t_expand frames of a temporal chunk → (B, 3, t_expand, H_out, W_out)."""
         B = z.shape[0]
         expanded = self.expander(
             z, positions, latent_positions, latent_token_types
@@ -361,9 +372,18 @@ class AsymmetricDecoder(nn.Module):
         for blk in self.self_attn_blocks:
             expanded = blk(expanded)
 
-        # Reshape to 2D spatial grid
-        feat = expanded.transpose(1, 2).reshape(B, -1, H_grid, W_grid)
-        return self.cnn(feat)   # (B, 3, 16*H_grid, 16*W_grid)
+        if t_expand == 1:
+            feat = expanded.transpose(1, 2).reshape(B, -1, H_grid, W_grid)
+            return self.cnn(feat)   # (B, 3, 16*H_grid, 16*W_grid)
+
+        assert t_expand == self.t_patch, (t_expand, self.t_patch)
+        N = expanded.shape[1]
+        sub = self.temporal_expand(expanded).view(B, N, t_expand, -1)      # (B, N, τ, dec_dim)
+        frames = []
+        for k in range(t_expand):
+            feat = sub[:, :, k].transpose(1, 2).reshape(B, -1, H_grid, W_grid)
+            frames.append(self.cnn(feat))                                  # (B, 3, H, W)
+        return torch.stack(frames, dim=2)                                  # (B, 3, τ, H, W)
 
     def forward(
         self,
@@ -387,17 +407,19 @@ class AsymmetricDecoder(nn.Module):
         elif modality == 'video':
             Tp, Hg, Wg = grid_shape
             N_frame = Hg * Wg
-            # Decode per-frame with shared weights
-            frames = []
+            # Decode per temporal chunk, expanding each chunk to t_patch frames so the
+            # output covers every input frame (T = Tp * t_patch).
+            chunks = []
             for t in range(Tp):
                 pos_t = target_positions[t * N_frame:(t + 1) * N_frame]
-                frame = self._decode_grid(
+                chunk = self._decode_grid(
                     z, pos_t, Hg, Wg,
                     latent_positions=latent_positions,
                     latent_token_types=latent_token_types,
-                )  # (B, 3, H, W)
-                frames.append(frame)
-            return torch.stack(frames, dim=2)   # (B, 3, Tp, H, W)
+                    t_expand=self.t_patch,
+                )  # (B, 3, τ, H, W)
+                chunks.append(chunk)
+            return torch.cat(chunks, dim=2)     # (B, 3, T, H, W)
 
         elif modality == 'threed':
             N_plane = target_positions.shape[0] // 3
@@ -445,8 +467,13 @@ class UnderstandingDecoder(nn.Module):
         num_heads: int = 8,
         num_layers: int = 2,
         mlp_ratio: float = 4.0,
+        content_only: bool = False,
     ):
         super().__init__()
+        # content_only: read only the content slots (token_type 0). The 2026-09-02 probe
+        # showed the head pooling over 256 non-semantic detail tokens loses information
+        # (kNN 0.378 on content-mu → 0.335 at the head output).
+        self.content_only = content_only
         self.in_proj = nn.Linear(latent_dim, dec_dim)
         self.norm_in = nn.LayerNorm(dec_dim)
 
@@ -463,8 +490,12 @@ class UnderstandingDecoder(nn.Module):
         self.norm_out = nn.LayerNorm(dec_dim)
         self.proj = nn.Linear(dec_dim, semantic_dim)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, Nz, latent_dim) → semantic: (B, semantic_dim)"""
+    def forward(self, z: torch.Tensor, token_types: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """z: (B, Nz, latent_dim), token_types: (Nz,) 0=content/1=detail → semantic: (B, semantic_dim)"""
+        if self.content_only and token_types is not None:
+            keep = token_types == 0
+            if keep.any():
+                z = z[:, keep]
         x = self.norm_in(self.in_proj(z))
         for blk in self.self_attn_blocks:
             x = blk(x)

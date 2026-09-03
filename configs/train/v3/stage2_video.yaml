@@ -1,0 +1,71 @@
+# MAVT v3 — Stage 2 (image + video) on manifests. Start from the Stage-1 checkpoint:
+#   STAGE=2 INIT_CKPT=checkpoints/v3/stage1/<ckpt> ./deepseek
+trainer:
+  max_steps: 100000
+  devices: auto
+  precision: bf16-mixed
+  log_every_n_steps: 50
+  val_check_interval: 2000
+  limit_val_batches: 32
+  enable_checkpointing: true
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      find_unused_parameters: true
+      gradient_as_bucket_view: true
+  use_distributed_sampler: false
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: checkpoints/v3/stage2
+        filename: mavt-v3-s2-{step:07d}
+        save_top_k: -1
+        every_n_train_steps: 5000
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: lightning.pytorch.callbacks.RichProgressBar
+
+model:
+  training_stage: 2
+  embed_dim: 1152
+  num_heads: 16
+  mlp_ratio: 3.7361111111111112
+  semantic_dim: 1152
+  local_detail_window_size: 2
+  t_patch: 2
+  init_siglip2: true
+  init_siglip2_patchify: true
+  siglip2_model_name: google/siglip2-so400m-patch16-384
+  use_semantic_distill: true
+  distill_center: true
+  w_vic: 0.05
+  rgat_impl: flex
+  edge_plane_local: true
+  edge_cross_mode: projection
+  use_gradient_checkpointing: false
+  w_l1: 1.0
+  w_lpips: 0.25
+  w_kl: 1.0
+  w_sem: 0.3
+  w_aux: 0.01
+  w_temp: 0.1                       # temporal consistency — decoder now returns all T frames
+  use_lpips: true
+  warmup_steps: 1000
+  total_steps: 100000
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+data:
+  active_modalities: [image, video]
+  image_manifest: data/manifests/openimages_v2.jsonl   # scan-verified (check_data.py), w/h/mode enriched
+  video_manifest: data/manifests/openvid_v2.jsonl      # 35,105 OpenVid clips, scan-verified, <16-frame dropped, csv motion/aesthetic joined
+  image_resolution: 256
+  video_resolution: 256
+  video_frames: 8
+  video_frame_stride: 2             # contiguous window: 8 frames = 16 source frames ~0.67 s @24fps
+  batch_size: 16
+  num_workers: 8
+  pin_memory: true
+  val_split: 0.002
+  test_split: 0.0

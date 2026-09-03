@@ -405,3 +405,188 @@ class ShardVideoDataset(Dataset):
             'caption': caption,
             'id': obj_id,
         }
+
+
+# --------------------------------------------------------------------------- #
+#  Manifest-backed datasets (v3)                                               #
+# --------------------------------------------------------------------------- #
+
+def _load_manifest(path: str) -> List[Dict]:
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _record_caption(rec: Dict) -> str:
+    if rec.get("caption"):
+        return str(rec["caption"])
+    cp = rec.get("caption_path")
+    if cp:
+        try:
+            with open(cp) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
+class ManifestImageDataset(Dataset):
+    """Images listed in a .jsonl manifest ({"path", "caption"?, "caption_path"?}).
+
+    No filesystem scan at init; fail-loud: a decode failure retries a substitute
+    sample up to 3 times, counts errors, then raises. Never yields zero tensors.
+    """
+
+    _MAX_RETRIES = 3
+
+    def __init__(self, manifest_path: str, resolution: int = 256):
+        self.records = _load_manifest(manifest_path)
+        if not self.records:
+            raise FileNotFoundError(f"Empty manifest: {manifest_path}")
+        self.transform = transforms.Compose([
+            transforms.Resize(resolution),
+            transforms.CenterCrop(resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+        self.n_errors = 0
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _load_one(self, idx: int) -> Dict:
+        from PIL import Image as PILImage
+        rec = self.records[idx]
+        img = PILImage.open(rec["path"]).convert("RGB")
+        return {"data": self.transform(img), "modality": "image",
+                "caption": _record_caption(rec), "id": Path(rec["path"]).stem}
+
+    def __getitem__(self, idx: int) -> Dict:
+        import random
+        for _ in range(self._MAX_RETRIES):
+            try:
+                return self._load_one(idx)
+            except Exception as exc:  # noqa: BLE001
+                self.n_errors += 1
+                if self.n_errors <= 3 or self.n_errors % 100 == 0:
+                    print(f"[ManifestImageDataset] error #{self.n_errors}: {exc!r}")
+                idx = random.randrange(len(self.records))
+        raise RuntimeError(f"Image load failed {self._MAX_RETRIES}x (total errors={self.n_errors})")
+
+
+class ManifestVideoDataset(Dataset):
+    """Video clips from a .jsonl manifest ({"path", "caption"?}).
+
+    v2 (2026-09): streaming PyAV decode — frames are resized *inside the decoder*
+    and only the sampled ones are kept, so a 720p/500-frame clip costs ~0.1 s and a
+    few MB instead of read_video's full-clip tensor (2.7 s, 1.2 GB). Frames are a
+    contiguous window at ``frame_stride`` (default 2 → 16 frames ≈ 1.3 s @ 24 fps),
+    never spread over the whole clip: the temporal patchify (t_patch=2) needs
+    neighbouring frames to be neighbours in time. Spatial: short side → ``resolution``
+    then centre crop (same geometry as ManifestImageDataset; no anisotropic squash).
+    Fail-loud: a broken file raises, it never becomes a static repeated frame.
+    """
+
+    _MAX_RETRIES = 3
+
+    def __init__(self, manifest_path: str, n_frames: int = 16, resolution: int = 256,
+                 frame_stride: int = 2):
+        self.records = _load_manifest(manifest_path)
+        if not self.records:
+            raise FileNotFoundError(f"Empty manifest: {manifest_path}")
+        if n_frames < 1 or frame_stride < 1:
+            raise ValueError("n_frames and frame_stride must be >= 1")
+        self.n_frames = n_frames
+        self.resolution = resolution
+        self.frame_stride = frame_stride
+        self.n_errors = 0
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    # -- sampling ---------------------------------------------------------------
+    def _sample_indices(self, n_total: int, rng: "torch.Generator") -> List[int]:
+        """Contiguous window of n_frames at frame_stride; halve the stride until it
+        fits; a clip shorter than n_frames returns every frame (padded by caller)."""
+        T = self.n_frames
+        if n_total <= T:
+            return list(range(n_total))
+        stride = self.frame_stride
+        while stride > 1 and (T - 1) * stride + 1 > n_total:
+            stride //= 2
+        span = (T - 1) * stride + 1
+        start = int(torch.randint(0, n_total - span + 1, (1,), generator=rng))
+        return [start + i * stride for i in range(T)]
+
+    # -- decoding ---------------------------------------------------------------
+    @staticmethod
+    def _configure_stream(stream) -> None:
+        """Single-threaded libav decode. Frame threading (thread_type=AUTO → 16 ``av:h264:df*``
+        threads per worker) deadlocked inside forked DataLoader workers on 2026-09-02: five workers
+        stuck in futex_wait, the rank never delivered its batch and the other DDP ranks spun in
+        all-reduce for 20+ minutes. One decode thread per worker is slower per clip but safe."""
+        stream.thread_type = "NONE"
+        stream.thread_count = 1
+
+    def _target_size(self, w: int, h: int) -> Tuple[int, int]:
+        r = self.resolution
+        if w >= h:
+            return max(r, round(w * r / h)), r
+        return r, max(r, round(h * r / w))
+
+    def _decode(self, path: str, rng: "torch.Generator") -> "torch.Tensor":
+        import av
+        import numpy as np
+        with av.open(path) as container:
+            stream = container.streams.video[0]
+            self._configure_stream(stream)
+            n_total = int(stream.frames or 0)
+            frames: List[np.ndarray] = []
+            if n_total > 0:
+                idxs = self._sample_indices(n_total, rng)
+                want, last = set(idxs), idxs[-1]
+                tw = th = None
+                for i, fr in enumerate(container.decode(stream)):
+                    if i > last:
+                        break
+                    if i in want:
+                        if tw is None:
+                            tw, th = self._target_size(fr.width, fr.height)
+                        frames.append(fr.to_ndarray(format="rgb24", width=tw, height=th))
+            else:  # container without a frame count: decode everything (already small) then sample
+                tw = th = None
+                for fr in container.decode(stream):
+                    if tw is None:
+                        tw, th = self._target_size(fr.width, fr.height)
+                    frames.append(fr.to_ndarray(format="rgb24", width=tw, height=th))
+                if frames:
+                    frames = [frames[i] for i in self._sample_indices(len(frames), rng)]
+        if not frames:
+            raise ValueError("no decodable frames")
+        clip = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float() / 255.0  # (t, 3, H, W)
+        r = self.resolution
+        H, W = clip.shape[-2:]
+        top, left = (H - r) // 2, (W - r) // 2
+        clip = clip[:, :, top: top + r, left: left + r]
+        if clip.shape[0] < self.n_frames:  # short clip: repeat last frame
+            pad = clip[-1:].expand(self.n_frames - clip.shape[0], -1, -1, -1)
+            clip = torch.cat([clip, pad], 0)
+        return (clip - 0.5) / 0.5
+
+    def _load_one(self, idx: int) -> Dict:
+        rec = self.records[idx]
+        rng = torch.Generator().manual_seed(int(torch.randint(0, 2**31 - 1, (1,))))
+        clip = self._decode(rec["path"], rng)
+        return {"data": clip.permute(1, 0, 2, 3).contiguous(), "modality": "video",
+                "caption": _record_caption(rec), "id": Path(rec["path"]).stem}
+
+    def __getitem__(self, idx: int) -> Dict:
+        import random
+        for _ in range(self._MAX_RETRIES):
+            try:
+                return self._load_one(idx)
+            except Exception as exc:  # noqa: BLE001
+                self.n_errors += 1
+                if self.n_errors <= 3 or self.n_errors % 100 == 0:
+                    print(f"[ManifestVideoDataset] error #{self.n_errors}: {exc!r}")
+                idx = random.randrange(len(self.records))
+        raise RuntimeError(f"Video load failed {self._MAX_RETRIES}x (total errors={self.n_errors})")
