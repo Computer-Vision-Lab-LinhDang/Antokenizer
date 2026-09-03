@@ -1,0 +1,64 @@
+# Thí nghiệm đường cong nén–chất lượng: ngân sách 128 token x 32 = 4,096 float/ảnh 256²,
+# đúng bằng SD-VAE f8 (27.44 dB / LPIPS 0.119 đo trên Imagenette val). Baseline hiện tại 23.92 dB.
+#
+# Thay đổi so với s1: nhánh content được ép thực sự tái tạo feature backbone (w_content),
+# và trọng số gán patch→slot chuẩn hoá theo trục slot. Đo 2026-09-03: slot cũ bắt 6.3%
+# năng lượng, trần PCA-64 trong ảnh là 91%. Distill semantic tắt để cô lập biến.
+trainer:
+  max_steps: 6000
+  devices: auto
+  precision: bf16-mixed
+  log_every_n_steps: 10
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  limit_val_batches: 16
+  enable_checkpointing: true
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args: {find_unused_parameters: true, gradient_as_bucket_view: true}
+  use_distributed_sampler: false
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args: {logging_interval: step}
+
+model:
+  training_stage: 3
+  embed_dim: 1152
+  num_heads: 16
+  mlp_ratio: 3.7361111111111112
+  semantic_dim: 1152
+  local_detail_window_size: 2       # 64 content + 64 detail = 128 token = 4,096 float
+  t_patch: 2
+  init_siglip2: true
+  init_siglip2_patchify: true
+  siglip2_model_name: google/siglip2-so400m-patch16-384
+  rgat_impl: flex
+  edge_plane_local: true
+  edge_cross_mode: projection
+  use_gradient_checkpointing: false
+  w_l1: 1.0
+  w_lpips: 0.25
+  w_kl: 1.0
+  w_content: 1.0                    # BIẾN THÍ NGHIỆM: ép nhánh content mang thông tin
+  w_sem: 0.0                        # tắt để cô lập biến
+  w_vic: 0.0
+  w_aux: 0.01
+  w_temp: 0.0
+  use_semantic_distill: false
+  use_lpips: true
+  lr: 1.0e-4
+  warmup_steps: 300
+  total_steps: 6000
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+data:
+  active_modalities: [image]
+  image_manifest: data/manifests/openimages_v2.jsonl
+  image_resolution: 256
+  batch_size: 48
+  num_workers: 12
+  loader_timeout: 900
+  pin_memory: true
+  val_split: 0.002
+  test_split: 0.0

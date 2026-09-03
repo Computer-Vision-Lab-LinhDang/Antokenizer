@@ -16,7 +16,8 @@ case "$STAGE" in
   1) CFG=configs/train/v3/stage1_image.yaml ;;
   2) CFG=configs/train/v3/stage2_video.yaml ;;
   3) CFG=configs/train/v3/stage3_3d.yaml ;;
-  *) echo "STAGE must be 1|2|3" >&2; exit 2 ;;
+  rd) CFG=configs/train/v3/rd_window2.yaml ;;   # thí nghiệm đường cong nén-chất lượng
+  *) echo "STAGE must be 1|2|3|rd" >&2; exit 2 ;;
 esac
 RUN="${RUN:-runs/deepseek/s${STAGE}}"
 mkdir -p "$RUN"

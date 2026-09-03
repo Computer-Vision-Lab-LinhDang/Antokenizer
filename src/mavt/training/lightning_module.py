@@ -64,6 +64,7 @@ class MAVTLightningModule(L.LightningModule):
         w_temp: float = 0.0,    # temporal consistency weight (video only)
         w_vic: float = 0.0,     # VICReg anti-collapse on pooled embedding
         w_dense: float = 0.0,   # per-token distillation of backbone tokens → teacher patch tokens (image)
+        w_content: float = 0.0, # force content slots to reconstruct the backbone features (real residual split)
         distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool = False,
@@ -111,7 +112,8 @@ class MAVTLightningModule(L.LightningModule):
         self.loss_fn = MAVTLoss(
             w_l1=w_l1, w_lpips=w_lpips, w_kl=w_kl,
             w_clip=w_clip, w_sem=w_sem, w_aux=w_aux,
-            w_temp=w_temp, w_vic=w_vic, w_dense=w_dense, distill_center=distill_center,
+            w_temp=w_temp, w_vic=w_vic, w_dense=w_dense, w_content=w_content,
+            distill_center=distill_center,
             use_lpips=use_lpips, use_clip=use_clip,
             active_modalities=_active_mods,
         )
@@ -312,6 +314,7 @@ class MAVTLightningModule(L.LightningModule):
             teacher_embed=teacher_embed,
             dense_student=dense_student,
             dense_teacher=dense_teacher,
+            content_recon_error=out.cd_metrics.get('content_recon_error'),
         )
 
         self._log_losses(losses, out.cd_metrics, modality, log_prefix)

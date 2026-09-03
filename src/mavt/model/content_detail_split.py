@@ -155,6 +155,19 @@ class ContentDetailSplit(nn.Module):
             pos[:, 1] = torch.arange(N, device=device)
         return pos
 
+    @staticmethod
+    def _content_weights(x: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """Assignment of each patch to the content slots: softmax over the SLOT axis.
+
+        (B, N_c, N), with ``w[:, :, n]`` summing to 1 so ``x_approx[n]`` is a convex
+        combination of slots and can reach the scale of ``x[n]``. Normalising over the
+        patch axis instead (the 2026-09-02 code) made ``x_approx`` an unnormalised
+        mixture with ~0.2x the norm of ``x`` and cos(x, x_approx) = 0.027, so the
+        "residual" R was as large as x itself and the detail branch carried everything.
+        """
+        D = x.shape[-1]
+        return F.softmax((C @ x.transpose(-1, -2)) / (D ** 0.5), dim=-2)
+
     def _local_detail_pool(
         self,
         residual: torch.Tensor,
@@ -239,12 +252,9 @@ class ContentDetailSplit(nn.Module):
         # Stage 3a: ContentExtractor
         C = content_pooler(x)   # (B, N_c, D)
 
-        # Stage 3b: Residual via inverse (broadcast) attention
-        # weights[b, c, n] = softmax over n: sim(C[b,c], x[b,n])
-        weights = F.softmax(
-            (C @ x.transpose(-1, -2)) / (D ** 0.5), dim=-1
-        )  # (B, N_c, N)
-        x_approx = weights.transpose(-1, -2) @ C   # (B, N, D)
+        # Stage 3b: residual = x minus its reconstruction from the content slots.
+        weights = self._content_weights(x, C)       # (B, N_c, N), convex per patch
+        x_approx = weights.transpose(-1, -2) @ C    # (B, N, D)
         R = x - x_approx                            # (B, N, D)
 
         # Stage 3c: local residual detail tokens with explicit positions
@@ -256,6 +266,9 @@ class ContentDetailSplit(nn.Module):
 
         # Monitoring signals
         metrics = self._compute_metrics(C, R, x)
+        # Relative error of the content reconstruction: 0 = slots span x, 1 = slots useless.
+        metrics['content_recon_error'] = (
+            R.pow(2).sum(-1).mean() / x.pow(2).sum(-1).mean().clamp_min(1e-8))
         metrics['detail_token_count'] = torch.tensor(
             D_tokens.shape[1], device=x.device, dtype=x.dtype)
         metrics['detail_avg_window_tokens'] = detail_counts.float().mean().to(

@@ -255,6 +255,7 @@ class MAVTLoss(nn.Module):
         w_temp: float = 0.0,    # temporal consistency (video only); 0 = disabled
         w_vic: float  = 0.0,    # VICReg anti-collapse on the pooled semantic embedding
         w_dense: float = 0.0,   # per-token cosine distillation of backbone tokens to teacher patch tokens
+        w_content: float = 0.0, # force the content slots to actually reconstruct the backbone features
         distill_center: bool = False,  # centered cosine distillation
         use_lpips: bool = True,
         use_clip: bool  = False,  # requires text embeddings
@@ -270,6 +271,7 @@ class MAVTLoss(nn.Module):
         self.w_temp = w_temp
         self.w_vic = w_vic
         self.w_dense = w_dense
+        self.w_content = w_content
         self.distill_center = distill_center
         self.use_clip = use_clip
 
@@ -288,6 +290,7 @@ class MAVTLoss(nn.Module):
         teacher_embed: Optional[torch.Tensor] = None,
         dense_student: Optional[torch.Tensor] = None,   # (B, N, D) backbone tokens (projected)
         dense_teacher: Optional[torch.Tensor] = None,   # (B, N, D) teacher patch tokens on the student grid
+        content_recon_error: Optional[torch.Tensor] = None,  # relative error of the content branch
     ) -> Dict[str, torch.Tensor]:
 
         # Reconstruction
@@ -325,6 +328,10 @@ class MAVTLoss(nn.Module):
         if self.w_dense > 0.0 and dense_student is not None and dense_teacher is not None:
             l_dense = dense_distill_loss(dense_student, dense_teacher)
 
+        l_content = torch.tensor(0.0, device=pred.device)
+        if self.w_content > 0.0 and content_recon_error is not None:
+            l_content = content_recon_error
+
         # Slot diversity (auxiliary)
         l_div = slot_diversity_loss(slot_diversity)
 
@@ -342,6 +349,7 @@ class MAVTLoss(nn.Module):
             + self.w_temp * l_temp
             + self.w_vic * l_vic
             + self.w_dense * l_dense
+            + self.w_content * l_content
         )
 
         return {
@@ -356,4 +364,5 @@ class MAVTLoss(nn.Module):
             'loss_temp':  l_temp,
             'loss_vic':   l_vic,
             'loss_dense': l_dense,
+            'loss_content': l_content,
         }
