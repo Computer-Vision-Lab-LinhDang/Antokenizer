@@ -61,3 +61,23 @@ def test_loss_exposes_content_term_and_adds_it_to_total():
     base = lf(**kw)
     assert "loss_content" in out and float(out["loss_content"]) == pytest.approx(0.8)
     assert float(out["loss"]) > float(base["loss"])
+
+
+def test_content_error_is_not_satisfied_by_predicting_the_mean():
+    """Feature backbone có 99.9% năng lượng nằm ở vector trung bình chung của các patch
+    (đo 2026-09-03). Nếu chuẩn hoá theo ||x||², chỉ cần đoán trung bình là loss về ~0.001
+    mà không mang thông tin nào — model đã học đúng lời giải tầm thường đó.
+    Thước phải chuẩn hoá theo phương sai QUANH trung bình: đoán trung bình → lỗi ≈ 1.0."""
+    from mavt.model.content_detail_split import content_reconstruction_error
+    torch.manual_seed(0)
+    B, N, D = 2, 64, 32
+    big_mean = torch.randn(1, 1, D) * 100.0          # thành phần chung, chiếm gần hết năng lượng
+    dev = torch.randn(B, N, D)                        # dao động = thông tin thật
+    x = big_mean + dev
+    approx_mean_only = big_mean.expand(B, N, D)       # xấp xỉ tầm thường: chỉ đoán trung bình
+    e = float(content_reconstruction_error(x, approx_mean_only))
+    assert 0.85 < e < 1.15, f"đoán trung bình phải cho lỗi ~1.0, nhận {e:.4f}"
+    e_perfect = float(content_reconstruction_error(x, x))
+    assert e_perfect < 1e-5, e_perfect
+    half = big_mean + 0.5 * dev                       # bắt được một nửa dao động
+    assert 0.1 < float(content_reconstruction_error(x, half)) < 0.5

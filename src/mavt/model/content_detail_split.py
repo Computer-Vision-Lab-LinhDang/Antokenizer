@@ -72,6 +72,22 @@ class SlotPooler(nn.Module):
         return slots
 
 
+def content_reconstruction_error(x: torch.Tensor, x_approx: torch.Tensor) -> torch.Tensor:
+    """Relative error of the content reconstruction, normalised by the *centred* energy.
+
+    Backbone features carry ~99.9 % of their energy in a mean vector shared by every patch,
+    so normalising by ``||x||^2`` makes the metric trivially satisfiable: predicting that mean
+    alone scores 0.001 while capturing none of the per-patch variation (measured 2026-09-03 —
+    the first version of this loss learned exactly that degenerate solution). Dividing by the
+    variance around the per-sample mean makes "predict the mean" score 1.0, so only real
+    structure lowers it. 0 = slots reproduce x, 1 = slots carry nothing beyond the mean.
+    """
+    dev = x - x.mean(dim=1, keepdim=True)
+    num = (x - x_approx).pow(2).sum(-1).mean()
+    den = dev.pow(2).sum(-1).mean().clamp_min(1e-8)
+    return num / den
+
+
 class ContentDetailSplit(nn.Module):
     """Content-Detail Split module.
 
@@ -267,8 +283,7 @@ class ContentDetailSplit(nn.Module):
         # Monitoring signals
         metrics = self._compute_metrics(C, R, x)
         # Relative error of the content reconstruction: 0 = slots span x, 1 = slots useless.
-        metrics['content_recon_error'] = (
-            R.pow(2).sum(-1).mean() / x.pow(2).sum(-1).mean().clamp_min(1e-8))
+        metrics['content_recon_error'] = content_reconstruction_error(x, x_approx)
         metrics['detail_token_count'] = torch.tensor(
             D_tokens.shape[1], device=x.device, dtype=x.dtype)
         metrics['detail_avg_window_tokens'] = detail_counts.float().mean().to(
