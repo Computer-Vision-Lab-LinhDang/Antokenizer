@@ -1,0 +1,67 @@
+# Thí nghiệm C — Perceiver/TiTok: latent token học được đi thẳng trong trunk.
+#
+# Vì sao: docs/slot_attention_failure.md. Nhánh content dùng slot-attention chết vì softmax bão hoà
+# (entropy 0.0000, gradient 5e-10) do massive activations trong feature backbone. Ở đây không còn
+# module pooling riêng nào — latent đi cùng residual stream đã LayerNorm của trunk, nên không có
+# nhiệt độ riêng nào để hiệu chỉnh sai. TiTok đạt rFID 2.21 với 32 token theo đúng cách này.
+#
+# Ngân sách: 128 latent x 32 chiều = 4,096 float/ảnh 256², bằng đúng SD-VAE f8 (27.44 dB / LPIPS 0.119)
+# và bằng cấu hình window-2 hiện tại (25.07 dB / 0.262). Mốc phải vượt: 25.07 dB.
+trainer:
+  max_steps: 10000
+  devices: auto
+  precision: bf16-mixed
+  log_every_n_steps: 10
+  check_val_every_n_epoch: null
+  val_check_interval: 1000
+  limit_val_batches: 16
+  enable_checkpointing: true
+  strategy:
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args: {find_unused_parameters: true, gradient_as_bucket_view: true}
+  use_distributed_sampler: false
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args: {logging_interval: step}
+
+model:
+  training_stage: 3
+  embed_dim: 1152
+  num_heads: 16
+  mlp_ratio: 3.7361111111111112
+  semantic_dim: 1152
+  num_latent_tokens: 128            # BIẾN THÍ NGHIỆM: 128 x 32 = 4,096 float
+  t_patch: 2
+  init_siglip2: true
+  init_siglip2_patchify: true
+  siglip2_model_name: google/siglip2-so400m-patch16-384
+  rgat_impl: flex
+  edge_plane_local: true
+  edge_cross_mode: projection
+  use_gradient_checkpointing: false
+  w_l1: 1.0
+  w_lpips: 0.25
+  w_kl: 1.0
+  w_content: 0.0                    # không còn phép tách
+  w_sem: 0.0                        # tắt để cô lập biến nén-chất lượng
+  w_vic: 0.0
+  w_aux: 0.0
+  w_temp: 0.0
+  use_semantic_distill: false
+  use_lpips: true
+  lr: 1.6e-4
+  warmup_steps: 500
+  total_steps: 10000
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+data:
+  active_modalities: [image]
+  image_manifest: data/manifests/openimages_v2.jsonl
+  image_resolution: 256
+  batch_size: 128
+  num_workers: 12
+  loader_timeout: 900
+  pin_memory: true
+  val_split: 0.002
+  test_split: 0.0

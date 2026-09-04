@@ -76,6 +76,7 @@ class MAVTLightningModule(L.LightningModule):
         init_siglip2_patchify: bool = False,   # inherit Conv2d kernel + 24x24 pos table
         use_semantic_distill: bool = True,
         semantic_content_only: bool = False,  # understanding head reads content slots only
+        num_latent_tokens: int = 0,           # >0: Perceiver mode — z is K trunk latents, no content/detail split
         # Cross-stage weight transfer (loads model weights only, NOT optimizer
         # / scheduler / step state — use --ckpt_path for true resume instead).
         init_from_ckpt: Optional[str] = None,
@@ -99,6 +100,7 @@ class MAVTLightningModule(L.LightningModule):
             latent_dim=latent_dim, kl_weight=kl_weight,
             semantic_dim=semantic_dim, dec_dim=dec_dim,
             semantic_content_only=semantic_content_only,
+            num_latent_tokens=num_latent_tokens,
             num_dec_attn_blocks=num_dec_attn_blocks, r_s=r_s, r_t=r_t,
             rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
             edge_cross_mode=edge_cross_mode,

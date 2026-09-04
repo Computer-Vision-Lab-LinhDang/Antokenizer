@@ -76,6 +76,7 @@ class MAVT(nn.Module):
         r_s: int = 2,
         r_t: int = 1,
         semantic_content_only: bool = False,
+        num_latent_tokens: int = 0,       # >0: Perceiver mode — z is the K latents, no content/detail split
         rgat_impl: str = "dense",
         edge_plane_local: bool = False,
         edge_cross_mode: str = "shared_axis",
@@ -101,7 +102,9 @@ class MAVT(nn.Module):
             use_gradient_checkpointing=use_gradient_checkpointing,
             rgat_impl=rgat_impl, edge_plane_local=edge_plane_local,
             edge_cross_mode=edge_cross_mode,
+            num_latent_tokens=num_latent_tokens,
         )
+        self.num_latent_tokens = int(num_latent_tokens)
 
         # Stage 3
         self.cd_split = ContentDetailSplit(
@@ -176,15 +179,22 @@ class MAVT(nn.Module):
         features = self.backbone(tokens, positions, plane_ids, modality)
 
         # Stage 3 — Content-Detail Split
-        content_ratio, detail_ratio = _MODALITY_RATIOS[modality]
-        compressed, cd_metrics, latent_positions, latent_token_types = self.cd_split(
-            features,
-            positions=positions,
-            plane_ids=plane_ids,
-            content_ratio=content_ratio,
-            detail_ratio=detail_ratio,
-            return_metadata=True,
-        )  # (B, N_c + N_d, D)
+        if self.num_latent_tokens > 0:
+            # Perceiver mode: the trunk already produced the latents — keep only those.
+            compressed = features[:, -self.num_latent_tokens:]
+            latent_positions = latent_token_types = None
+            _z = torch.zeros((), device=x.device, dtype=compressed.dtype)
+            cd_metrics = {'slot_diversity': _z, 'residual_ratio': _z, 'content_recon_error': _z}
+        else:
+            content_ratio, detail_ratio = _MODALITY_RATIOS[modality]
+            compressed, cd_metrics, latent_positions, latent_token_types = self.cd_split(
+                features,
+                positions=positions,
+                plane_ids=plane_ids,
+                content_ratio=content_ratio,
+                detail_ratio=detail_ratio,
+                return_metadata=True,
+            )  # (B, N_c + N_d, D)
 
         # Stage 4 — VAE bottleneck (semantic now derives from z, not compressed)
         z, mu, logvar, loss_kl = self.vae_head(compressed)

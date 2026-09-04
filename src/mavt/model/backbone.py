@@ -40,6 +40,7 @@ class HybridBackbone(nn.Module):
         r_t: int = 1,
         use_gradient_checkpointing: bool = False,
         rgat_impl: str = "dense",          # dense | sparse | flex
+        num_latent_tokens: int = 0,        # >0: Perceiver mode — learned latents ride the trunk
         edge_plane_local: bool = False,    # spatial edges in each plane's own frame
         edge_cross_mode: str = "shared_axis",  # shared_axis | projection
     ):
@@ -52,6 +53,16 @@ class HybridBackbone(nn.Module):
         self.rgat_impl = rgat_impl
         self.edge_plane_local = edge_plane_local
         self.edge_cross_mode = edge_cross_mode
+
+        # Perceiver / TiTok mode: learned latent tokens are concatenated to the patch tokens
+        # and travel through the same LayerNorm'd residual stream as everything else. Having
+        # no separate pooling module means no separate attention temperature to mis-calibrate,
+        # which is what killed the slot-attention content branch (docs/slot_attention_failure.md).
+        self.num_latent_tokens = int(num_latent_tokens)
+        self.latent_tokens = (
+            nn.Parameter(torch.randn(1, self.num_latent_tokens, dim) * dim ** -0.5)
+            if self.num_latent_tokens > 0 else None
+        )
 
         self.blocks = nn.ModuleList()
         for i in range(num_blocks):
@@ -121,11 +132,19 @@ class HybridBackbone(nn.Module):
             adj_mask, edge_type_masks = graph
             graph = (adj_mask.to(x.device), [m.to(x.device) for m in edge_type_masks])
 
+        n_patch = x.shape[1]
+        if self.latent_tokens is not None:
+            x = torch.cat([x, self.latent_tokens.expand(x.shape[0], -1, -1).to(x.dtype)], dim=1)
+
         for i, block in enumerate(self.blocks):
             if i in RGAT_POSITIONS:
-                x = self._run_rgat(block, x, graph)
+                # The graph encodes 4D spatial structure, which latent tokens do not have, so
+                # they skip the RGAT block unchanged (it is residual — this is the identity)
+                # and rejoin at the next dense self-attention block.
+                patch = self._run_rgat(block, x[:, :n_patch], graph)
+                x = torch.cat([patch, x[:, n_patch:]], dim=1) if x.shape[1] > n_patch else patch
             else:
-                x = self._run_transformer(block, x)
+                x = self._run_transformer(block, x)   # dense: latents attend to every patch
         return x
 
     # ------------------------------------------------------------------ #
