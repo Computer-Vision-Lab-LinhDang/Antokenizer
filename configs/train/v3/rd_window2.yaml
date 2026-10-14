@@ -60,5 +60,5 @@ data:
   num_workers: 12
   loader_timeout: 900
   pin_memory: true
-  val_split: 0.002
+  val_split: {image: 0.005, video: 0.02, threed: 0.01}   # fraction of GROUPS (source video / image id / 3D uid), group_hash split
   test_split: 0.0

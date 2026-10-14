@@ -98,3 +98,15 @@ def test_main_prints_table_and_json(tmp_path, capsys):
     s = json.loads(out.read_text())
     assert s["items"] == 12 and s["groups"] == 7 and s["items_in_multi_member_groups"] == 8
     assert s["held_out"]["val"]["items"] == [3, 3.0, 3]
+
+
+def test_group_hash_split_has_no_video_leak(tmp_path, capsys):
+    m = tmp_path / "ov.jsonl"
+    _write_jsonl(m, [{"path": f"/v/{c}"} for c in CLIPS])
+    out = tmp_path / "h.json"
+    assert cs.main(["video", str(m), "--split-mode", "group_hash", "--val-split", "0.5", "--json", str(out)]) == 0
+    assert "group_hash split" in capsys.readouterr().out
+    s = json.loads(out.read_text())
+    assert s["seeds"] == [] and s["salt"] == "mavt-split-v1"
+    val = s["held_out"]["val"]
+    assert val["items"][0] > 0 and val["leaked_items"] == [0, 0.0, 0] and val["leaked_groups"] == [0, 0.0, 0]

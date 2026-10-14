@@ -19,6 +19,10 @@ simulate the split at the config's fractions over a few seeds and count, per gro
     python scripts/data/check_split.py video data/manifests/openvid_v2.jsonl --val-split 0.002
     python scripts/data/check_split.py image data/manifests/openimages_v2.jsonl --workers 32
     python scripts/data/check_split.py threed data/datasets/objaverse_lvis/3d_objects/renders
+
+``--split-mode group_hash --val-split <f>`` scores the fixed split of mavt.data.splits instead (the
+datamodule default since feat/data-g1): items are hashed by the same id the datamodule uses, leaks
+are still counted by the content/source keys above, so exact duplicates under two ids still show.
 """
 from __future__ import annotations
 
@@ -27,36 +31,14 @@ import hashlib
 import json
 import os
 import random
-import re
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
 PLANES = ("oxoy", "oxoz", "oyoz")
-_YTID = r"[A-Za-z0-9_-]{11}"                                       # YouTube ids are exactly 11 chars, may hold "_"/"-"
-_YT = re.compile(rf"^(?P<id>{_YTID})_\d+_\d+to\d+$")              # Panda-70M: <ytid>_<scene>_<start>to<end>
-_CELEBV = re.compile(rf"^celebv_(?P<id>{_YTID})(?:_\d+)+$")        # CelebV-HQ: celebv_<ytid>_<n>[_<m>]
-_MAGICTIME = re.compile(rf"^magictime_(?:(?P<tt>\d{{15,20}})|(?P<id>{_YTID}))(?:_\d+)*$")  # <ytid|tiktok id>[_<nnnn>...]
-_STOCK = re.compile(r"^(?P<site>pixabay|pexels|mixkit)_(?:.*_)?(?P<id>\d+)_\d+$")  # <site>_<words>_<id>_<seg>
-
-
-def video_source(path: str) -> Tuple[Optional[str], str]:
-    """(source key, origin tag) of an OpenVid clip; key None = name pattern not recognised."""
-    stem = os.path.splitext(os.path.basename(path))[0]
-    m = _CELEBV.match(stem)
-    if m:
-        return f"yt:{m['id']}", "celebv"
-    m = _MAGICTIME.match(stem)
-    if m:
-        return (f"tt:{m['tt']}" if m["tt"] else f"yt:{m['id']}"), "magictime"
-    m = _STOCK.match(stem)
-    if m:
-        return f"{m['site']}:{m['id']}", m["site"]
-    m = _YT.match(stem)
-    if m:
-        return f"yt:{m['id']}", "panda"
-    return None, "unparsed"
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+from mavt.data.splits import SPLIT_SALT, assign, group_key, video_source  # noqa: E402
 
 
 def _by(items: Sequence, key: Callable) -> Dict[Hashable, List]:
@@ -163,11 +145,25 @@ def image_keys(manifest: str, workers: int) -> Tuple[List[str], Dict]:
                                      "duplicate_ids": sum(c - 1 for c in stems.values() if c > 1)}
 
 
-def threed_keys(renders_dir: str, workers: int) -> Tuple[List[str], Dict]:
+def threed_uids(renders_dir: str) -> List[str]:
     """Objects exactly as UniversalThreeDDataset lists them (sorted, all three planes present)."""
-    uids = sorted(d for d in os.listdir(renders_dir)
+    return sorted(d for d in os.listdir(renders_dir)
                   if not d.startswith(".") and os.path.isdir(os.path.join(renders_dir, d))
                   and all(os.path.exists(os.path.join(renders_dir, d, f"{p}.png")) for p in PLANES))
+
+
+def item_ids(kind: str, source: str) -> List[str]:
+    """Per-sample ids in the order the *_keys functions return keys (what the datamodule hashes)."""
+    return threed_uids(source) if kind == "threed" else [r["path"] for r in _read_jsonl(source)]
+
+
+def hash_assign(kind: str, ids: Sequence[str], val_split: float, test_split: float, salt: str) -> List[str]:
+    """The datamodule's split_mode="group_hash" assignment (mavt.data.splits)."""
+    return [assign(group_key(kind, i), val_split, test_split, salt) for i in ids]
+
+
+def threed_keys(renders_dir: str, workers: int) -> Tuple[List[str], Dict]:
+    uids = threed_uids(renders_dir)
     items = {u: [os.path.join(renders_dir, u, f"{p}.png") for p in PLANES] for u in uids}
     rep = content_groups(items, workers=workers)
     expected = {f"{p}.png" for p in PLANES}
@@ -177,10 +173,13 @@ def threed_keys(renders_dir: str, workers: int) -> Tuple[List[str], Dict]:
 
 # --------------------------------------------------------------------------- report
 
-def summarize(keys: Sequence[Hashable], val_split: float, test_split: float, seeds: Sequence[int]) -> Dict:
+def summarize(keys: Sequence[Hashable], val_split: float, test_split: float, seeds: Sequence[int],
+              fixed_assign: Optional[Sequence[str]] = None) -> Dict:
+    """Leak counts over simulated random splits (one per seed), or over one fixed assignment."""
     sizes = Counter(keys)
     hist = Counter(min(c, 10) for c in sizes.values())
-    runs = [leak_table(keys, simulate_split(len(keys), val_split, test_split, s)) for s in seeds]
+    runs = ([leak_table(keys, fixed_assign)] if fixed_assign is not None else
+            [leak_table(keys, simulate_split(len(keys), val_split, test_split, s)) for s in seeds])
     held = {split: {f: [min(r[split][f] for r in runs), sum(r[split][f] for r in runs) / len(runs),
                         max(r[split][f] for r in runs)] for f in runs[0][split]}
             for split in runs[0]}
@@ -188,7 +187,8 @@ def summarize(keys: Sequence[Hashable], val_split: float, test_split: float, see
             "items_in_multi_member_groups": sum(c for c in sizes.values() if c > 1),
             "largest_group": max(sizes.values(), default=0),
             "group_size_hist": {("10+" if k == 10 else str(k)): v for k, v in sorted(hist.items())},
-            "held_out": held, "seeds": list(seeds), "val_split": val_split, "test_split": test_split}
+            "held_out": held, "seeds": [] if fixed_assign is not None else list(seeds),
+            "val_split": val_split, "test_split": test_split}
 
 
 def print_report(kind: str, src: str, s: Dict, notes: Dict) -> None:
@@ -197,8 +197,8 @@ def print_report(kind: str, src: str, s: Dict, notes: Dict) -> None:
     print(f"items {s['items']:,} | groups {s['groups']:,} | items sharing a group {multi:,} "
           f"({100 * multi / max(1, s['items']):.2f}%) | largest group {s['largest_group']}")
     print("group size histogram (size: groups):", ", ".join(f"{k}: {v:,}" for k, v in s["group_size_hist"].items()))
-    print(f"\nsimulated per-sample split, val {s['val_split']}, test {s['test_split']}, seeds {s['seeds']} "
-          "(min / mean / max)\n")
+    how = f"seeds {s['seeds']}" if s["seeds"] else f"group_hash split, salt {s.get('salt')!r}"
+    print(f"\nsplit: val {s['val_split']}, test {s['test_split']}, {how} (min / mean / max)\n")
     print("| split | items | groups | items whose group is also in train | groups also in train |")
     print("|---|---|---|---|---|")
     for split, r in s["held_out"].items():
@@ -218,6 +218,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--workers", type=int, default=16, help="threads for hashing size-colliding files")
     ap.add_argument("--json", help="also write the summary here")
+    ap.add_argument("--split-mode", choices=["random", "group_hash"], default="random",
+                    help="random = simulate the old per-sample random_split; group_hash = the fixed split")
+    ap.add_argument("--salt", default=SPLIT_SALT)
     a = ap.parse_args(argv)
     if a.kind == "video":
         keys, notes = video_keys(a.source)
@@ -228,7 +231,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not keys:
         print(f"no items in {a.source}", file=sys.stderr)
         return 1
-    s = summarize(keys, a.val_split, a.test_split, a.seeds)
+    fixed = (hash_assign(a.kind, item_ids(a.kind, a.source), a.val_split, a.test_split, a.salt)
+             if a.split_mode == "group_hash" else None)
+    s = summarize(keys, a.val_split, a.test_split, a.seeds, fixed)
+    if fixed is not None:
+        s["salt"] = a.salt
     print_report(a.kind, a.source, s, notes)
     if a.json:
         with open(a.json, "w") as f:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 import os
 import random
-from typing import Dict, Iterator, List, Optional, Sequence
+import warnings
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, DistributedSampler, Sampler, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, DistributedSampler, Sampler, Subset, random_split
 import lightning as L
 
 from pathlib import Path
@@ -21,6 +22,7 @@ from mavt.data.datasets import (
     ManifestImageDataset,
     ManifestVideoDataset,
 )
+from mavt.data.splits import DEFAULT_VAL, SPLIT_SALT, fraction_for, group_key, item_ids, split_indices
 
 
 def _collate(batch):
@@ -196,9 +198,14 @@ class MAVTDataModule(L.LightningDataModule):
         triplane_res: int = 256,
         # Synthetic (smoke test)
         synthetic_n: int = 64,
-        # Train/val/test split
-        val_split: float = 0.05,
-        test_split: float = 0.0,
+        # Train/val/test split. group_hash (default): fixed by sha1(salt + group) — clips of one
+        # source video / one image id / one 3D uid stay on one side, and the split survives manifest
+        # growth. Fractions are of groups; a float applies to every modality, a dict per modality.
+        # random: the old per-sample random_split (leaks groups; only for datasets without ids).
+        split_mode: str = "group_hash",
+        split_salt: str = SPLIT_SALT,
+        val_split: Union[float, Dict[str, float], None] = None,
+        test_split: Union[float, Dict[str, float]] = 0.0,
         # DataLoader params
         batch_size: int = 8,
         num_workers: int = 4,
@@ -251,21 +258,46 @@ class MAVTDataModule(L.LightningDataModule):
 
     # ------------------------------------------------------------------ #
 
+    def _split(self, modality: str, ds: Dataset) -> Tuple[Dataset, Dataset, Optional[Dataset]]:
+        hp = self.hparams
+        val_frac = fraction_for(modality, hp.val_split, DEFAULT_VAL)
+        test_frac = fraction_for(modality, hp.test_split, {})
+        ids = item_ids(ds) if hp.split_mode == "group_hash" else None
+        if hp.split_mode not in ("group_hash", "random"):
+            raise ValueError(f"split_mode must be 'group_hash' or 'random', got {hp.split_mode!r}")
+        if ids is None:
+            if hp.split_mode == "group_hash" and not isinstance(ds, SyntheticMultiModalDataset):
+                warnings.warn(f"[MAVTDataModule] {modality}: {type(ds).__name__} exposes no sample ids, "
+                              "falling back to a per-sample random_split: groups (source videos, assets) "
+                              "can leak between train and val.", stacklevel=2)
+            n = len(ds)
+            n_val = max(1, int(n * val_frac))
+            n_test = max(1, int(n * test_frac)) if test_frac > 0 else 0
+            parts = random_split(ds, [n - n_val - n_test, n_val] + ([n_test] if n_test else []))
+            return parts[0], parts[1], (parts[2] if n_test else None)
+        idx = split_indices([group_key(modality, i) for i in ids], val_frac, test_frac, hp.split_salt)
+        if not idx["val"] or not idx["train"]:
+            raise ValueError(f"[MAVTDataModule] {modality}: group_hash split of {len(ids)} samples gave "
+                             f"{len(idx['train'])} train / {len(idx['val'])} val at val_split={val_frac}; "
+                             "raise val_split or add data.")
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(f"[MAVTDataModule] {modality}: group_hash split (salt={hp.split_salt!r}, val={val_frac}, "
+                  f"test={test_frac}) -> train {len(idx['train'])} / val {len(idx['val'])} / "
+                  f"test {len(idx['test'])}", flush=True)
+        return (Subset(ds, idx["train"]), Subset(ds, idx["val"]),
+                Subset(ds, idx["test"]) if test_frac > 0 else None)
+
     def setup(self, stage: Optional[str] = None) -> None:
         hp = self.hparams
         full_datasets = [self._make_dataset(m) for m in hp.active_modalities]
 
         train_splits, val_splits, test_splits = [], [], []
-        for ds in full_datasets:
-            n = len(ds)
-            n_val = max(1, int(n * hp.val_split))
-            n_test = max(1, int(n * hp.test_split)) if hp.test_split > 0 else 0
-            n_train = n - n_val - n_test
-            parts = random_split(ds, [n_train, n_val, n_test]) if n_test else random_split(ds, [n_train, n_val])
-            train_splits.append(parts[0])
-            val_splits.append(parts[1])
-            if n_test:
-                test_splits.append(parts[2])
+        for modality, ds in zip(hp.active_modalities, full_datasets):
+            train, val, test = self._split(modality, ds)
+            train_splits.append(train)
+            val_splits.append(val)
+            if test is not None:
+                test_splits.append(test)
 
         if len(train_splits) == 1:
             self._train_ds: Dataset = train_splits[0]

@@ -57,8 +57,13 @@ def teacher_pool(teacher, x, size):
 @torch.no_grad()
 def run_openimages(model, teacher, tsize, args, dev):
     from torch.utils.data import DataLoader, Subset
+    from mavt.data.splits import group_key, split_indices
     ds = ManifestImageDataset(args.manifest, args.resolution)
-    ds = Subset(ds, range(min(args.n_images, len(ds))))
+    # held-out images only: the datamodule's group_hash val split (same salt and fraction as training)
+    val = split_indices([group_key("image", r["path"]) for r in ds.records], args.val_split, 0.0, args.split_salt)["val"]
+    if len(val) < args.n_images:
+        print(f"[openimages] only {len(val)} val images < --n-images {args.n_images}", flush=True)
+    ds = Subset(ds, val[:args.n_images])
     dl = DataLoader(ds, batch_size=args.batch, num_workers=4)
     lp = None
     try:
@@ -101,6 +106,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt"); ap.add_argument("--manifest", default="data/manifests/openimages.jsonl")
     ap.add_argument("--n-images", type=int, default=1024); ap.add_argument("--resolution", type=int, default=256)
+    from mavt.data.splits import DEFAULT_VAL, SPLIT_SALT
+    ap.add_argument("--val-split", type=float, default=DEFAULT_VAL["image"], help="must match the training config")
+    ap.add_argument("--split-salt", default=SPLIT_SALT)
     ap.add_argument("--batch", type=int, default=32); ap.add_argument("--teacher", default="google/siglip2-so400m-patch16-384")
     ap.add_argument("--init-siglip2", action="store_true"); ap.add_argument("--init-patchify", action="store_true")
     ap.add_argument("--semantic-dim", type=int, default=1152); ap.add_argument("--mlp-ratio", type=float, default=4304 / 1152)
