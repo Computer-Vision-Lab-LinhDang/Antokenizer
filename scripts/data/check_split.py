@@ -10,7 +10,9 @@ simulate the split at the config's fractions over a few seeds and count, per gro
 
     image  : Open Images manifest  -> key = exact file content (size -> first 64 KiB -> full sha1)
     video  : OpenVid manifest      -> key = source video parsed from the clip name
-                                      <ytid>_<scene>_<s>to<e> and celebv_<ytid>_<n> -> yt:<ytid>
+                                      <ytid>_<scene>_<s>to<e>, celebv_<ytid>_<n>[_<m>],
+                                      magictime_<ytid>[_<nnnn>]                      -> yt:<ytid>
+                                      magictime_<tiktok id>[_<nnnn>]                 -> tt:<id>
                                       <pixabay|pexels|mixkit>_<words>_<id>_<seg>     -> <site>:<id>
     threed : renders/<uid>/ dir    -> key = exact content of oxoy+oxoz+oyoz (same asset, two uids)
 
@@ -32,8 +34,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
 PLANES = ("oxoy", "oxoz", "oyoz")
-_YT = re.compile(r"^(?P<id>.+)_\d+_\d+to\d+$")                    # Panda-70M: <ytid>_<scene>_<start>to<end>
-_CELEBV = re.compile(r"^celebv_(?P<id>.+)_\d+$")                  # CelebV-HQ: celebv_<ytid>_<n>
+_YTID = r"[A-Za-z0-9_-]{11}"                                       # YouTube ids are exactly 11 chars, may hold "_"/"-"
+_YT = re.compile(rf"^(?P<id>{_YTID})_\d+_\d+to\d+$")              # Panda-70M: <ytid>_<scene>_<start>to<end>
+_CELEBV = re.compile(rf"^celebv_(?P<id>{_YTID})(?:_\d+)+$")        # CelebV-HQ: celebv_<ytid>_<n>[_<m>]
+_MAGICTIME = re.compile(rf"^magictime_(?:(?P<tt>\d{{15,20}})|(?P<id>{_YTID}))(?:_\d+)*$")  # <ytid|tiktok id>[_<nnnn>...]
 _STOCK = re.compile(r"^(?P<site>pixabay|pexels|mixkit)_(?:.*_)?(?P<id>\d+)_\d+$")  # <site>_<words>_<id>_<seg>
 
 
@@ -43,6 +47,9 @@ def video_source(path: str) -> Tuple[Optional[str], str]:
     m = _CELEBV.match(stem)
     if m:
         return f"yt:{m['id']}", "celebv"
+    m = _MAGICTIME.match(stem)
+    if m:
+        return (f"tt:{m['tt']}" if m["tt"] else f"yt:{m['id']}"), "magictime"
     m = _STOCK.match(stem)
     if m:
         return f"{m['site']}:{m['id']}", m["site"]

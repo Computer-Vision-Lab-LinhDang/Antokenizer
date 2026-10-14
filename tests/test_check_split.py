@@ -11,6 +11,9 @@ cs = importlib.util.module_from_spec(spec); spec.loader.exec_module(cs)  # type:
 CLIPS = [
     "ECfF08Vn_5w_14_0to274.mp4", "ECfF08Vn_5w_15_0to100.mp4",   # ytid with "_" -> one source, 2 scenes
     "celebv_ECfF08Vn_5w_3.mp4",                                  # same YouTube video via CelebV-HQ
+    "celebv_ECfF08Vn_5w_59_0.mp4",                               # CelebV with two trailing numbers
+    "magictime_vGOR2_vlq9M_0001.mp4", "magictime_vGOR2_vlq9M_0022_0003.mp4",  # MagicTime, YouTube source
+    "magictime_7136539298299530527_0001.mp4",                    # MagicTime, TikTok source
     "---_iRTHryQ_13_0to241.mp4",                                 # ytid starting with "-"
     "pixabay_Spring_Blossoms_39162_002.mp4", "pixabay_flowers_videos_39162_005.mp4",  # one stock video, 2 categories
     "pexels_landscape_landscape_39162_000.mp4",                  # same number, other site: separate source, flagged
@@ -24,15 +27,16 @@ def _write_jsonl(path, recs):
 
 def test_video_source_keys():
     keys = [cs.video_source(c)[0] for c in CLIPS]
-    assert keys == ["yt:ECfF08Vn_5w"] * 3 + ["yt:---_iRTHryQ", "pixabay:39162", "pixabay:39162",
-                                             "pexels:39162", None]
+    assert keys == ["yt:ECfF08Vn_5w"] * 4 + ["yt:vGOR2_vlq9M"] * 2 + [
+        "tt:7136539298299530527", "yt:---_iRTHryQ", "pixabay:39162", "pixabay:39162", "pexels:39162", None]
+    assert cs.video_source("magictime_✨How to Grow.mp4")[0] is None
 
 
 def test_video_keys_notes(tmp_path):
     m = tmp_path / "ov.jsonl"
     _write_jsonl(m, [{"path": f"/v/part0/{c}"} for c in CLIPS])
     keys, notes = cs.video_keys(str(m))
-    assert len(set(keys)) == 5
+    assert len(set(keys)) == 7
     assert notes["unparsed_names"] == 1 and notes["unparsed_examples"] == ["mixkit-unknown-layout.mp4"]
     assert notes["yt_ids_in_both_celebv_and_panda"] == 1
     assert notes["stock_ids_under_two_sites"] == 1
@@ -92,5 +96,5 @@ def test_main_prints_table_and_json(tmp_path, capsys):
     assert cs.main(["video", str(m), "--val-split", "0.25", "--seeds", "0", "1", "--json", str(out)]) == 0
     assert "| val |" in capsys.readouterr().out
     s = json.loads(out.read_text())
-    assert s["items"] == 8 and s["groups"] == 5 and s["items_in_multi_member_groups"] == 5
-    assert s["held_out"]["val"]["items"] == [2, 2.0, 2]
+    assert s["items"] == 12 and s["groups"] == 7 and s["items_in_multi_member_groups"] == 8
+    assert s["held_out"]["val"]["items"] == [3, 3.0, 3]
