@@ -43,7 +43,7 @@ def test_h2_content_weights_normalise_over_slot_axis():
 
 
 def test_h6_mask_cache_is_keyed_by_layout_not_only_n():
-    """H6 — trùng cache key. Dòng: backbone.py:85 (_mask_cache) và :94 key = (modality, N).
+    """H6 — trùng cache key. Dòng: backbone.py:82 (_mask_cache) và :92 key = (modality, N).
 
     Ảnh 16x16 và 8x32 patch cùng N=256 nên lấy chung mask: đầu vào thứ hai chạy RGAT trên đồ thị
     láng giềng của bố cục thứ nhất. Va chạm thực tế khác: video (Tp,Hp,Wp)=(4,8,8) và (1,16,16).
@@ -82,8 +82,8 @@ def test_h8_slot_diversity_loss_has_gradient():
 
 
 def test_h17_semantic_signal_keeps_a_token_axis():
-    """H17 — một vector toàn cục làm nút cổ chai. Dòng: decoder.py:500-504
-    (UnderstandingDecoder: một query attention-pool -> (B, semantic_dim)), mavt.py:199.
+    """H17 — một vector toàn cục làm nút cổ chai. Dòng: decoder.py:503-505
+    (UnderstandingDecoder: một query attention-pool -> (B, semantic_dim)), mavt.py:204.
 
     Toàn bộ giám sát ngữ nghĩa lên z đi qua MỘT vector mỗi mẫu (ví dụ 768 số so với 4096 số latent
     ở perceiver 128x32). Head không có positional encoding, nên còn mù bố cục. w_dense không tính:
