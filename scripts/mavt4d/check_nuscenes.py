@@ -481,8 +481,8 @@ def render_graph(r: dict) -> list[str]:
          "| M1 criterion | measured | threshold | verdict |", "|---|---|---|---|",
          f"| projection edges re-project into their patch | {passed}/{edges} = {_rate(passed, edges)}; "
          f"H2P = reverse of P2H in every sample: {reverse} | 100% | {_verdict(proj_ok)} |",
-         f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps (`pm5`, graph's cell rule: upper bound) "
-         f"| {fv5[0]}/{fv5[1]} = {_rate(*fv5)} | < {FV_MAX:.0%} | {_verdict(fv_ok)} (upper bound, cell rule) |",
+         f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps (`pm5`, graph's cell rule) "
+         f"| {fv5[0]}/{fv5[1]} = {_rate(*fv5)} | < {FV_MAX:.0%} | {_verdict(fv_ok)} (cell rule; see attribution) |",
          "| data_wait_frac | not measured (needs T25) | < 0.10 | pending |", "",
          "### Projection re-check", "",
          "An edge passes when at least one member of its hub, lifted to world in float64 and projected with "
@@ -513,11 +513,13 @@ def render_graph(r: dict) -> list[str]:
           "with its own ego pose; points with |x|, |y| < 1 m in the sensor frame (ego body, as devkit `remove_close`) "
           "and points inside the annotation boxes interpolated at the sweep's time, dilated 0.3 m (moving objects "
           "smear across sweeps), are dropped from the neighbours. Same cell and tol as the graph, so grazing ground "
-          "at range can be rejected by a denser cloud of the same surface: this rate is an upper bound. The synthetic "
+          "at range can be rejected by a denser cloud of the same surface, which inflates this rate; it also misses "
+          "occluders the roof LiDAR never returns (parallax shadows, glass, thin objects), so it is not a strict "
+          "bound either way. The synthetic "
           "test of T11 (`gt_visible`) excludes grazing on purpose (farthest of the 4 surrounding GT depths); no such "
           "definition is applied to real data here.",
           "- Attribution rows, not gates: `pm1` = ±1 sweep (±50 ms, so pose drift is negligible: a jump from `pm0` "
-          "to `pm1` comes from point density alone; growth from `pm1` to `pm5` mixes density with registration over "
+          "to `pm1` is mostly density; growth from `pm1` to `pm5` mixes density with registration over "
           "time and does not separate them); `pm5_ego3` = ego exclusion widened to |x|, |y| < 3 m (a collapse on "
           "CAM_FRONT / CAM_BACK means ghosts of the ego body from neighbour sweeps); `pm5_noground` = neighbour points "
           f"below world z {GROUND_Z_M} m dropped (a collapse in the far bins means grazing ground).", "",

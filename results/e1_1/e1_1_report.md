@@ -104,7 +104,7 @@ Every m3 sample of mini_train and mini_val: hold-out (frac 0.3) -> `build_hubs` 
 | M1 criterion | measured | threshold | verdict |
 |---|---|---|---|
 | projection edges re-project into their patch | 974852/974852 = 100.00%; H2P = reverse of P2H in every sample: True | 100% | **PASS** |
-| false-visible vs LiDAR merged over ±5 sweeps (`pm5`, graph's cell rule: upper bound) | 925455/3018725 = 30.66% | < 5% | **FAIL** (upper bound, cell rule) |
+| false-visible vs LiDAR merged over ±5 sweeps (`pm5`, graph's cell rule) | 925455/3018725 = 30.66% | < 5% | **FAIL** (cell rule; see attribution) |
 | data_wait_frac | not measured (needs T25) | < 0.10 | pending |
 
 ### Projection re-check
@@ -124,8 +124,8 @@ Members counted: one per hub member slot, visible to the builder's z-buffer and 
 
 - `train`: the graph's own reference (input points of the keyframe sweep). Must be 0; checks the counting.
 - `pm0`: every point of the keyframe sweep, held-out included (effect of hold-out sparsity alone).
-- `pm5` (gate): `pm0` plus up to ±5 neighbouring LIDAR_TOP sweeps inside the scene, each placed with its own ego pose; points with |x|, |y| < 1 m in the sensor frame (ego body, as devkit `remove_close`) and points inside the annotation boxes interpolated at the sweep's time, dilated 0.3 m (moving objects smear across sweeps), are dropped from the neighbours. Same cell and tol as the graph, so grazing ground at range can be rejected by a denser cloud of the same surface: this rate is an upper bound. The synthetic test of T11 (`gt_visible`) excludes grazing on purpose (farthest of the 4 surrounding GT depths); no such definition is applied to real data here.
-- Attribution rows, not gates: `pm1` = ±1 sweep (±50 ms, so pose drift is negligible: a jump from `pm0` to `pm1` comes from point density alone; growth from `pm1` to `pm5` mixes density with registration over time and does not separate them); `pm5_ego3` = ego exclusion widened to |x|, |y| < 3 m (a collapse on CAM_FRONT / CAM_BACK means ghosts of the ego body from neighbour sweeps); `pm5_noground` = neighbour points below world z 0.3 m dropped (a collapse in the far bins means grazing ground).
+- `pm5` (gate): `pm0` plus up to ±5 neighbouring LIDAR_TOP sweeps inside the scene, each placed with its own ego pose; points with |x|, |y| < 1 m in the sensor frame (ego body, as devkit `remove_close`) and points inside the annotation boxes interpolated at the sweep's time, dilated 0.3 m (moving objects smear across sweeps), are dropped from the neighbours. Same cell and tol as the graph, so grazing ground at range can be rejected by a denser cloud of the same surface, which inflates this rate; it also misses occluders the roof LiDAR never returns (parallax shadows, glass, thin objects), so it is not a strict bound either way. The synthetic test of T11 (`gt_visible`) excludes grazing on purpose (farthest of the 4 surrounding GT depths); no such definition is applied to real data here.
+- Attribution rows, not gates: `pm1` = ±1 sweep (±50 ms, so pose drift is negligible: a jump from `pm0` to `pm1` is mostly density; growth from `pm1` to `pm5` mixes density with registration over time and does not separate them); `pm5_ego3` = ego exclusion widened to |x|, |y| < 3 m (a collapse on CAM_FRONT / CAM_BACK means ghosts of the ego body from neighbour sweeps); `pm5_noground` = neighbour points below world z 0.3 m dropped (a collapse in the far bins means grazing ground).
 
 | split | reference | used members | false-visible | rate | [0, 10) | [10, 20) | [20, 40) | [40, inf) |
 |---|---|---|---|---|---|---|---|---|
