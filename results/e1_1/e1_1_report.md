@@ -1,6 +1,6 @@
 # E1.1 nuScenes data check (v1.0-mini)
 
-dataroot `/home/user02/edtech/antoken/data/datasets/nuscenes`; wall 489 s; headnode load average at start 138, 131, 124 (timings are inflated by a shared, loaded headnode).
+dataroot `/home/user02/edtech/antoken/data/datasets/nuscenes`; wall 661 s; headnode load average at start 46, 102, 113 (timings are inflated by a shared, loaded headnode).
 
 ## Sample counts
 
@@ -90,12 +90,12 @@ Independent check against the devkit's map_pointcloud_to_image chain (pyquaterni
 
 | mode | workers | n | wall [s] | s/sample |
 |---|---|---|---|---|
-| m3 | 0 | 24 | 5.1 | 0.213 |
-| m3 | 2 | 24 | 4.8 | 0.199 |
-| m2 | 0 | 24 | 3.0 | 0.123 |
-| m2 | 2 | 24 | 1.9 | 0.080 |
+| m3 | 0 | 24 | 1.8 | 0.074 |
+| m3 | 2 | 24 | 1.3 | 0.056 |
+| m2 | 0 | 24 | 6.2 | 0.260 |
+| m2 | 2 | 24 | 3.3 | 0.138 |
 
-Peak RSS (getrusage, same counter as `/usr/bin/time -v`): main process 832 MB, largest joined DataLoader worker 651 MB. The `/usr/bin/time -v` log of this run, if wrapped, sits beside this report as `time_v.log`.
+Peak RSS (getrusage, same counter as `/usr/bin/time -v`): main process 871 MB, largest joined DataLoader worker 664 MB. The `/usr/bin/time -v` log of this run, if wrapped, sits beside this report as `time_v.log`.
 
 ## Graph edges (T27, gate M1)
 
@@ -103,16 +103,18 @@ Every m3 sample of mini_train and mini_val: hold-out (frac 0.3) -> `build_hubs` 
 
 False-visible metric, the same for every row (M1 rule): a member behind a kept PROJ_P2H edge is false-visible when `zbuffer_visibility` with cell 4 px and tol 0.5 m rejects it against LiDAR merged over ±5 sweeps (`pm5`, gate) or against the keyframe sweep with held-out points restored (`pm0`). `own rule` re-runs each variant's own z-buffer on its own reference and must be 0 (counting check).
 
+Corrected rule (metric revision 2026-10-15, calibrated on synthetic GT, `fv_calibration.md`): cell 4 px, tol 0.5 m + 5% of depth, reference points within 0.2 m of the member's hub plane ignored. Both rules are reported; the M1 rule's numbers are kept.
+
 ### Builder variants
 
-| variant | z-buffer cell / tol | grazing filter | FV ±5 sweeps | FV keyframe sweep | own rule | re-check | P2H = H2P edges | used members | mean in-degree P2H per hub / H2P per patch | prepare median [s] | M1 re-check / FV |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| baseline | 4 px / 0.5 m | off | **30.66%** | 4.28% | 0 | 100.00% | 974852 | 3018725 | 9.47 / 0.90 | 0.223 | **PASS** / **FAIL** |
-| grazing | 4 px / 0.5 m | cos ≥ 0.2 | **27.64%** | 4.18% | 0 | 100.00% | 622252 | 1947346 | 6.15 / 0.59 | 0.231 | **PASS** / **FAIL** |
-| reltol | 4 px / 5% of depth | off | **33.81%** | 8.62% | 0 | 100.00% | 979200 | 3160699 | 9.52 / 0.91 | 0.222 | **PASS** / **FAIL** |
-| cell2 | 2 px / 0.5 m | off | **37.05%** | 13.08% | 0 | 100.00% | 1010816 | 3319111 | 9.81 / 0.93 | 0.228 | **PASS** / **FAIL** |
-| grazing+reltol | 4 px / 5% of depth | cos ≥ 0.2 | **31.13%** | 8.79% | 0 | 100.00% | 625497 | 2045492 | 6.18 / 0.59 | 0.225 | **PASS** / **FAIL** |
-| all | 2 px / 5% of depth | cos ≥ 0.2 | **34.51%** | 13.27% | 0 | 100.00% | 646096 | 2150540 | 6.37 / 0.61 | 0.221 | **PASS** / **FAIL** |
+| variant | z-buffer cell / tol | grazing filter | FV ±5 sweeps | FV keyframe sweep | FV ±5, corrected rule | own rule | re-check | P2H = H2P edges | used members | mean in-degree P2H per hub / H2P per patch | prepare median [s] | M1 re-check / FV (M1 rule) / FV (corrected) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | 4 px / 0.5 m | off | **30.66%** | 4.28% | **15.83%** | 0 | 100.00% | 974852 | 3018725 | 9.47 / 0.90 | 0.237 | **PASS** / **FAIL** / **FAIL** |
+| grazing | 4 px / 0.5 m | cos ≥ 0.2 | **27.64%** | 4.18% | **14.98%** | 0 | 100.00% | 622252 | 1947346 | 6.15 / 0.59 | 0.238 | **PASS** / **FAIL** / **FAIL** |
+| reltol | 4 px / 5% of depth | off | **33.81%** | 8.62% | **15.84%** | 0 | 100.00% | 979200 | 3160699 | 9.52 / 0.91 | 0.242 | **PASS** / **FAIL** / **FAIL** |
+| cell2 | 2 px / 0.5 m | off | **37.05%** | 13.08% | **19.82%** | 0 | 100.00% | 1010816 | 3319111 | 9.81 / 0.93 | 0.244 | **PASS** / **FAIL** / **FAIL** |
+| grazing+reltol | 4 px / 5% of depth | cos ≥ 0.2 | **31.13%** | 8.79% | **14.96%** | 0 | 100.00% | 625497 | 2045492 | 6.18 / 0.59 | 0.231 | **PASS** / **FAIL** / **FAIL** |
+| all | 2 px / 5% of depth | cos ≥ 0.2 | **34.51%** | 13.27% | **18.83%** | 0 | 100.00% | 646096 | 2150540 | 6.37 / 0.61 | 0.233 | **PASS** / **FAIL** / **FAIL** |
 
 Settings, each chosen once (no sweep): grazing filter cos ≥ 0.2 (incidence ≤ ~78°; with a 5% tolerance and fx / cell ≈ 90 px a surface stays inside the tolerance up to tan(incidence) ≈ 4.5); relative tolerance 5% of depth replacing the fixed 0.5 m (equal to it at 10 m: stricter nearer, looser farther); cell 2 px against 4 px. Prepare = hold-out + hubs + graph inside a worker, all variants timed in the same item so they share the headnode's load.
 
@@ -140,16 +142,24 @@ False-visible (`pm5`, M1 rule) per camera, both splits:
 | CAM_BACK_LEFT | 27.45% | 22.71% | 29.07% | 33.70% | 24.24% | 28.14% |
 | CAM_FRONT_LEFT | 25.16% | 22.79% | 27.64% | 31.46% | 25.85% | 28.96% |
 
-- mini_train: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm5 273452; dropped from neighbours: 27680260 ego-body, 9924706 in boxes (|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).
-- mini_val: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm5 266331; dropped from neighbours: 6870304 ego-body, 2574932 in boxes (|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).
+- mini_train: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm1 82606, pm5 273452; dropped from neighbours: 27680260 ego-body, 9924706 in boxes (|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).
+- mini_val: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm1 81183, pm5 266331; dropped from neighbours: 6870304 ego-body, 2574932 in boxes (|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).
 
 ### Default GraphConfig (`baseline`): patch 16, cell 4 px, tol 0.5 m, caps hub 32 / patch 8
 
 | M1 criterion | measured | threshold | verdict |
 |---|---|---|---|
 | projection edges re-project into their patch | 974852/974852 = 100.00%; H2P = reverse of P2H in every sample: True | 100% | **PASS** |
-| false-visible vs LiDAR merged over ±5 sweeps | 925455/3018725 = 30.66% | < 5% | **FAIL** |
+| false-visible vs LiDAR merged over ±5 sweeps, M1 rule as first measured | 925455/3018725 = 30.66% | < 5% | **FAIL** |
+| false-visible vs LiDAR merged over ±5 sweeps, corrected rule (revision 2026-10-15) | 477719/3018725 = 15.83% | < 5% | **FAIL** |
 | data_wait_frac | not measured (needs T25) | < 0.10 | pending |
+
+False-visible of the default builder's edges against reference density:
+
+| rule | keyframe sweep | ±1 sweep | ±5 sweeps |
+|---|---|---|---|
+| M1 rule | 4.28% | 15.60% | 30.66% |
+| corrected rule | 2.07% | 7.21% | 15.83% |
 
 Projection re-check: an edge passes when at least one member of its hub, lifted to world in float64 and projected with `project` (not the builder's float32 path), lands in the edge's patch in front of the camera (spec T11, test 1).
 
@@ -186,7 +196,7 @@ Caps, max over all variants: SPATIAL max 24 vs cap 24 (ok); PROJ_P2H max 32 vs c
 
 ### Prepare time (mini_train m3, default GraphConfig)
 
-Loader delivering (sample, hubs, graph) with 8 workers (1 torch thread each) over 160 samples: wall 21.9 s = **0.137 s/sample**. Inside a worker: load (6 JPEGs + sweep) median 0.4477 s (p95 1.021), hold-out + hubs + graph median 0.2409 s (p95 0.7207). Headnode load average before this pass: 136, 133, 125 on a shared 8-core headnode, so these are upper bounds for a dedicated node. Per-variant prepare medians are in the variant table (measured inside the check pass, which also runs the checks).
+Loader delivering (sample, hubs, graph) with 8 workers (1 torch thread each) over 160 samples: wall 10.1 s = **0.063 s/sample**. Inside a worker: load (6 JPEGs + sweep) median 0.1861 s (p95 0.263), hold-out + hubs + graph median 0.2124 s (p95 0.3397). Headnode load average before this pass: 32, 93, 110 on a shared 8-core headnode, so these are upper bounds for a dedicated node. Per-variant prepare medians are in the variant table (measured inside the check pass, which also runs the checks).
 
 ## Pending
 

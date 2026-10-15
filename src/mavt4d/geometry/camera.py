@@ -51,21 +51,23 @@ def pixel_to_patch(uv: Tensor, patch: int, Hp: int, Wp: int) -> tuple[Tensor, Te
     return torch.floor(uv.flip(-1) / patch).long(), inside
 
 
+def cell_index(uv: Tensor, depth: Tensor, H: int, W: int, cell_px: int) -> tuple[Tensor, Tensor, int]:
+    """(N,) in-image-and-in-front mask, (N,) index of the ``cell_px`` x ``cell_px`` cell (0 where not ok) and
+    the number of cells of an H x W image."""
+    nr, nc = -(-H // cell_px), -(-W // cell_px)
+    rc, inside = pixel_to_patch(uv, cell_px, nr, nc)
+    ok = inside & (uv[:, 0] < W) & (uv[:, 1] < H) & (depth > 0)
+    return ok, torch.where(ok, rc[:, 0] * nc + rc[:, 1], 0), nr * nc
+
+
 def zbuffer_visibility(uv: Tensor, depth: Tensor, ref_uv: Tensor, ref_depth: Tensor, H: int, W: int,
                        cell_px: int = 4, tol_m: float = 0.5, tol_rel: float = 0.0) -> Tensor:
     """(N,) bool: point is in the image, in front of the camera and within ``tol_m + tol_rel * depth`` of the
     nearest reference depth in its ``cell_px`` x ``cell_px`` cell. A cell with no reference counts as visible."""
-    nr, nc = -(-H // cell_px), -(-W // cell_px)
-
-    def cell(uv: Tensor, d: Tensor) -> tuple[Tensor, Tensor]:
-        rc, inside = pixel_to_patch(uv, cell_px, nr, nc)
-        ok = inside & (uv[:, 0] < W) & (uv[:, 1] < H) & (d > 0)
-        return ok, torch.where(ok, rc[:, 0] * nc + rc[:, 1], 0)
-
-    ref_ok, ref_idx = cell(ref_uv, ref_depth)
-    zmin = torch.full((nr * nc,), float("inf"), dtype=ref_depth.dtype, device=ref_depth.device)
+    ref_ok, ref_idx, n_cells = cell_index(ref_uv, ref_depth, H, W, cell_px)
+    zmin = torch.full((n_cells,), float("inf"), dtype=ref_depth.dtype, device=ref_depth.device)
     zmin.scatter_reduce_(0, ref_idx[ref_ok], ref_depth[ref_ok], "amin")
-    ok, idx = cell(uv, depth)
+    ok, idx, _ = cell_index(uv, depth, H, W, cell_px)
     return ok & (depth <= zmin[idx] + tol_m + tol_rel * depth)
 
 

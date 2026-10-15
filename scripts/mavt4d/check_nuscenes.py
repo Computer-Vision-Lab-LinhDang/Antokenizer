@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from mavt4d.data.holdout import apply_holdout
 from mavt4d.data.nuscenes import CAM6, LIDAR, NuScenesSceneDataset, load_official_split
-from mavt4d.eval.graph_checks import CHEB_MAX, DEPTH_BINS_M, false_visible_counts, recheck_projection_edges
+from mavt4d.eval.graph_checks import CHEB_MAX, DEPTH_BINS_M, FVRule, false_visible_counts, recheck_projection_edges
 from mavt4d.geometry.camera import invert_se3, project, transform_points, unproject
 from mavt4d.geometry.hubs import build_hubs
 from mavt4d.graph.builder import GraphConfig, build_graph
@@ -34,8 +34,10 @@ from mavt4d.graph.types import EdgeType
 SPLITS = ("mini_train", "mini_val")
 GCFG = GraphConfig()  # default graph configuration, as in training
 FV_MAX = 0.05  # M1: false-visible rate against LiDAR merged over +-5 sweeps
-REFS = ("train", "pm0", "pm5")  # false-visible references, see _GraphItems
-M1_RULE = {"ref_cell_px": 4, "ref_tol_m": 0.5, "ref_tol_rel": 0.0}  # M1 occlusion rule, fixed across variants
+REFS = ("train", "pm0", "pm1", "pm5")  # false-visible references, see _GraphItems
+M1_RULE = FVRule(cell_px=4, tol_m=0.5)  # M1 occlusion rule (T27 as first measured), fixed across variants
+CORRECTED_RULE = FVRule(cell_px=4, tol_m=0.5, tol_rel=0.05, plane_tau=0.2)  # revision 2026-10-15, fv_calibration.md
+CORR = "@corr"  # suffix of false-visible keys measured with CORRECTED_RULE
 COS_MIN = 0.2  # grazing filter: |cos incidence| >= 0.2 (~78 deg); 5% tol at fx / cell ~ 90 allows tan(theta) < 4.5
 TOL_REL = 0.05  # depth-relative tolerance replacing 0.5 m: equal to it at 10 m
 COLLINEAR = 0.05  # lambda_mid / lambda_max below this: hub members nearly on a line, normal ill-defined
@@ -208,17 +210,21 @@ class _GraphItems(Dataset):
         hubs_s = time.perf_counter() - t1
         full = transform_points(h.lidar_to_world[0], h.lidar_points[0][:, :3])
         nb, info = self.ds.neighbour_points(i, self.n_sweeps)
+        nb1, _ = self.ds.neighbour_points(i, 1)
         refs = {"train": [transform_points(h.lidar_to_world[0], h.input_points(0)[:, :3])], "pm0": [full],
-                "pm5": [torch.cat([full, nb])]}
+                "pm1": [torch.cat([full, nb1])], "pm5": [torch.cat([full, nb])]}
         cams, out = self.ds.cameras, {}
         for name, cfg in VARIANTS.items():
             t = time.perf_counter()
             graph, stats = build_graph(h, hubs, cfg)
             v = {"prepare_s": hubs_s + time.perf_counter() - t, "stats": asdict(stats),
                  "max_in_degree": {et.name: int(graph.in_degree(et).max()) for et in EdgeType},
-                 "recheck": recheck_projection_edges(h, hubs, graph, cfg),
-                 "fv": {ref: {cams[k[0]]: c for k, c in false_visible_counts(
-                     h, hubs, graph, refs[ref], cfg, **({} if ref == "train" else M1_RULE)).items()} for ref in REFS}}
+                 "recheck": recheck_projection_edges(h, hubs, graph, cfg), "fv": {}}
+            keys = REFS if name == "baseline" else ("train", "pm0", "pm5")  # pm1 only for the baseline
+            for key in keys + tuple(r + CORR for r in keys if r != "train" and (name == "baseline" or r == "pm5")):
+                ref, rule = key.removesuffix(CORR), (CORRECTED_RULE if key.endswith(CORR) else M1_RULE)
+                v["fv"][key] = {cams[k[0]]: c for k, c in false_visible_counts(
+                    h, hubs, graph, refs[ref], cfg, rule=None if ref == "train" else rule).items()}
             if name == "baseline":
                 v["grazing"] = _grazing_diag(hubs, graph)
             out[name] = v
@@ -257,7 +263,7 @@ def _variant_summary(items: list[dict], cameras) -> dict:
                "centre_cheb_median": _hist_quantile(hist, 0.5), "centre_cheb_p95": _hist_quantile(hist, 0.95),
                "failed": len(fails), "fail_min_dist_px": _stats(fails) if fails else {"n": 0}}
     fv = {}
-    for name in REFS:
+    for name in items[0]["fv"]:
         per_cam = {c: {"used": np.sum([it["fv"][name][c]["used"] for it in items], 0).tolist(),
                        "false": np.sum([it["fv"][name][c]["false"] for it in items], 0).tolist()} for c in cameras}
         used, false = (np.sum([d[k] for d in per_cam.values()], 0).tolist() for k in ("used", "false"))
@@ -394,7 +400,8 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rep = {"version": args.version, "dataroot": args.dataroot, "cameras": list(CAM6), "loadavg": os.getloadavg(),
-           "m3": {}, "m2": {}, "timing": {}, "graph": {}, "graph_config": asdict(GCFG), "m1_rule": M1_RULE,
+           "m3": {}, "m2": {}, "timing": {}, "graph": {}, "graph_config": asdict(GCFG), "m1_rule": asdict(M1_RULE),
+           "corrected_rule": asdict(CORRECTED_RULE),
            "variant_configs": {name: asdict(c) for name, c in VARIANTS.items()},
            "heldout_frac": args.heldout_frac, "fv_sweeps": args.fv_sweeps, "cpu_count": os.cpu_count()}
     t_all = time.perf_counter()
@@ -520,8 +527,11 @@ def render_graph(r: dict) -> list[str]:
         return (tot(v, lambda x: x["recheck"]["passed"]) == tot(v, lambda x: x["recheck"]["edges"]) > 0
                 and all(var(sp, v)["recheck"]["h2p_is_reverse_all"] for sp in SPLITS))
 
-    def fv_ok(v: str) -> bool:
-        return fv(v, "pm5", "used") > 0 and fv(v, "pm5", "false") / fv(v, "pm5", "used") < FV_MAX
+    def fv_ok(v: str, ref: str = "pm5") -> bool:
+        return fv(v, ref, "used") > 0 and fv(v, ref, "false") / fv(v, ref, "used") < FV_MAX
+
+    def fvr(v: str, ref: str) -> str:
+        return _rate(fv(v, ref, "false"), fv(v, ref, "used"))
 
     def deg(v: str, et: str) -> float:
         return float(np.mean([var(sp, v)["degree"][et]["mean_in_degree"] for sp in SPLITS]))
@@ -535,14 +545,20 @@ def render_graph(r: dict) -> list[str]:
          f"unchanged on trainval keyframes. The ±{r['fv_sweeps']} sweeps enter only the metric. Graph passes use "
          f"{r['timing']['graph_m3']['workers']} DataLoader workers.", "",
          f"False-visible metric, the same for every row (M1 rule): a member behind a kept PROJ_P2H edge is "
-         f"false-visible when `zbuffer_visibility` with cell {rule['ref_cell_px']} px and tol {rule['ref_tol_m']} m "
+         f"false-visible when `zbuffer_visibility` with cell {rule['cell_px']} px and tol {rule['tol_m']} m "
          f"rejects it against LiDAR merged over ±{r['fv_sweeps']} sweeps (`pm5`, gate) or against the keyframe sweep "
          "with held-out points restored (`pm0`). `own rule` re-runs each variant's own z-buffer on its own reference "
          "and must be 0 (counting check).", "",
+         f"Corrected rule (metric revision 2026-10-15, calibrated on synthetic GT, `fv_calibration.md`): "
+         f"cell {r['corrected_rule']['cell_px']} px, tol {r['corrected_rule']['tol_m']} m"
+         + (f" + {r['corrected_rule']['tol_rel']:.0%} of depth" if r["corrected_rule"]["tol_rel"] else "")
+         + (f", reference points within {r['corrected_rule']['plane_tau']} m of the member's hub plane ignored"
+            if r["corrected_rule"]["plane_tau"] is not None else "")
+         + ". Both rules are reported; the M1 rule's numbers are kept.", "",
          "### Builder variants", "",
-         "| variant | z-buffer cell / tol | grazing filter | FV ±5 sweeps | FV keyframe sweep | own rule | re-check "
-         "| P2H = H2P edges | used members | mean in-degree P2H per hub / H2P per patch | prepare median [s] "
-         "| M1 re-check / FV |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+         "| variant | z-buffer cell / tol | grazing filter | FV ±5 sweeps | FV keyframe sweep | FV ±5, corrected rule "
+         "| own rule | re-check | P2H = H2P edges | used members | mean in-degree P2H per hub / H2P per patch "
+         "| prepare median [s] | M1 re-check / FV (M1 rule) / FV (corrected) |", "|---|" + "---|" * 12]
     for v, c in vc.items():
         tol = (f"{c['zbuffer_tol_m']:g} m" if not c["zbuffer_tol_rel"] else
                f"{c['zbuffer_tol_rel']:.0%} of depth" + (f" + {c['zbuffer_tol_m']:g} m" if c["zbuffer_tol_m"] else ""))
@@ -550,10 +566,10 @@ def render_graph(r: dict) -> list[str]:
         prep = float(np.median([var(sp, v)["prepare_s"]["median"] for sp in SPLITS]))
         graze = f"cos ≥ {c['min_cos_incidence']:g}" if c["min_cos_incidence"] else "off"
         L.append(f"| {v} | {c['zbuffer_cell_px']} px / {tol} | {graze} | "
-                 f"**{_rate(fv(v, 'pm5', 'false'), fv(v, 'pm5', 'used'))}** | {_rate(fv(v, 'pm0', 'false'), fv(v, 'pm0', 'used'))} "
+                 f"**{fvr(v, 'pm5')}** | {fvr(v, 'pm0')} | **{fvr(v, 'pm5' + CORR)}** "
                  f"| {fv(v, 'train', 'false')} | {_rate(tot(v, lambda x: x['recheck']['passed']), edges)} | {edges} "
                  f"| {fv(v, 'pm5', 'used')} | {deg(v, 'PROJ_P2H'):.2f} / {deg(v, 'PROJ_H2P'):.2f} | {_f(prep, 3)} "
-                 f"| {_verdict(proj_ok(v))} / {_verdict(fv_ok(v))} |")
+                 f"| {_verdict(proj_ok(v))} / {_verdict(fv_ok(v))} / {_verdict(fv_ok(v, 'pm5' + CORR))} |")
     gz = var(SPLITS[0], "baseline")["grazing"]
     gz = {k: sum(var(sp, "baseline")["grazing"][k] for sp in SPLITS) for k in gz}
     L += ["", f"Settings, each chosen once (no sweep): grazing filter cos ≥ {COS_MIN} (incidence ≤ ~78°; with a 5% "
@@ -592,9 +608,16 @@ def render_graph(r: dict) -> list[str]:
           "| M1 criterion | measured | threshold | verdict |", "|---|---|---|---|",
           f"| projection edges re-project into their patch | {passed}/{edges} = {_rate(passed, edges)}; H2P = reverse "
           f"of P2H in every sample: {all(x['h2p_is_reverse_all'] for x in rc.values())} | 100% | {_verdict(proj_ok(b))} |",
-          f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps | {fv(b, 'pm5', 'false')}/{fv(b, 'pm5', 'used')} = "
-          f"{_rate(fv(b, 'pm5', 'false'), fv(b, 'pm5', 'used'))} | < {FV_MAX:.0%} | {_verdict(fv_ok(b))} |",
+          f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps, M1 rule as first measured | "
+          f"{fv(b, 'pm5', 'false')}/{fv(b, 'pm5', 'used')} = {fvr(b, 'pm5')} | < {FV_MAX:.0%} | {_verdict(fv_ok(b))} |",
+          f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps, corrected rule (revision 2026-10-15) | "
+          f"{fv(b, 'pm5' + CORR, 'false')}/{fv(b, 'pm5' + CORR, 'used')} = {fvr(b, 'pm5' + CORR)} | < {FV_MAX:.0%} "
+          f"| {_verdict(fv_ok(b, 'pm5' + CORR))} |",
           "| data_wait_frac | not measured (needs T25) | < 0.10 | pending |", "",
+          "False-visible of the default builder's edges against reference density:", "",
+          "| rule | keyframe sweep | ±1 sweep | ±5 sweeps |", "|---|---|---|---|",
+          "| M1 rule | " + " | ".join(fvr(b, k) for k in ("pm0", "pm1", "pm5")) + " |",
+          "| corrected rule | " + " | ".join(fvr(b, k + CORR) for k in ("pm0", "pm1", "pm5")) + " |", "",
           "Projection re-check: an edge passes when at least one member of its hub, lifted to world in float64 and "
           "projected with `project` (not the builder's float32 path), lands in the edge's patch in front of the camera "
           "(spec T11, test 1).", "",

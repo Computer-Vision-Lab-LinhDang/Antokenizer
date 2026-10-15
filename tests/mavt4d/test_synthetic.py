@@ -99,3 +99,37 @@ def test_adjacent_cameras_overlap(scene):
     d1 = gt.depth[1, t][v[inside], u[inside]]
     seen = (gt.valid[1, t][v[inside], u[inside]] & ((z[inside] - d1).abs() < 0.05 * d1 + 0.05)).sum()
     assert seen / (CFG.H * CFG.W) >= 0.10
+
+
+def test_render_sweeps_reproduce_the_scene_sweeps(scene):
+    """Extra sweeps come from the same scanner, ego motion and box motion: at the frame times they are the
+    scene's own sweeps (world frame) and the scene's own box states."""
+    from mavt4d.data.synthetic import render_sweeps
+
+    sample, _ = scene
+    sweeps = render_sweeps(CFG, 0, sample.lidar_times)
+    assert len(sweeps) == CFG.T
+    for t, (pts, boxes) in enumerate(sweeps):
+        want = transform_points(sample.lidar_to_world[t], sample.lidar_points[t][:, :3])
+        assert pts.shape == want.shape and torch.allclose(pts, want, atol=1e-4)
+        assert torch.allclose(boxes.center, sample.boxes[t].center) and torch.equal(boxes.yaw, sample.boxes[t].yaw)
+
+
+def test_render_sweeps_between_frames_move_with_ego():
+    """Half a frame later the scanner sits ego_speed * dt / 2 further along +x: the ground hit straight ahead
+    on the lowest beam moves by that much."""
+    from mavt4d.data.synthetic import render_sweeps
+
+    cfg = SyntheticSceneConfig(n_boxes=0, n_moving=0)
+    (a, _), (b, _) = render_sweeps(cfg, 0, torch.tensor([0.0, cfg.dt / 2], dtype=torch.float64))
+    def ahead(p):
+        ground = p[(p[:, 2].abs() < 1e-4) & (p[:, 1].abs() < 1e-3) & (p[:, 0] > 0)]
+        return ground[:, 0].min()
+    assert float(ahead(b) - ahead(a)) == pytest.approx(cfg.ego_speed * cfg.dt / 2, abs=1e-3)
+
+
+def test_camera_pitch_is_configurable():
+    flat = SyntheticSceneConfig(cam_pitch_deg=0.0, n_boxes=0, n_moving=0, T=1)
+    sample, _ = make_synthetic_scene(flat, 0)
+    fwd = sample.cam_to_world[0, 0, :3, 2]  # optical axis in world
+    assert abs(float(fwd[2])) < 1e-6

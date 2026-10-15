@@ -9,8 +9,8 @@ import torch
 from mavt4d.data.holdout import apply_holdout
 from mavt4d.data.sample import SceneSample
 from mavt4d.data.synthetic import SyntheticSceneConfig, make_synthetic_scene
-from mavt4d.eval.graph_checks import false_visible_counts, recheck_projection_edges
-from mavt4d.geometry.camera import transform_points
+from mavt4d.eval.graph_checks import FVRule, false_visible_counts, recheck_projection_edges, rule_visible
+from mavt4d.geometry.camera import transform_points, zbuffer_visibility
 from mavt4d.geometry.hubs import build_hubs
 from mavt4d.graph.builder import GraphConfig, build_graph
 from mavt4d.graph.types import CorrespondenceGraph, EdgeSet, EdgeType
@@ -81,9 +81,34 @@ def test_false_visible_zero_against_own_reference_for_variant(scene):
 def test_false_visible_reference_rule_overrides_builder_rule(scene):
     """The reference rule is held fixed by the caller: a negative tolerance rejects every used member."""
     sample, hubs, graph = scene
-    fv = false_visible_counts(sample, hubs, graph, _train_refs(sample), GCFG, ref_cell_px=4, ref_tol_m=-1e3,
-                              ref_tol_rel=0.0)
+    fv = false_visible_counts(sample, hubs, graph, _train_refs(sample), GCFG, rule=FVRule(tol_m=-1e3))
     assert all(c["false"] == c["used"] for c in fv.values()) and any(sum(c["used"]) for c in fv.values())
+
+
+def test_rule_without_plane_is_the_zbuffer():
+    """The plane-aware path with every reference point counted (tau < 0) gives the plain z-buffer answer."""
+    g = torch.Generator().manual_seed(0)
+    uv, z = torch.rand(400, 2, generator=g) * torch.tensor([80.0, 48.0]), 2 + 30 * torch.rand(400, generator=g)
+    ref_uv, ref_z = torch.rand(900, 2, generator=g) * torch.tensor([80.0, 48.0]), 2 + 30 * torch.rand(900, generator=g)
+    p, n, ref_p = torch.randn(400, 3, generator=g), torch.randn(400, 3, generator=g), torch.randn(900, 3, generator=g)
+    for rule in (FVRule(), FVRule(cell_px=2, tol_m=0.2, tol_rel=0.05)):
+        want = zbuffer_visibility(uv, z, ref_uv, ref_z, 48, 80, rule.cell_px, rule.tol_m, rule.tol_rel)
+        assert torch.equal(rule_visible(uv, z, ref_uv, ref_z, 48, 80, rule), want)
+        got = rule_visible(uv, z, ref_uv, ref_z, 48, 80, replace(rule, plane_tau=-1.0), p, n, ref_p)
+        assert torch.equal(got, want) and 0 < int(want.sum()) < 400
+
+
+def test_plane_aware_rule_ignores_points_on_the_members_plane():
+    """A ground member at 30 m with nearer ground points in its cell (grazing view) is visible to the
+    plane-aware rule but not to the plain one; a point 1 m above the ground in front still hides it."""
+    uv, z = torch.tensor([[10.5, 10.5]]), torch.tensor([30.0])
+    p, n = torch.tensor([[30.0, 0.0, 0.0]]), torch.tensor([[0.0, 0.0, 1.0]])
+    ground_uv, ground_z, ground_p = torch.tensor([[11.0, 11.0]]), torch.tensor([28.0]), torch.tensor([[28.0, 0.0, 0.0]])
+    plane = FVRule(plane_tau=0.2)
+    assert not rule_visible(uv, z, ground_uv, ground_z, 48, 80, FVRule())[0]
+    assert rule_visible(uv, z, ground_uv, ground_z, 48, 80, plane, p, n, ground_p)[0]
+    above = torch.tensor([[25.0, 0.0, 1.0]])
+    assert not rule_visible(uv, z, ground_uv, torch.tensor([25.0]), 48, 80, plane, p, n, above)[0]
 
 def test_used_members_match_edge_weights(scene):
     """Members counted as used are exactly the visible members behind the kept edges' weights."""
@@ -149,7 +174,7 @@ def test_check_script_graph_pass_on_fake_nuscenes(tmp_path, monkeypatch):
     assert base["grazing"]["dropped"] + base["grazing"]["kept"] == base["recheck"]["edges"]
     t = mod.graph_timing(ds, 0.3, 2, workers=0)
     assert t["n"] == 2 and t["s_per_sample"] > 0
-    rep = {"graph": {sp: g for sp in mod.SPLITS}, "graph_config": mod.asdict(mod.GCFG), "m1_rule": mod.M1_RULE,
+    rep = {"graph": {sp: g for sp in mod.SPLITS}, "graph_config": mod.asdict(mod.GCFG), "m1_rule": mod.asdict(mod.M1_RULE), "corrected_rule": mod.asdict(mod.CORRECTED_RULE),
            "variant_configs": {k: mod.asdict(c) for k, c in mod.VARIANTS.items()}, "heldout_frac": 0.3,
            "fv_sweeps": 5, "cameras": list(fk.CAMERAS), "timing": {"graph_m3": t}, "loadavg_graph_timing": (1.0, 1.0, 1.0)}
     text = "\n".join(mod.render_graph(rep))

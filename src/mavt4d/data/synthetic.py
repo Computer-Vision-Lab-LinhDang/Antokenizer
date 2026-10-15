@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 
 from mavt4d.data.sample import Boxes3D, SceneSample
 from mavt4d.geometry.boxes import half_extents, move_with_boxes, rot_z, world_to_box
-from mavt4d.geometry.camera import project
+from mavt4d.geometry.camera import project, transform_points
 
 CAM_HEIGHT, CAM_RING, CAM_PITCH_DEG = 1.5, 0.5, 15.0
 LIDAR_HEIGHT, LIDAR_MOUNT_YAW = 1.8, math.pi / 2
@@ -42,6 +42,7 @@ class SyntheticSceneConfig:
     lidar_beams: int = 16
     lidar_az: int = 256
     lidar_elev_deg: tuple = (-25.0, 5.0)
+    cam_pitch_deg: float = CAM_PITCH_DEG
 
 
 @dataclass
@@ -109,7 +110,7 @@ def _make_boxes(cfg: SyntheticSceneConfig, g: torch.Generator) -> tuple[Tensor, 
 def _camera_rotations(cfg: SyntheticSceneConfig) -> Tensor:
     """(V, 3, 3) camera-to-world rotations; optical frame x right, y down, z forward."""
     out = []
-    pitch = math.radians(CAM_PITCH_DEG)
+    pitch = math.radians(cfg.cam_pitch_deg)
     for v in range(cfg.V):
         yaw = math.radians((v - (cfg.V - 1) / 2) * cfg.cam_yaw_step_deg)
         fwd = torch.tensor([math.cos(yaw) * math.cos(pitch), math.sin(yaw) * math.cos(pitch), -math.sin(pitch)])
@@ -118,14 +119,59 @@ def _camera_rotations(cfg: SyntheticSceneConfig) -> Tensor:
     return torch.stack(out).double()
 
 
+def _boxes_at(c0: Tensor, size: Tensor, yaw: Tensor, vel: Tensor, tau: float) -> Boxes3D:
+    """Float64 box states at time ``tau`` (s from frame 0): constant velocity, fixed yaw."""
+    return Boxes3D(center=c0 + vel * tau, size=size, yaw=yaw, instance_id=torch.arange(1, len(c0) + 1))
+
+
+def _lidar_dirs(cfg: SyntheticSceneConfig) -> Tensor:
+    """(beams * az, 3) float64 unit beam directions in the LiDAR frame."""
+    elev = torch.deg2rad(torch.linspace(*cfg.lidar_elev_deg, cfg.lidar_beams, dtype=torch.float64))
+    az = torch.arange(cfg.lidar_az, dtype=torch.float64) * (2 * math.pi / cfg.lidar_az)
+    e, a = torch.meshgrid(elev, az, indexing="ij")
+    return torch.stack([e.cos() * a.cos(), e.cos() * a.sin(), e.sin()], -1).reshape(-1, 3)
+
+
+def _lidar_to_world(ego: Tensor) -> Tensor:
+    """(N, 4, 4) float64 LiDAR poses for ego positions (N, 3)."""
+    l2w = torch.eye(4, dtype=torch.float64).repeat(len(ego), 1, 1)
+    l2w[:, :3, :3] = rot_z(torch.tensor(LIDAR_MOUNT_YAW, dtype=torch.float64))
+    l2w[:, :3, 3] = ego + torch.tensor([0, 0, LIDAR_HEIGHT], dtype=torch.float64)
+    return l2w
+
+
+def _lidar_sweep(dirs_l: Tensor, l2w: Tensor, boxes64: Boxes3D) -> Tensor:
+    """(N, 4) float32 hits in the LiDAR frame (xyz, intensity from the instance) of one sweep."""
+    hit_t, hit_i = _raycast(l2w[:3, 3].expand_as(dirs_l), dirs_l @ l2w[:3, :3].T, boxes64)
+    ok = hit_i >= 0
+    xyz = hit_t[ok, None] * dirs_l[ok]  # unit LiDAR-frame directions: t is range
+    return torch.cat([xyz, (0.1 + 0.15 * hit_i[ok, None]).double()], 1).float()
+
+
+def render_sweeps(cfg: SyntheticSceneConfig, seed: int, times: Tensor) -> list[tuple[Tensor, Boxes3D]]:
+    """Extra LiDAR sweeps of the scene ``make_synthetic_scene(cfg, seed)`` renders, at ``times`` (s from frame
+    0, float64): same scanner, ego motion and box motion. Returns world-frame points (N, 3) and the float32 box
+    states at each time; at the frame times these are exactly the scene's own sweeps and boxes."""
+    c0, size, yaw, vel = _make_boxes(cfg, torch.Generator().manual_seed(seed))
+    times = times.to(torch.float64)
+    zeros = torch.zeros_like(times)
+    l2w, dirs = _lidar_to_world(torch.stack([times * cfg.ego_speed, zeros, zeros], 1)), _lidar_dirs(cfg)
+    out = []
+    for i, tau in enumerate(times.tolist()):
+        b = _boxes_at(c0, size, yaw, vel, tau)
+        pts = _lidar_sweep(dirs, l2w[i], b)
+        out.append((transform_points(l2w[i].float(), pts[:, :3]),
+                    Boxes3D(center=b.center.float(), size=b.size.float(), yaw=b.yaw.float(), instance_id=b.instance_id)))
+    return out
+
+
 def make_synthetic_scene(cfg: SyntheticSceneConfig, seed: int) -> tuple[SceneSample, SyntheticGT]:
     """Render one scene (tier A: cameras, one LiDAR sweep per frame, per-frame boxes) and its exact GT."""
     g = torch.Generator().manual_seed(seed)
     V, T, H, W = cfg.V, cfg.T, cfg.H, cfg.W
     c0, size, yaw, vel = _make_boxes(cfg, g)
     times = torch.arange(T, dtype=torch.float64) * cfg.dt
-    boxes64 = [Boxes3D(center=c0 + vel * float(times[t]), size=size, yaw=yaw,
-                       instance_id=torch.arange(1, len(c0) + 1)) for t in range(T)]
+    boxes64 = [_boxes_at(c0, size, yaw, vel, float(times[t])) for t in range(T)]
     boxes = [Boxes3D(center=b.center.float(), size=b.size.float(), yaw=b.yaw.float(), instance_id=b.instance_id)
              for b in boxes64]
     ego = torch.stack([times * cfg.ego_speed, torch.zeros(T, dtype=torch.float64),
@@ -174,20 +220,8 @@ def make_synthetic_scene(cfg: SyntheticSceneConfig, seed: int) -> tuple[SceneSam
                 p_obj[sel] = world_to_box(p_obj[sel], boxes[t].center[i], boxes[t].yaw[i])
             images[v, t][ok] = texture(p_obj, k)
 
-    elev = torch.deg2rad(torch.linspace(*cfg.lidar_elev_deg, cfg.lidar_beams, dtype=torch.float64))
-    az = torch.arange(cfg.lidar_az, dtype=torch.float64) * (2 * math.pi / cfg.lidar_az)
-    e, a = torch.meshgrid(elev, az, indexing="ij")
-    dirs_l = torch.stack([e.cos() * a.cos(), e.cos() * a.sin(), e.sin()], -1).reshape(-1, 3)
-    R_l = rot_z(torch.tensor(LIDAR_MOUNT_YAW, dtype=torch.float64))
-    l2w = torch.eye(4, dtype=torch.float64).repeat(T, 1, 1)
-    l2w[:, :3, :3] = R_l
-    l2w[:, :3, 3] = ego + torch.tensor([0, 0, LIDAR_HEIGHT], dtype=torch.float64)
-    lidar = []
-    for t in range(T):
-        hit_t, hit_i = _raycast(l2w[t, :3, 3].expand_as(dirs_l), dirs_l @ R_l.T, boxes64[t])
-        ok = hit_i >= 0
-        xyz = hit_t[ok, None] * dirs_l[ok]  # unit LiDAR-frame directions: t is range
-        lidar.append(torch.cat([xyz, (0.1 + 0.15 * hit_i[ok, None]).double()], 1).float())
+    dirs_l, l2w = _lidar_dirs(cfg), _lidar_to_world(ego)
+    lidar = [_lidar_sweep(dirs_l, l2w[t], boxes64[t]) for t in range(T)]
 
     sample = SceneSample(
         scene_id=f"synthetic-{seed}", source="synthetic", images=images.reshape(V, T, H, W, 3).permute(0, 1, 4, 2, 3)
