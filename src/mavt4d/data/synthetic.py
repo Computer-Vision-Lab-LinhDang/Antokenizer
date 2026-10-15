@@ -43,6 +43,8 @@ class SyntheticSceneConfig:
     lidar_az: int = 256
     lidar_elev_deg: tuple = (-25.0, 5.0)
     cam_pitch_deg: float = CAM_PITCH_DEG
+    texture_shift: float = 0.0  # > 0: per-scene random texture offset (m) per instance, so colour is not a
+                                # fixed function of the camera ray across scenes (geometry is unchanged)
 
 
 @dataclass
@@ -209,6 +211,9 @@ def make_synthetic_scene(cfg: SyntheticSceneConfig, seed: int) -> tuple[SceneSam
     inst = inst.clamp(min=0)
     world32 = world.float()
 
+    tex_offset = torch.zeros(len(c0) + 1, 3)  # per instance (0 = ground)
+    if cfg.texture_shift > 0:
+        tex_offset = (torch.rand(len(c0) + 1, 3, generator=g) * 2 - 1) * cfg.texture_shift
     images = torch.tensor(SKY).view(1, 1, 1, 3).repeat(V, T, H * W, 1)
     for v in range(V):
         for t in range(T):
@@ -218,7 +223,7 @@ def make_synthetic_scene(cfg: SyntheticSceneConfig, seed: int) -> tuple[SceneSam
             for i in range(len(c0)):
                 sel = k == boxes[t].instance_id[i]
                 p_obj[sel] = world_to_box(p_obj[sel], boxes[t].center[i], boxes[t].yaw[i])
-            images[v, t][ok] = texture(p_obj, k)
+            images[v, t][ok] = texture(p_obj + tex_offset[k], k)
 
     dirs_l, l2w = _lidar_dirs(cfg), _lidar_to_world(ego)
     lidar = [_lidar_sweep(dirs_l, l2w[t], boxes64[t]) for t in range(T)]

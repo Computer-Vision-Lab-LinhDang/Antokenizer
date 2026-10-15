@@ -1,16 +1,25 @@
 """Train the time-indexed state model on synthetic scenes and measure whether the state remembers.
 
 The central check of the state direction: with reconstruction of what was just seen as the only signal, the
-state can be overwritten every step. ``--memory-signal on`` drops whole steps and hides single views during
-training, so their readout must come from the state; ``off`` keeps every view of every step visible.
+state can be overwritten every step. Both arms see the same random dropped steps and hidden views; they differ
+only in what is supervised:
+  --memory-signal on   every (view, step) cell, seen or not: unseen cells must be read out of the state
+  --memory-signal off  only the cells the update saw
 
-Eval on held-out seeds (never used in training), PSNR (dB) and depth abs-rel on the cells of interest:
-  all        every view of every step visible; all cells (reconstruction guard)
-  drop_last  last step unobserved; its cells (memory + predict)
-  hide_view  from step 1, view (t mod V) hidden; the hidden cells (fusion with other views + memory)
-``copy_prev`` is the reference of copying the same view's previous frame into the cells of interest.
+Scenes use a per-scene random texture offset (--texture-shift): with the default fixed background the readout
+learns the background from the camera rays alone and ignores the observations.
 
-    PYTHONPATH=src python scripts/state/train_synth.py --memory-signal on --out runs/state_synth/mem_on
+Eval on held-out seeds (never trained on). Ground and sky still dominate the pixels, so the headline is on box
+pixels (GT instance > 0) of the cells of interest, next to three references on the same pixels:
+  seen       the same model with every view of every step visible (upper bound)
+  copy_prev  the same view's previous frame
+  prior      per-pixel median image over train scenes (no state, no images: the "no memory" floor)
+Conditions (cells of interest in brackets):
+  all [every cell]  drop_last [last step]  drop_last2 [last two steps]
+  hide_view [view t mod V, t >= 1]  hide_edge [view 0 for every t >= 1]
+
+    PYTHONPATH=src python scripts/state/train_synth.py --memory-signal on --out results/state_synth/v2_on
+    PYTHONPATH=src python scripts/state/train_synth.py --eval-ckpt results/state_synth/v2_on/last.pt
 """
 from __future__ import annotations
 
@@ -27,7 +36,8 @@ from torch.utils.data import DataLoader, Dataset
 from mavt4d.data.synthetic import SyntheticSceneConfig, make_synthetic_scene
 from mavt4d.model.state import StateConfig, StateModel, state_loss
 
-VAL_SEED0 = 10_000_000  # train seeds are 0 .. steps * batch - 1, far below this
+VAL_SEED0 = 10_000_000  # train seeds are 0 .. steps * batch - 1, checked to stay below this
+N_PRIOR = 64            # train scenes in the per-pixel median prior
 
 
 class Scenes(Dataset):
@@ -40,7 +50,7 @@ class Scenes(Dataset):
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         s, g = make_synthetic_scene(self.cfg, self.seeds[i])
         return {"images": s.images, "K": s.intrinsics, "c2w": s.cam_to_world, "times": s.frame_times[0].float(),
-                "depth": g.depth, "valid": g.valid}
+                "depth": g.depth, "valid": g.valid, "instance": g.instance}
 
 
 def sample_visible(B: int, V: int, T: int, p_drop: float, p_hide: float, g: torch.Generator) -> torch.Tensor:
@@ -57,49 +67,88 @@ def sample_visible(B: int, V: int, T: int, p_drop: float, p_hide: float, g: torc
 def eval_masks(B: int, V: int, T: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     """condition -> (visible (B, V, T), cells of interest (B, V, T))."""
     full = torch.ones(B, V, T, dtype=torch.bool)
-    drop = full.clone()
-    drop[:, :, T - 1] = False
-    hide = full.clone()
+    out = {"all": (full, full)}
+    for name, steps in (("drop_last", [T - 1]), ("drop_last2", [T - 2, T - 1])):
+        vis = full.clone()
+        vis[:, :, steps] = False
+        out[name] = (vis, ~vis)
+    rot, edge = full.clone(), full.clone()
     for t in range(1, T):
-        hide[:, t % V, t] = False
-    return {"all": (full, full), "drop_last": (drop, ~drop), "hide_view": (hide, ~hide)}
+        rot[:, t % V, t] = False
+        edge[:, 0, t] = False
+    out["hide_view"], out["hide_edge"] = (rot, ~rot), (edge, ~edge)
+    return out
 
 
-def cell_metrics(rgb: torch.Tensor, log_depth: torch.Tensor, b: dict, cells: torch.Tensor) -> dict[str, float]:
-    """Mean PSNR over cells (images in [-1, 1]) and depth abs-rel over valid pixels of those cells."""
-    mse = (((rgb - b["images"]) / 2) ** 2).mean((-3, -2, -1))           # (B, V, T)
-    psnr = (-10 * torch.log10(mse.clamp(min=1e-10)))[cells].mean().item()
-    m = b["valid"] & cells[..., None, None]
-    rel = (log_depth[:, :, :, 0].exp() - b["depth"]).abs() / b["depth"].clamp(min=1e-3)
-    return {"psnr": psnr, "absrel": rel[m].mean().item() if m.any() else float("nan")}
+class Pool:
+    """Pooled sums so that every pixel counts once, whatever the batch sizes."""
+
+    def __init__(self) -> None:
+        self.s: dict[str, list[float]] = {}
+
+    def add(self, key: str, values: torch.Tensor, mask: torch.Tensor) -> None:
+        acc = self.s.setdefault(key, [0.0, 0])
+        acc[0] += values[mask].sum().item()
+        acc[1] += int(mask.sum().item())
+
+    def mean(self, key: str) -> float:
+        total, n = self.s.get(key, [0.0, 0])
+        return total / n if n else float("nan")
+
+
+def _psnr(mse: float) -> float:
+    return -10 * math.log10(max(mse, 1e-10))
 
 
 @torch.no_grad()
-def evaluate(model: StateModel, batches: list[dict], device: torch.device) -> dict[str, dict[str, float]]:
+def evaluate(model: StateModel, batches: list[dict], prior: torch.Tensor, device: torch.device) -> dict:
     model.eval()
-    acc: dict[str, list[dict[str, float]]] = {}
+    pool = Pool()
     for b in batches:
         b = {k: v.to(device) for k, v in b.items()}
         B, V, T = b["images"].shape[:3]
-        prev = torch.cat([b["images"][:, :, :1], b["images"][:, :, :-1]], 2)  # same view, previous frame
+        img, box = b["images"], b["instance"] > 0                         # box: (B, V, T, H, W)
+        prev = torch.cat([img[:, :, :1], img[:, :, :-1]], 2)               # same view, previous frame
+        se = lambda pred: (((pred - img) / 2) ** 2).mean(3)               # (B, V, T, H, W), images in [0, 1]
+        rel = lambda ld: (ld[:, :, :, 0].exp() - b["depth"]).abs() / b["depth"].clamp(min=1e-3)
+        seen = model(img, b["K"], b["c2w"], b["times"], torch.ones(B, V, T, dtype=torch.bool, device=device))
         for name, (vis, cells) in eval_masks(B, V, T).items():
             vis, cells = vis.to(device), cells.to(device)
-            out = model(b["images"], b["K"], b["c2w"], b["times"], vis)
-            acc.setdefault(name, []).append(cell_metrics(out.rgb, out.log_depth, b, cells))
-            if name != "all":
-                acc.setdefault(f"{name}/copy_prev", []).append(
-                    {"psnr": cell_metrics(prev, out.log_depth, b, cells)["psnr"]})
+            out = seen if name == "all" else model(img, b["K"], b["c2w"], b["times"], vis)
+            on_cells = cells[..., None, None].expand_as(box)
+            pool.add(f"{name}/img", se(out.rgb), on_cells)
+            for src, pred in (("model", out.rgb), ("seen", seen.rgb), ("copy_prev", prev), ("prior", prior)):
+                pool.add(f"{name}/{src}/box", se(pred.expand_as(img)), on_cells & box)
+            for src, o in (("model", out), ("seen", seen)):
+                pool.add(f"{name}/{src}/absrel", rel(o.log_depth), on_cells & box & b["valid"])
     model.train()
-    return {k: {m: sum(r[m] for r in v) / len(v) for m in v[0]} for k, v in acc.items()}
+    res = {}
+    for name in eval_masks(1, 1, 2):
+        r = {"psnr_img": _psnr(pool.mean(f"{name}/img"))}
+        for src in ("model", "seen", "copy_prev", "prior"):
+            r[f"psnr_box_{src}"] = _psnr(pool.mean(f"{name}/{src}/box"))
+        for src in ("model", "seen"):
+            r[f"absrel_box_{src}"] = pool.mean(f"{name}/{src}/absrel")
+        res[name] = {k: round(v, 4) for k, v in r.items()}
+    return res
+
+
+def median_prior(scene: SyntheticSceneConfig, device: torch.device) -> torch.Tensor:
+    """(1, V, T, 3, H, W) per-pixel median image over N_PRIOR train scenes."""
+    imgs = torch.stack([make_synthetic_scene(scene, s)[0].images for s in range(N_PRIOR)])
+    return imgs.median(0).values[None].to(device)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--memory-signal", choices=["on", "off"], required=True)
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--memory-signal", choices=["on", "off"])
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--eval-ckpt", type=Path, help="only evaluate this checkpoint and print the result")
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--T", type=int, default=4)
+    ap.add_argument("--texture-shift", type=float, default=50.0,
+                    help="per-scene random texture offset (m); 0 = the fixed background of the default scenes")
     ap.add_argument("--K", type=int, default=16)
     ap.add_argument("--dim", type=int, default=256)
     ap.add_argument("--depth", type=int, default=4)
@@ -112,10 +161,24 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available()
                           else "mps" if torch.backends.mps.is_available() else "cpu")
-    scene = SyntheticSceneConfig(T=args.T)
+    scene = SyntheticSceneConfig(T=args.T, texture_shift=args.texture_shift)
+    val = list(DataLoader(Scenes(range(VAL_SEED0, VAL_SEED0 + args.n_val), scene), batch_size=args.batch))
+    prior = median_prior(scene, device)
+
+    if args.eval_ckpt:
+        ckpt = torch.load(args.eval_ckpt, map_location="cpu")
+        model = StateModel(StateConfig(**ckpt["config"]))
+        model.load_state_dict(ckpt["model"])
+        print(json.dumps(evaluate(model.to(device), val, prior, device), indent=1))
+        return
+    if args.memory_signal is None or args.out is None:
+        ap.error("--memory-signal and --out are required for training")
+    if args.steps * args.batch > VAL_SEED0:
+        ap.error("train seeds would overlap the validation seeds")
+
+    torch.manual_seed(args.seed)
     cfg = StateConfig(dim=args.dim, depth=args.depth, n_state=args.K)
     model = StateModel(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -123,13 +186,11 @@ def main() -> None:
         opt, lambda s: min(1.0, (s + 1) / 200) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / args.steps))))
     train = DataLoader(Scenes(range(args.steps * args.batch), scene), batch_size=args.batch, shuffle=True,
                        num_workers=args.workers, drop_last=True, persistent_workers=args.workers > 0)
-    val = list(DataLoader(Scenes(range(VAL_SEED0, VAL_SEED0 + args.n_val), scene), batch_size=args.batch))
-    p_drop, p_hide = (args.p_drop, args.p_hide) if args.memory_signal == "on" else (0.0, 0.0)
     g = torch.Generator().manual_seed(args.seed)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    n_params = sum(p.numel() for p in model.parameters())
-    meta = {"args": {k: str(v) for k, v in vars(args).items()}, "device": str(device), "params": n_params,
+    meta = {"args": {k: str(v) for k, v in vars(args).items()}, "device": str(device),
+            "params": sum(p.numel() for p in model.parameters()),
             "patches_per_step": scene.V * (scene.H // scene.patch) * (scene.W // scene.patch),
             "z_floats_per_step": args.K * cfg.z_dim, "input_floats_per_step": scene.V * 3 * scene.H * scene.W}
     (args.out / "meta.json").write_text(json.dumps(meta, indent=1))
@@ -140,19 +201,21 @@ def main() -> None:
     for b in train:
         b = {k: v.to(device) for k, v in b.items()}
         B, V, T = b["images"].shape[:3]
-        vis = sample_visible(B, V, T, p_drop, p_hide, g).to(device)
+        vis = sample_visible(B, V, T, args.p_drop, args.p_hide, g).to(device)
+        cells = None if args.memory_signal == "on" else vis
         losses = state_loss(model(b["images"], b["K"], b["c2w"], b["times"], vis), b["images"], b["depth"],
-                            b["valid"])
+                            b["valid"], cells)
         opt.zero_grad(set_to_none=True)
         losses["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sched.step()
         step += 1
-        if step % 50 == 0 or step == args.steps:
+        do_eval = step % args.eval_every == 0 or step == args.steps
+        if step % 50 == 0 or do_eval:
             rec = {"step": step, "sec": round(time.time() - t0, 1), **{k: round(v.item(), 5) for k, v in losses.items()}}
-            if step % args.eval_every == 0 or step == args.steps:
-                rec["eval"] = evaluate(model, val, device)
+            if do_eval:
+                rec["eval"] = evaluate(model, val, prior, device)
             log.write(json.dumps(rec) + "\n")
             log.flush()
             print(json.dumps(rec), flush=True)

@@ -111,6 +111,21 @@ def test_predict_uses_time_gap(batch):
     assert not torch.allclose(a.states[:, 1], b.states[:, 1])
 
 
+def test_state_loss_ignores_unsupervised_cells(model, batch):
+    images, K, c2w, times, depth, valid = batch
+    out = model(images, K, c2w, times, _all_visible(images))
+    cells = _all_visible(images)
+    cells[:, 1, 2] = False
+    a = state_loss(out, images, depth, valid, cells)
+    other_img, other_depth = images.clone(), depth.clone()
+    other_img[:, 1, 2] = -other_img[:, 1, 2]
+    other_depth[:, 1, 2] = other_depth[:, 1, 2] * 3
+    b = state_loss(out, other_img, other_depth, valid, cells)
+    assert torch.equal(a["rgb"], b["rgb"]) and torch.equal(a["depth"], b["depth"])
+    full = state_loss(out, images, depth, valid)
+    assert torch.allclose(full["rgb"], (out.rgb - images).abs().mean())
+
+
 def test_loss_backward_reaches_stem_and_state_init(batch):
     images, K, c2w, times, depth, valid = batch
     torch.manual_seed(0)

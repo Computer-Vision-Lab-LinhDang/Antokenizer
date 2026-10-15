@@ -125,12 +125,15 @@ class StateModel(nn.Module):
                            states=torch.stack(states, 1), z=torch.stack(zs, 1), kl=kl)
 
 
-def state_loss(out: StateOutput, images: Tensor, depth: Tensor, valid: Tensor,
+def state_loss(out: StateOutput, images: Tensor, depth: Tensor, valid: Tensor, cells: Tensor | None = None,
                depth_weight: float = 0.5) -> dict[str, Tensor]:
-    """L1 on RGB everywhere, L1 on log depth where the GT surface exists (not sky), plus the weighted KL.
-    Every (view, step) is supervised, visible or not: that is what forces the state to remember."""
-    rgb = (out.rgb - images).abs().mean()
-    m = valid[:, :, :, None].to(out.log_depth.dtype)
+    """L1 on RGB and, where the GT surface exists (not sky), on log depth, over the supervised ``cells``
+    (B, V, T) bool (default: all), plus the weighted KL. Supervising cells the update did not see is what
+    forces the state to remember."""
+    c = torch.ones(images.shape[:3], dtype=torch.bool, device=images.device) if cells is None else cells
+    w = c[:, :, :, None, None, None].to(images.dtype)
+    rgb = ((out.rgb - images).abs() * w).sum() / (w.sum() * images[0, 0, 0].numel()).clamp(min=1)
+    m = (valid & c[..., None, None])[:, :, :, None].to(out.log_depth.dtype)
     err = (out.log_depth - torch.log(depth.clamp(min=1e-3))[:, :, :, None]).abs()
     d = (err * m).sum() / m.sum().clamp(min=1)
     return {"loss": rgb + depth_weight * d + out.kl, "rgb": rgb, "depth": d, "kl": out.kl}

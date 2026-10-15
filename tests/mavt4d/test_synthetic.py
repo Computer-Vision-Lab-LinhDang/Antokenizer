@@ -16,6 +16,18 @@ def scene():
     return make_synthetic_scene(CFG, seed=0)
 
 
+def test_texture_shift_changes_appearance_not_geometry(scene):
+    s0, gt0 = scene
+    s1, gt1 = make_synthetic_scene(SyntheticSceneConfig(texture_shift=50.0), seed=0)
+    assert torch.equal(gt0.depth, gt1.depth) and torch.equal(gt0.instance, gt1.instance)
+    assert all(torch.equal(a.center, b.center) for a, b in zip(s0.boxes, s1.boxes))
+    ground, box = gt0.valid & (gt0.instance == 0), gt0.instance > 0
+    assert (s0.images - s1.images).abs().amax(2)[ground].mean() > 0.1
+    assert (s0.images - s1.images).abs().amax(2)[box].mean() > 0.1
+    sky = ~gt0.valid
+    assert torch.equal(s0.images.permute(0, 1, 3, 4, 2)[sky], s1.images.permute(0, 1, 3, 4, 2)[sky])
+
+
 def test_shapes_and_tier_A(scene):
     s, gt = scene
     s.validate()
