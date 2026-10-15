@@ -71,8 +71,10 @@ class Attention(nn.Module):
     Plain dot-product attention trained from scratch starts near-uniform here (entropy within 1% of log N in
     both the update and the readout): every state token reads the mean of all patches and training sits on
     the scene-independent mean image for 1000-1500 steps before it escapes. Random cosines at head width 32
-    have std ~0.18, so s = 10 makes attention selective from step 0. On 8-scene memorisation this shortened
-    the plateau and reached a box-pixel PSNR of 19.1 dB at 3000 steps against 16.4 dB with plain attention.
+    have std ~0.18, so s = 10 makes attention selective from step 0. On 8-scene memorisation (one seed,
+    box-pixel PSNR at 3000 steps) this block with plain attention reached 18.0 dB and with this attention
+    19.1 dB; the earlier StandardTransformerBlock update + nn.TransformerDecoder readout reached 16.4 dB, so
+    most of that gain came from the block/readout change, not from the normalisation.
     The cap keeps attention from saturating to one-hot, which is how slot attention died."""
 
     def __init__(self, dim: int, heads: int) -> None:
