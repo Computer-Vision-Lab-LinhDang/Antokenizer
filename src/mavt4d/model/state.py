@@ -14,15 +14,16 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from mavt.model.latent_heads import VAEHead
-from mavt.model.transformer import StandardTransformerBlock
 from mavt4d.geometry.camera import patch_ray_dirs
 from mavt4d.model.stems import CameraStem
 
 GEOM_FREQS = 4  # Fourier octaves for ray direction + camera centre
 DT_FREQS = 6    # Fourier octaves for the time gap (periods 2 s .. 1/16 s)
+LOGIT_SCALE_INIT, LOGIT_SCALE_MAX = 10.0, 100.0
 
 
 @dataclass(frozen=True)
@@ -59,8 +60,59 @@ def patch_geometry(K: Tensor, c2w: Tensor, Hp: int, Wp: int, patch: int) -> Tens
     return torch.cat([dirs, (c2w[..., None, :3, 3] / 10).expand_as(dirs)], -1)
 
 
-def _mlp(d_in: int, d: int) -> nn.Sequential:
-    return nn.Sequential(nn.Linear(d_in, d), nn.GELU(), nn.Linear(d, d))
+def _mlp(d_in: int, d: int, d_out: int | None = None) -> nn.Sequential:
+    return nn.Sequential(nn.Linear(d_in, d), nn.GELU(), nn.Linear(d, d_out or d))
+
+
+class Attention(nn.Module):
+    """Multi-head attention on per-head normalised q, k with a learnable logit scale s (init 10, at most 100):
+    logits = s * cos(q, k).
+
+    Plain dot-product attention trained from scratch starts near-uniform here (entropy within 1% of log N in
+    both the update and the readout): every state token reads the mean of all patches and training sits on
+    the scene-independent mean image for 1000-1500 steps before it escapes. Random cosines at head width 32
+    have std ~0.18, so s = 10 makes attention selective from step 0. On 8-scene memorisation this shortened
+    the plateau and reached a box-pixel PSNR of 19.1 dB at 3000 steps against 16.4 dB with plain attention.
+    The cap keeps attention from saturating to one-hot, which is how slot attention died."""
+
+    def __init__(self, dim: int, heads: int) -> None:
+        super().__init__()
+        self.heads = heads
+        self.q, self.kv, self.out = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
+        self.log_scale = nn.Parameter(torch.full((heads, 1, 1), math.log(LOGIT_SCALE_INIT)))
+
+    def _split(self, x: Tensor) -> Tensor:
+        return x.unflatten(-1, (self.heads, -1)).transpose(1, 2)        # (B, H, N, d_head)
+
+    def _qkv(self, x: Tensor, mem: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        k, v = self.kv(mem).chunk(2, -1)
+        q = F.normalize(self._split(self.q(x)), dim=-1) * self.log_scale.exp().clamp(max=LOGIT_SCALE_MAX)
+        return q, F.normalize(self._split(k), dim=-1), self._split(v)
+
+    def weights(self, x: Tensor, mem: Tensor) -> Tensor:
+        """(B, H, N, M) attention probabilities, for tests and diagnostics."""
+        q, k, _ = self._qkv(x, mem)
+        return (q @ k.transpose(-1, -2)).softmax(-1)
+
+    def forward(self, x: Tensor, mem: Tensor) -> Tensor:
+        q, k, v = self._qkv(x, mem)
+        return self.out(F.scaled_dot_product_attention(q, k, v, scale=1.0).transpose(1, 2).flatten(2))
+
+
+class Block(nn.Module):
+    """Pre-LN block: attention of x to ``mem`` (cross) or to itself, then an MLP."""
+
+    def __init__(self, dim: int, heads: int, mlp_ratio: float, cross: bool = False) -> None:
+        super().__init__()
+        self.norm_x, self.norm_mlp = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.norm_mem = nn.LayerNorm(dim) if cross else None
+        self.attn = Attention(dim, heads)
+        self.mlp = _mlp(dim, round(dim * mlp_ratio), dim)
+
+    def forward(self, x: Tensor, mem: Tensor | None = None) -> Tensor:
+        xn = self.norm_x(x)
+        x = x + self.attn(xn, xn if self.norm_mem is None else self.norm_mem(mem))
+        return x + self.mlp(self.norm_mlp(x))
 
 
 class StateModel(nn.Module):
@@ -72,7 +124,7 @@ class StateModel(nn.Module):
         self.obs_geometry = _mlp(n_geo, d)
         self.mask_token = nn.Parameter(torch.zeros(d))
         self.state_init = nn.Parameter(torch.randn(cfg.n_state, d) * d ** -0.5)
-        self.blocks = nn.ModuleList(StandardTransformerBlock(d, cfg.heads, cfg.mlp_ratio) for _ in range(cfg.depth))
+        self.blocks = nn.ModuleList(Block(d, cfg.heads, cfg.mlp_ratio) for _ in range(cfg.depth))
         self.state_norm = nn.LayerNorm(d)
         self.predict = _mlp(d + 2 * DT_FREQS + 1, d)
         nn.init.zeros_(self.predict[-1].weight)
@@ -80,9 +132,9 @@ class StateModel(nn.Module):
         self.vae = VAEHead(d, cfg.z_dim, cfg.kl_weight)
         self.z_in = nn.Linear(cfg.z_dim, d)
         self.query_geometry = _mlp(n_geo, d)
-        layer = nn.TransformerDecoderLayer(d, cfg.heads, round(d * cfg.mlp_ratio), dropout=0.0,
-                                           activation="gelu", batch_first=True, norm_first=True)
-        self.readout_blocks = nn.TransformerDecoder(layer, cfg.readout_depth, norm=nn.LayerNorm(d))
+        self.readout_blocks = nn.ModuleList(Block(d, cfg.heads, cfg.mlp_ratio, cross=True)
+                                            for _ in range(cfg.readout_depth))
+        self.readout_norm = nn.LayerNorm(d)
         self.to_pixels = nn.Linear(d, cfg.patch * cfg.patch * 4)
 
     def readout(self, z: Tensor, K: Tensor, c2w: Tensor, H: int, W: int) -> tuple[Tensor, Tensor]:
@@ -93,9 +145,10 @@ class StateModel(nn.Module):
         p = self.cfg.patch
         Hp, Wp = H // p, W // p
         q = self.query_geometry(fourier(patch_geometry(K, c2w, Hp, Wp, p), GEOM_FREQS))
-        mem = self.z_in(z)[:, None].expand(B, V, -1, -1)
-        x = self.to_pixels(self.readout_blocks(q.flatten(0, 1), mem.flatten(0, 1)))
-        x = x.view(B, V, Hp, Wp, p, p, 4).permute(0, 1, 6, 2, 4, 3, 5).reshape(B, V, 4, H, W)
+        x, mem = q.flatten(0, 1), self.z_in(z)[:, None].expand(B, V, -1, -1).flatten(0, 1)
+        for blk in self.readout_blocks:
+            x = blk(x, mem)
+        x = self.to_pixels(self.readout_norm(x)).view(B, V, Hp, Wp, p, p, 4).permute(0, 1, 6, 2, 4, 3, 5).reshape(B, V, 4, H, W)
         return x[:, :, :3].tanh(), x[:, :, 3:]
 
     def forward(self, images: Tensor, K: Tensor, c2w: Tensor, times: Tensor, visible: Tensor) -> StateOutput:

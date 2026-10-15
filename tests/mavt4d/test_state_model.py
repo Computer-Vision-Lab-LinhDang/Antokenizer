@@ -1,6 +1,8 @@
 """Time-indexed state model: causal by construction, readout only through z_t, hidden evidence is ignored."""
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -27,6 +29,48 @@ def batch():
 def model():
     torch.manual_seed(0)
     return StateModel(CFG).eval()
+
+
+def _entropy_ratio(attn, x, mem, rows=slice(None)) -> float:
+    """Mean attention entropy of the selected query rows divided by log(number of keys)."""
+    w = attn.weights(x, mem)[:, :, rows]
+    return ((-(w * w.clamp_min(1e-12).log()).sum(-1)).mean() / math.log(w.shape[-1])).item()
+
+
+def test_attention_selective_at_init(model, batch):
+    """Regression: with plain dot-product attention both the update (state <- patches) and the readout
+    (patch query <- z) started at ~99% of the maximum entropy, every state token read the mean of all
+    patches and training sat on the scene-independent mean image for 1000-1500 steps."""
+    images, K, c2w, times, *_ = batch
+    seen = {}
+
+    def keep_first_inputs(key):
+        def hook(mod, inp, out):  # returns None: a non-None return would replace the module output
+            seen.setdefault(key, inp)
+        return hook
+
+    hooks = [m.attn.register_forward_hook(keep_first_inputs(key))
+             for key, m in (("update", model.blocks[0]), ("readout", model.readout_blocks[0]))]
+    try:
+        model(images, K, c2w, times, _all_visible(images))
+    finally:
+        for h in hooks:
+            h.remove()
+    assert _entropy_ratio(model.blocks[0].attn, *seen["update"], rows=slice(-CFG.n_state, None)) < 0.8
+    assert _entropy_ratio(model.readout_blocks[0].attn, *seen["readout"]) < 0.9  # only K = 8 keys here
+
+
+def test_state_differs_across_scenes_at_init(model, batch):
+    images, K, c2w, times, *_ = batch
+    s = model(images, K, c2w, times, _all_visible(images)).states[:, 0]
+    assert torch.nn.functional.cosine_similarity(s[0], s[1], dim=-1).mean() < 0.9
+
+
+def test_state_tokens_distinct_at_init(model, batch):
+    images, K, c2w, times, *_ = batch
+    s = torch.nn.functional.normalize(model(images, K, c2w, times, _all_visible(images)).states[:, 0], dim=-1)
+    off = ~torch.eye(CFG.n_state, dtype=torch.bool)
+    assert (s @ s.transpose(1, 2))[:, off].abs().mean() < 0.5
 
 
 def _all_visible(images):
