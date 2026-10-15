@@ -39,4 +39,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mavt"]
+packages = ["src/mavt", "src/mavt4d"]
+
+[tool.pytest.ini_options]
+markers = ["server: needs nuScenes or DINOv3 weights on the server; runs only with MAVT4D_SERVER=1"]
