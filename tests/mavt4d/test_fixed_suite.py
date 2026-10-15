@@ -165,6 +165,21 @@ def test_short_event():
     assert "short_event" not in _cats(_scene("e", _still(), calm))
 
 
+def test_short_event_requires_observable_event():
+    """Event frame (4) and the frame before (3): visibility bin >= 3, >= 5 LiDAR points, <= 30 m from ego."""
+    attrs = ["vehicle.moving"] * 4 + ["vehicle.stopped"] * 4
+
+    def frames(x=12.0, vis_before=4, pts_event=10):
+        return [[_ann("car", x, 3, [a], vis=vis_before if t == 3 else 4, pts=pts_event if t == 4 else 10)]
+                for t, a in enumerate(attrs)]
+
+    ev = _cats(_scene("e", _still(), frames()))["short_event"][1]["instances"][0]
+    assert (ev["frame"], ev["vis"], ev["lidar_pts"]) == (4, 4, 10)
+    assert ev["dist_m"] == pytest.approx(math.hypot(12, 3), abs=1e-3) and ev["prev_vis"] == 4
+    for bad in (dict(x=45.0), dict(vis_before=2), dict(pts_event=4)):
+        assert "short_event" not in _cats(_scene("e", _still(), frames(**bad))), bad
+
+
 def test_rare_category():
     frames = [[_ann("dog", 8, 1, cat="animal")] for _ in range(K)]
     rare = fs.rare_classes({"animal": 3, "vehicle.car": 997})
@@ -173,16 +188,23 @@ def test_rare_category():
     assert "rare_category" not in _cats(_scene("f", _still(), frames), {})
 
 
-def test_same_final_position_pairs():
-    # A: ego at origin facing +x, car ends at ego-frame (10, 3) heading +x.
-    a = _scene("scene-a", _still(), [[_ann("ca", 10 * t / (K - 1), 3, ["vehicle.moving"])] for t in range(K)])
-    # B: ego at (100, 50) facing world +y; car moves world -y and ends at ego-frame (10, 3) heading -x.
-    b = _scene("scene-b", [(100.0, 50.0)] * K,
-               [[_ann("cb", 97, 70 - 10 * t / (K - 1), ["vehicle.moving"])] for t in range(K)],
-               ego_yaw=math.pi / 2)
-    # C: like A (same direction) 0.5 m away: pairs with B, never with A.
-    c = _scene("scene-c", _still(), [[_ann("cc", 10 * t / (K - 1), 3 + 0.5 * t / (K - 1), ["vehicle.moving"])]
+def _pair_scenes(fx=10.0, b_last_vis=4, b_last_pts=10):
+    """A, B end at ego-frame (fx, 3) in opposite directions; C is like A (same direction), 0.5 m away."""
+    # A: ego at origin facing +x, car ends at ego-frame (fx, 3) heading +x.
+    a = _scene("scene-a", _still(), [[_ann("ca", fx - 10 + 10 * t / (K - 1), 3, ["vehicle.moving"])]
                                      for t in range(K)])
+    # B: ego at (100, 50) facing world +y; car moves world -y and ends at ego-frame (fx, 3) heading -x.
+    b = _scene("scene-b", [(100.0, 50.0)] * K,
+               [[_ann("cb", 97, 50 + fx + 10 - 10 * t / (K - 1), ["vehicle.moving"],
+                      vis=b_last_vis if t == K - 1 else 4, pts=b_last_pts if t == K - 1 else 10)] for t in range(K)],
+               ego_yaw=math.pi / 2)
+    c = _scene("scene-c", _still(), [[_ann("cc", fx - 10 + 10 * t / (K - 1), 3 + 0.5 * t / (K - 1),
+                                           ["vehicle.moving"])] for t in range(K)])
+    return a, b, c
+
+
+def test_same_final_position_pairs():
+    a, b, c = _pair_scenes()
     rows, _ = fs.mine([a, b, c], K, 4, 2, {}, "v1.0-trainval")
     pair = [r for r in rows if r["category"] == fs.PAIR]
     assert len(pair) == 2
@@ -191,8 +213,16 @@ def test_same_final_position_pairs():
     crit = pair[0]["criteria"]
     assert crit["heading_diff_deg"] >= 90 and crit["final_pos_diff_m"] <= 2
     assert {crit["partner_id"], pair[0]["id"]} == {r["id"] for r in pair}
+    assert crit["final_vis"] == 4 and crit["final_lidar_pts"] == 10
     rows_ac, _ = fs.mine([a, c], K, 4, 2, {}, "v1.0-trainval")
     assert not [r for r in rows_ac if r["category"] == fs.PAIR]
+
+
+def test_pairs_require_visible_final_position():
+    """Last annotation of the instance in each window: visibility bin >= 3, >= 5 LiDAR points, <= 30 m."""
+    for bad in (dict(b_last_vis=2), dict(b_last_pts=4), dict(fx=35.0)):
+        rows, _ = fs.mine(list(_pair_scenes(**bad)), K, 4, 2, {}, "v1.0-trainval")
+        assert not [r for r in rows if r["category"] == fs.PAIR], bad
 
 
 def test_select_deterministic_and_capped():
@@ -341,7 +371,7 @@ def test_build_end_to_end(tmp_path):
                 "lidar_sd_tokens", "instance_tokens", "criteria", "thresholds", "provenance", "mask", "pair_id",
                 "notes"):
         assert key in r, key
-    assert r["suite"] == "fixed_suite_v1" and r["split"] == "val" and r["scene_name"] == "scene-0003"
+    assert r["suite"] == fs.SUITE == "fixed_suite_v2" and r["split"] == "val" and r["scene_name"] == "scene-0003"
     assert len(r["sample_tokens"]) == 8 and r["instance_tokens"] == ["i-val"]
     assert r["lidar_sd_tokens"][0] == "scene-0003-s0-LIDAR_TOP"
     assert summary["counts"]["fixed_camera_moving_object"] == 1 and summary["counts"]["static_scene_moving_camera"] == 0
@@ -359,3 +389,50 @@ def test_build_end_to_end(tmp_path):
     with pytest.raises(FileNotFoundError, match="CAM_BACK"):
         bf.build(tmp_path / "nus", "v1.0-trainval", out, 8, 4, 40, val_names=["scene-0003"],
                  train_names=["scene-0001"], git_commit="test")
+
+
+# ----------------------------------------------------------------------------------------------- renderer
+
+def _two_camera_cache_and_row(category: str):
+    """CAM_FRONT looks along ego +x, CAM_BACK along ego -x. The key car is ahead at every frame except 6,
+    where it is behind the ego."""
+    intr = [[1000.0, 0.0, 800.0], [0.0, 1000.0, 450.0], [0.0, 0.0, 1.0]]
+    rot = {"CAM_FRONT": [0.5, -0.5, 0.5, -0.5], "CAM_BACK": [0.5, -0.5, -0.5, 0.5]}
+    samples = [f"s{t}" for t in range(K)]
+    cache = {"sample_data": {}, "ego_pose": {"ego": {"translation": [0.0, 0.0, 0.0], "rotation": [1.0, 0.0, 0.0, 0.0]}},
+             "calibrated_sensor": {f"cs-{c}": {"translation": [0.0, 0.0, 1.5], "rotation": rot[c], "camera_intrinsic": intr}
+                                   for c in rot},
+             "annotations": {}}
+    for t, s in enumerate(samples):
+        for c in rot:
+            cache["sample_data"][f"{c}-{t}"] = {"ego_pose": "ego", "cs": f"cs-{c}", "width": 1600, "height": 900,
+                                                "filename": ""}
+        cache["annotations"][s] = [{"instance": "car", "xyz": [-10.0 if t == 6 else 10.0, 0.0, 1.5],
+                                    "size": [2.0, 4.5, 1.6], "rotation": [1.0, 0.0, 0.0, 0.0]}]
+    crit = {"instances": [{"instance": "car", "frame": 6}]} if category == fs.EVENT else {}
+    row = {"id": f"{category}:x:00", "category": category, "cameras": list(rot), "mask": None,
+           "sample_tokens": samples, "camera_sd_tokens": {c: [f"{c}-{t}" for t in range(K)] for c in rot},
+           "instance_tokens": ["car"], "criteria": crit}
+    return cache, row
+
+
+def test_renderer_reference_frame():
+    rf = _load(ROOT / "scripts" / "mavt4d" / "render_fixed_suite.py", "_render_fixed_suite")
+    _, ev = _two_camera_cache_and_row(fs.EVENT)
+    _, pair = _two_camera_cache_and_row(fs.PAIR)
+    _, fixed = _two_camera_cache_and_row(fs.FIXED)
+    miss = {**ev, "id": "missing_modality:lidar_dropped:" + ev["id"], "category": fs.MISSING,
+            "criteria": {"base_id": ev["id"], "base_category": fs.EVENT, "variant": "lidar_dropped"}}
+    by_id = {ev["id"]: ev}
+    assert rf.reference_frame(ev, by_id) == 6 and rf.reference_frame(pair, by_id) == K - 1
+    assert rf.reference_frame(miss, by_id) == 6 and rf.reference_frame(fixed, by_id) is None
+
+
+def test_renderer_camera_at_event_frame():
+    rf = _load(ROOT / "scripts" / "mavt4d" / "render_fixed_suite.py", "_render_fixed_suite")
+    cache, ev = _two_camera_cache_and_row(fs.EVENT)
+    cam, ref, _ = rf.choose_camera(ev, cache, rf.reference_frame(ev, {}))
+    assert (cam, ref) == ("CAM_BACK", 6)  # the event frame, not the middle frame
+    cache, fixed = _two_camera_cache_and_row(fs.FIXED)
+    cam, ref, _ = rf.choose_camera(fixed, cache, rf.reference_frame(fixed, {}))
+    assert (cam, ref) == ("CAM_FRONT", K // 2)

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-SUITE = "fixed_suite_v1"
+SUITE = "fixed_suite_v2"
 CAMERAS = ("CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_BACK_RIGHT", "CAM_BACK", "CAM_BACK_LEFT", "CAM_FRONT_LEFT")  # ring
 LIDAR = "LIDAR_TOP"
 
@@ -49,13 +49,16 @@ HALF_CAMERAS_KEPT = ("CAM_FRONT", "CAM_BACK_RIGHT", "CAM_BACK_LEFT")  # every ot
 
 # --- every threshold of the suite, in one place --------------------------------------------------------
 _MOTION = {"moving_attr_frac": 0.5, "moving_min_disp_m": 3.0, "static_max_disp_m": 1.0}
+# the annotation where the tested thing happens must be observable: short_event event frame and the frame
+# before it, same_final_position last annotation of the instance in each window
+_OBSERVED = {"observed_min_bin": 3, "observed_min_lidar_pts": 5, "observed_max_dist_m": 30.0}
 THRESHOLDS: dict[str, dict] = {
     STATIC: {**_MOTION, "ego_min_disp_m": 5.0, "min_static_instances": 1},
     FIXED: {**_MOTION, "ego_max_dev_m": 0.5, "ego_max_dyaw_deg": 5.0, "near_m": 40.0, "min_moving": 1},
     BOTH: {**_MOTION, "ego_min_disp_m": 5.0, "near_m": 40.0, "min_moving": 2},
     OCCL: {"near_m": 50.0, "visible_min_bin": 3, "occluded_bin": 1, "occluded_lidar_pts": 0},
-    EVENT: {"near_m": 40.0},
-    PAIR: {**_MOTION, "near_m": 40.0, "max_final_dist_m": 2.0, "min_heading_diff_deg": 90.0},
+    EVENT: {**_OBSERVED},
+    PAIR: {**_MOTION, **_OBSERVED, "max_final_dist_m": 2.0, "min_heading_diff_deg": 90.0},
     MISSING: {"bases_per_category": 2, "variants": list(MISSING_VARIANTS)},
     RARE: {"max_train_share": 0.005, "near_m": 40.0},
 }
@@ -69,8 +72,10 @@ NOTES = {
     BOTH: "Ego translation is first-to-last keyframe.",
     OCCL: ("visibility bins (1: 0-40%, ..., 4: 80-100%) are aggregated over all 6 cameras, so an occlusion here "
            "need not be an occlusion in any single camera."),
-    EVENT: "Annotator attribute change of one instance between consecutive keyframes.",
-    PAIR: ("Annotation-mined approximate pair (final position in the last keyframe's ego frame, displacement "
+    EVENT: ("Annotator attribute change of one instance between consecutive keyframes; at the event frame and "
+            "the frame before it the instance has visibility bin >= 3, >= 5 LiDAR points and is <= 30 m away."),
+    PAIR: ("Final annotation of the instance: visibility bin >= 3, >= 5 LiDAR points, <= 30 m away. "
+           "Annotation-mined approximate pair (final position in the last keyframe's ego frame, displacement "
            "heading in that frame, yaw only); synthetic T6 will supply exact pairs."),
     MISSING: ("Derived from another selected clip: missing = mask False, never zero values; the referenced "
               "tokens are kept so a loader can still verify what it drops."),
@@ -245,14 +250,24 @@ def _occlusion(tr: _Track) -> list[int] | None:
     return None
 
 
+def _observed(a: Ann, dist: float) -> bool:
+    th = _OBSERVED
+    return (a.vis >= th["observed_min_bin"] and a.lidar_pts >= th["observed_min_lidar_pts"]
+            and dist <= th["observed_max_dist_m"])
+
+
 def _event(tr: _Track) -> dict | None:
-    """First state change (moving <-> still) between consecutive annotations of one instance."""
+    """First state change (moving <-> still) between consecutive annotations of one instance where both
+    annotations are observable."""
     prev = None
     for idx, a in enumerate(tr.anns):
         st = next((EVENT_STATES[x] + (x,) for x in a.attrs if x in EVENT_STATES), None)
-        if st and prev and st[0] == prev[0] and st[1] != prev[1] and tr.frames[idx] == tr.frames[idx - 1] + 1:
+        if (st and prev and st[0] == prev[0] and st[1] != prev[1] and tr.frames[idx] == tr.frames[idx - 1] + 1
+                and _observed(a, tr.dists[idx]) and _observed(tr.anns[idx - 1], tr.dists[idx - 1])):
+            b = tr.anns[idx - 1]
             return {"instance": tr.instance, "frame": tr.frames[idx], "from": prev[2], "to": st[2],
-                    "dist_m": _r(tr.dists[idx])}
+                    "vis": a.vis, "lidar_pts": a.lidar_pts, "dist_m": _r(tr.dists[idx]),
+                    "prev_vis": b.vis, "prev_lidar_pts": b.lidar_pts, "prev_dist_m": _r(tr.dists[idx - 1])}
         prev = st if st else prev
     return None
 
@@ -299,7 +314,7 @@ def classify_window(scene: Scene, start: int, k: int, rare: dict) -> dict[str, t
     if occ:
         out[OCCL] = ([t.instance for t, _ in occ], {**ego, "instances": [c for _, c in occ]})
 
-    events = [(t, e) for t in by_near if t.near <= THRESHOLDS[EVENT]["near_m"] and (e := _event(t))]
+    events = [(t, e) for t in by_near if (e := _event(t))]
     if events:
         out[EVENT] = ([t.instance for t, _ in events], {**ego, "instances": [e for _, e in events]})
 
@@ -322,6 +337,8 @@ class _PairCand:
     heading_deg: float  # displacement direction in that frame
     disp: float
     final_dist: float
+    final_vis: int
+    final_pts: int
 
 
 def pair_candidates(scene: Scene, start: int, k: int) -> list[_PairCand]:
@@ -331,13 +348,14 @@ def pair_candidates(scene: Scene, start: int, k: int) -> list[_PairCand]:
     c, s = math.cos(yaw), math.sin(yaw)
     out = []
     for t in _tracks(frames):
-        if not t.moving or t.frames[-1] != k - 1 or t.dists[-1] > THRESHOLDS[PAIR]["near_m"]:
+        if not t.moving or t.frames[-1] != k - 1 or not _observed(t.anns[-1], t.dists[-1]):
             continue
         a0, a1 = t.anns[0], t.anns[-1]
         rx, ry = a1.xyz[0] - last.ego_xyz[0], a1.xyz[1] - last.ego_xyz[1]
         dx, dy = a1.xyz[0] - a0.xyz[0], a1.xyz[1] - a0.xyz[1]
         out.append(_PairCand(scene, start, t.instance, (c * rx + s * ry, -s * rx + c * ry),
-                             math.degrees(math.atan2(-s * dx + c * dy, c * dx + s * dy)), t.disp, t.dists[-1]))
+                             math.degrees(math.atan2(-s * dx + c * dy, c * dx + s * dy)), t.disp, t.dists[-1],
+                             a1.vis, a1.lidar_pts))
     return out
 
 
@@ -384,7 +402,8 @@ def select_pairs(cands: list[_PairCand], per_category: int, k: int, per_scene: i
             taken[x.scene.name].append(x.start)
             out.append(Cand(PAIR, x.scene, x.start, (x.instance,), {
                 "instance": x.instance, "final_ego_xy": [_r(v) for v in x.final_xy], "heading_deg": _r(x.heading_deg),
-                "disp_m": _r(x.disp), "final_dist_m": _r(x.final_dist), "partner_id": partner,
+                "disp_m": _r(x.disp), "final_dist_m": _r(x.final_dist), "final_vis": x.final_vis,
+                "final_lidar_pts": x.final_pts, "partner_id": partner,
                 "final_pos_diff_m": _r(d), "heading_diff_deg": _r(dh)}, pid))
     return out
 

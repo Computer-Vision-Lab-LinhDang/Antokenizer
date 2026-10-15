@@ -2,7 +2,7 @@
 """Mine the MAVT E1.3 fixed test suite v1 (roadmap §1.4) from nuScenes val annotations.
 
     PYTHONPATH=src python scripts/mavt4d/build_fixed_suite.py --dataroot data/datasets/nuscenes \
-        --out data/eval/fixed_suite_v1.jsonl --clip-len 8 --stride 4 --per-category 40 --git-commit <sha>
+        --out data/eval/fixed_suite_v2.jsonl --clip-len 8 --stride 4 --per-category 40 --git-commit <sha>
 
 Light data prep (run it on a login node, not through Slurm). The three big tables are streamed
 (mavt4d.data.jsonstream) keeping only val keyframe rows: sample_data (LIDAR_TOP + 6 cameras), the
@@ -225,7 +225,7 @@ def main(argv=None) -> None:
     ap.add_argument("--dataroot", required=True)
     ap.add_argument("--version", default="v1.0-trainval")
     ap.add_argument("--split", default="val", choices=["val"])
-    ap.add_argument("--out", default="data/eval/fixed_suite_v1.jsonl")
+    ap.add_argument("--out", default="data/eval/fixed_suite_v2.jsonl")
     ap.add_argument("--clip-len", type=int, default=8)
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--per-category", type=int, default=40)

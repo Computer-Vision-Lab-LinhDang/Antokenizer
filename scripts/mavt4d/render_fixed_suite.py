@@ -2,11 +2,11 @@
 """Contact sheets for the E1.3 fixed suite: a visual and geometric check of the mined clips.
 
     PYTHONPATH=src python scripts/mavt4d/render_fixed_suite.py --dataroot data/datasets/nuscenes \
-        --suite data/eval/fixed_suite_v1.jsonl --out data/eval/fixed_suite_v1_check
+        --suite data/eval/fixed_suite_v2.jsonl --out data/eval/fixed_suite_v2_check
 
 Picks ``--n`` clips deterministically (round robin over categories, bucket order within one), and for
-each the camera where the key instances' centres project in front of it and inside the image at the
-middle keyframe. Draws the K keyframes in a grid with projected 3D boxes (key instances bold orange,
+each the camera where the primary key instance's centre projects in front of it and inside the image at
+the reference frame: the event frame (short_event), the last keyframe (pairs), else the middle one. Draws the K keyframes in a grid with projected 3D boxes (key instances bold orange,
 others thin grey): global -> ego (ego_pose of that camera sample_data) -> camera (calibrated_sensor)
 -> intrinsics, via mavt4d.geometry.camera.project.
 
@@ -68,17 +68,29 @@ def centres_in_image(cache: dict, sd_tok: str, anns: list[dict]) -> tuple[int, f
     return int(ok.sum()), off
 
 
-def choose_camera(row: dict, cache: dict) -> tuple[str, int, list[list[dict]]]:
-    """(camera, reference frame, key-instance annotations per frame). The reference frame is the middle
-    keyframe, or the nearest one where the primary key instance (the first, nearest) is annotated. The
-    camera must see the primary centre first, then as many other key centres as possible; masked-out
-    cameras are skipped."""
+def reference_frame(row: dict, by_id: dict[str, dict]) -> int | None:
+    """Frame where the tested thing is visible: the primary instance's event frame (short_event), the last
+    keyframe (pairs: the final position), None otherwise. A missing_modality row uses its base clip's."""
+    src = by_id.get(row["criteria"].get("base_id"), row) if row["category"] == fs.MISSING else row
+    if src["category"] == fs.EVENT:
+        return src["criteria"]["instances"][0]["frame"]
+    if src["category"] == fs.PAIR:
+        return len(row["sample_tokens"]) - 1
+    return None
+
+
+def choose_camera(row: dict, cache: dict, ref: int | None = None) -> tuple[str, int, list[list[dict]]]:
+    """(camera, reference frame, key-instance annotations per frame). Without ``ref`` the reference frame
+    is the middle keyframe, or the nearest one where the primary key instance (the first, nearest) is
+    annotated. The camera must see the primary centre first, then as many other key centres as possible;
+    masked-out cameras are skipped."""
     key = set(row["instance_tokens"])
     primary = row["instance_tokens"][0] if row["instance_tokens"] else None
     k = len(row["sample_tokens"])
     key_at = [[a for a in cache["annotations"][s] if a["instance"] in key] for s in row["sample_tokens"]]
-    ref = min((t for t in range(k) if any(a["instance"] == primary for a in key_at[t])),
-              key=lambda t: (abs(t - k // 2), t), default=k // 2)
+    if ref is None:
+        ref = min((t for t in range(k) if any(a["instance"] == primary for a in key_at[t])),
+                  key=lambda t: (abs(t - k // 2), t), default=k // 2)
     cams = [c for c in row["cameras"] if row["mask"] is None or row["mask"]["cameras"][c][ref]]
 
     def score(c: str):
@@ -105,8 +117,8 @@ def _caption(row: dict) -> str:
     return json.dumps(crit, separators=(",", ":"))
 
 
-def render_clip(row: dict, cache: dict, dataroot: Path, width: int, path: Path) -> dict:
-    cam, ref, key_at = choose_camera(row, cache)
+def render_clip(row: dict, cache: dict, dataroot: Path, width: int, path: Path, ref: int | None = None) -> dict:
+    cam, ref, key_at = choose_camera(row, cache, ref)
     key = set(row["instance_tokens"])
     n_ref, _ = centres_in_image(cache, row["camera_sd_tokens"][cam][ref], key_at[ref])
     primary = row["instance_tokens"][0] if row["instance_tokens"] else None
@@ -203,9 +215,9 @@ devkit comparison are the independent checks.</p>
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Contact sheets for the E1.3 fixed suite.")
     ap.add_argument("--dataroot", required=True)
-    ap.add_argument("--suite", default="data/eval/fixed_suite_v1.jsonl")
+    ap.add_argument("--suite", default="data/eval/fixed_suite_v2.jsonl")
     ap.add_argument("--cache", default=None, help="default: <suite stem>.cache.json")
-    ap.add_argument("--out", default="data/eval/fixed_suite_v1_check")
+    ap.add_argument("--out", default="data/eval/fixed_suite_v2_check")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--width", type=int, default=448)
     ap.add_argument("--no-devkit-check", action="store_true")
@@ -215,8 +227,9 @@ def main(argv=None) -> None:
     with open(a.cache or suite.with_suffix(".cache.json"), encoding="utf-8") as f:
         cache = json.load(f)
     out.mkdir(parents=True, exist_ok=True)
-    clips = [render_clip(r, cache, dataroot, a.width, out / f"{i:02d}_{r['category']}.jpg")
-             for i, r in enumerate(pick_clips(rows, a.n))]
+    by_id = {r["id"]: r for r in rows}
+    clips = [render_clip(r, cache, dataroot, a.width, out / f"{i:02d}_{r['category']}.jpg",
+                         reference_frame(r, by_id)) for i, r in enumerate(pick_clips(rows, a.n))]
     tot = lambda k: sum(c[k] for c in clips)  # noqa: E731
     summary = {
         "clips": len(clips), "per_category": {c: sum(x["category"] == c for x in clips) for c in fs.CATEGORIES},
