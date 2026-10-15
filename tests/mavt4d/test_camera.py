@@ -85,6 +85,17 @@ def test_zbuffer_tolerance():
     assert vis.tolist() == [True, False]
 
 
+def test_zbuffer_depth_relative_tolerance():
+    """tol = tol_m + tol_rel * depth of the tested point: 5% of 10.4 m is 0.52 m, of 10.6 m 0.53 m."""
+    ref_uv = torch.tensor([[20.2, 20.2], [40.5, 10.5]])
+    ref_depth = torch.tensor([10.0, 30.0])  # nearest surfaces of two cells
+    uv = torch.tensor([[22.0, 21.0], [22.0, 21.0], [41.0, 11.0]])
+    depth = torch.tensor([10.4, 10.6, 31.4])
+    rel = zbuffer_visibility(uv, depth, ref_uv, ref_depth, H=48, W=80, tol_m=0.0, tol_rel=0.05)
+    assert rel.tolist() == [True, False, True]  # 31.4 <= 30 + 1.57
+    fixed = zbuffer_visibility(uv, depth, ref_uv, ref_depth, H=48, W=80, tol_m=0.5)
+    assert fixed.tolist() == [True, False, False]
+
 def test_patch_ray_dirs_unit_and_center_is_optical_axis():
     c2w = _pose(4)
     Hp, Wp, patch = 3, 5, 16

@@ -57,7 +57,7 @@ def _lidar_reps(sample: SceneSample, layout: TokenLayout, cfg: GraphConfig, v: i
     p = move_points(sample, p, inst, tau_s, tau)
     K, c2w = sample.intrinsics[v], sample.cam_to_world[v, t]
     H, W = sample.images.shape[-2:]
-    uv, depth, vis = project_visible(p, p, K, c2w, H, W, cfg.zbuffer_cell_px, cfg.zbuffer_tol_m)
+    uv, depth, vis = project_visible(p, p, K, c2w, H, W, cfg.zbuffer_cell_px, cfg.zbuffer_tol_m, cfg.zbuffer_tol_rel)
     rc, inside = pixel_to_patch(uv, cfg.patch, layout.Hp, layout.Wp)
     idx = (vis & inside).nonzero().flatten()
     if len(idx) == 0:

@@ -1,6 +1,6 @@
 # E1.1 nuScenes data check (v1.0-mini)
 
-dataroot `/home/user02/edtech/antoken/data/datasets/nuscenes`; wall 356 s; headnode load average at start 129, 109, 107 (timings are inflated by a shared, loaded headnode).
+dataroot `/home/user02/edtech/antoken/data/datasets/nuscenes`; wall 489 s; headnode load average at start 138, 131, 124 (timings are inflated by a shared, loaded headnode).
 
 ## Sample counts
 
@@ -90,75 +90,77 @@ Independent check against the devkit's map_pointcloud_to_image chain (pyquaterni
 
 | mode | workers | n | wall [s] | s/sample |
 |---|---|---|---|---|
-| m3 | 0 | 24 | 5.6 | 0.232 |
-| m3 | 2 | 24 | 3.4 | 0.141 |
-| m2 | 0 | 24 | 3.7 | 0.152 |
-| m2 | 2 | 24 | 2.2 | 0.091 |
+| m3 | 0 | 24 | 5.1 | 0.213 |
+| m3 | 2 | 24 | 4.8 | 0.199 |
+| m2 | 0 | 24 | 3.0 | 0.123 |
+| m2 | 2 | 24 | 1.9 | 0.080 |
 
-Peak RSS (getrusage, same counter as `/usr/bin/time -v`): main process 866 MB, largest joined DataLoader worker 665 MB. The `/usr/bin/time -v` log of this run, if wrapped, sits beside this report as `time_v.log`.
+Peak RSS (getrusage, same counter as `/usr/bin/time -v`): main process 832 MB, largest joined DataLoader worker 651 MB. The `/usr/bin/time -v` log of this run, if wrapped, sits beside this report as `time_v.log`.
 
 ## Graph edges (T27, gate M1)
 
-Every m3 sample of mini_train and mini_val: hold-out (frac 0.3) -> `build_hubs` (K=256, M=32) -> `build_graph` with the default `GraphConfig` (patch 16, z-buffer cell 4 px, tol 0.5 m, caps hub 32 / patch 8). Graph passes use 8 DataLoader workers.
+Every m3 sample of mini_train and mini_val: hold-out (frac 0.3) -> `build_hubs` (K=256, M=32, shared by all variants) -> `build_graph` per builder variant. The builders read only the keyframe sweep's input points (held-out excluded): no sweeps, so they run unchanged on trainval keyframes. The ±5 sweeps enter only the metric. Graph passes use 8 DataLoader workers.
+
+False-visible metric, the same for every row (M1 rule): a member behind a kept PROJ_P2H edge is false-visible when `zbuffer_visibility` with cell 4 px and tol 0.5 m rejects it against LiDAR merged over ±5 sweeps (`pm5`, gate) or against the keyframe sweep with held-out points restored (`pm0`). `own rule` re-runs each variant's own z-buffer on its own reference and must be 0 (counting check).
+
+### Builder variants
+
+| variant | z-buffer cell / tol | grazing filter | FV ±5 sweeps | FV keyframe sweep | own rule | re-check | P2H = H2P edges | used members | mean in-degree P2H per hub / H2P per patch | prepare median [s] | M1 re-check / FV |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | 4 px / 0.5 m | off | **30.66%** | 4.28% | 0 | 100.00% | 974852 | 3018725 | 9.47 / 0.90 | 0.223 | **PASS** / **FAIL** |
+| grazing | 4 px / 0.5 m | cos ≥ 0.2 | **27.64%** | 4.18% | 0 | 100.00% | 622252 | 1947346 | 6.15 / 0.59 | 0.231 | **PASS** / **FAIL** |
+| reltol | 4 px / 5% of depth | off | **33.81%** | 8.62% | 0 | 100.00% | 979200 | 3160699 | 9.52 / 0.91 | 0.222 | **PASS** / **FAIL** |
+| cell2 | 2 px / 0.5 m | off | **37.05%** | 13.08% | 0 | 100.00% | 1010816 | 3319111 | 9.81 / 0.93 | 0.228 | **PASS** / **FAIL** |
+| grazing+reltol | 4 px / 5% of depth | cos ≥ 0.2 | **31.13%** | 8.79% | 0 | 100.00% | 625497 | 2045492 | 6.18 / 0.59 | 0.225 | **PASS** / **FAIL** |
+| all | 2 px / 5% of depth | cos ≥ 0.2 | **34.51%** | 13.27% | 0 | 100.00% | 646096 | 2150540 | 6.37 / 0.61 | 0.221 | **PASS** / **FAIL** |
+
+Settings, each chosen once (no sweep): grazing filter cos ≥ 0.2 (incidence ≤ ~78°; with a 5% tolerance and fx / cell ≈ 90 px a surface stays inside the tolerance up to tan(incidence) ≈ 4.5); relative tolerance 5% of depth replacing the fixed 0.5 m (equal to it at 10 m: stricter nearer, looser farther); cell 2 px against 4 px. Prepare = hold-out + hubs + graph inside a worker, all variants timed in the same item so they share the headnode's load.
+
+Grazing filter on the baseline graph: it would drop 390496 of 974852 P2H edges (40.06%); 6.39% of the dropped and 1.41% of the kept come from near-collinear hubs (λ_mid / λ_max < 0.05), whose PCA normal, and so cos_incidence, is ill-defined.
+
+False-visible (`pm5`, M1 rule) per member-depth bin, both splits:
+
+| variant | [0, 10) | [10, 20) | [20, 40) | [40, inf) |
+|---|---|---|---|---|
+| baseline | 9.29% (187191) | 25.05% (568040) | 30.34% (1167558) | 37.55% (1095936) |
+| grazing | 6.60% (119317) | 19.03% (315249) | 26.53% (796615) | 36.18% (716165) |
+| reltol | 9.27% (186966) | 25.48% (571285) | 33.18% (1216472) | 42.33% (1185976) |
+| cell2 | 10.47% (189516) | 27.80% (589179) | 36.63% (1280033) | 45.81% (1260383) |
+| grazing+reltol | 6.58% (119177) | 19.45% (316885) | 29.51% (830127) | 41.37% (779303) |
+| all | 7.73% (120746) | 21.82% (326466) | 33.05% (873738) | 44.94% (829590) |
+
+False-visible (`pm5`, M1 rule) per camera, both splits:
+
+| camera | baseline | grazing | reltol | cell2 | grazing+reltol | all |
+|---|---|---|---|---|---|---|
+| CAM_FRONT | 32.75% | 29.96% | 35.77% | 38.10% | 33.41% | 35.68% |
+| CAM_FRONT_RIGHT | 27.28% | 25.61% | 29.44% | 32.61% | 27.90% | 30.98% |
+| CAM_BACK_RIGHT | 25.94% | 23.20% | 28.11% | 31.65% | 25.45% | 28.73% |
+| CAM_BACK | 38.11% | 34.39% | 43.09% | 46.24% | 39.98% | 44.21% |
+| CAM_BACK_LEFT | 27.45% | 22.71% | 29.07% | 33.70% | 24.24% | 28.14% |
+| CAM_FRONT_LEFT | 25.16% | 22.79% | 27.64% | 31.46% | 25.85% | 28.96% |
+
+- mini_train: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm5 273452; dropped from neighbours: 27680260 ego-body, 9924706 in boxes (|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).
+- mini_val: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm5 266331; dropped from neighbours: 6870304 ego-body, 2574932 in boxes (|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).
+
+### Default GraphConfig (`baseline`): patch 16, cell 4 px, tol 0.5 m, caps hub 32 / patch 8
 
 | M1 criterion | measured | threshold | verdict |
 |---|---|---|---|
 | projection edges re-project into their patch | 974852/974852 = 100.00%; H2P = reverse of P2H in every sample: True | 100% | **PASS** |
-| false-visible vs LiDAR merged over ±5 sweeps (`pm5`, graph's cell rule) | 925455/3018725 = 30.66% | < 5% | **FAIL** (cell rule; see attribution) |
+| false-visible vs LiDAR merged over ±5 sweeps | 925455/3018725 = 30.66% | < 5% | **FAIL** |
 | data_wait_frac | not measured (needs T25) | < 0.10 | pending |
 
-### Projection re-check
-
-An edge passes when at least one member of its hub, lifted to world in float64 and projected with `project` (not the builder's float32 `visible_members` path), lands in the edge's patch in front of the camera (spec T11, test 1). Visibility is judged by the false-visible check below, not here.
+Projection re-check: an edge passes when at least one member of its hub, lifted to world in float64 and projected with `project` (not the builder's float32 path), lands in the edge's patch in front of the camera (spec T11, test 1).
 
 | split | P2H edges | passed | failed | hub centre in the edge's patch | centre distance [patches] median / p95 |
 |---|---|---|---|---|---|
 | mini_train | 776675 | 776675 | 0 | 10.52% | 2 / 5 |
 | mini_val | 198177 | 198177 | 0 | 10.62% | 2 / 5 |
 
-The hub-centre column is information only: the task brief phrased the check as "the hub centre re-projects into the connected patch", but edges are built from members (spec T11), so a hub whose 32 members span several patches links to all of them and its centre lies in only one. The gate uses the spec's member definition. The centre distance is Chebyshev in patch units (capped at 64).
+The hub-centre column is information only: edges are built from members (spec T11), so a hub whose 32 members span several patches links to all of them and its centre lies in only one. Chebyshev distance in patch units, capped at 64.
 
-### False-visible rate
-
-Members counted: one per hub member slot, visible to the builder's z-buffer and inside the patch of a kept (post-cap) PROJ_P2H edge, i.e. exactly the members behind the edge weights. A member is false-visible when `zbuffer_visibility` with the same cell and tol rejects it against a reference cloud:
-
-- `train`: the graph's own reference (input points of the keyframe sweep). Must be 0; checks the counting.
-- `pm0`: every point of the keyframe sweep, held-out included (effect of hold-out sparsity alone).
-- `pm5` (gate): `pm0` plus up to ±5 neighbouring LIDAR_TOP sweeps inside the scene, each placed with its own ego pose; points with |x|, |y| < 1 m in the sensor frame (ego body, as devkit `remove_close`) and points inside the annotation boxes interpolated at the sweep's time, dilated 0.3 m (moving objects smear across sweeps), are dropped from the neighbours. Same cell and tol as the graph, so grazing ground at range can be rejected by a denser cloud of the same surface, which inflates this rate; it also misses occluders the roof LiDAR never returns (parallax shadows, glass, thin objects), so it is not a strict bound either way. The synthetic test of T11 (`gt_visible`) excludes grazing on purpose (farthest of the 4 surrounding GT depths); no such definition is applied to real data here.
-- Attribution rows, not gates: `pm1` = ±1 sweep (±50 ms, so pose drift is negligible: a jump from `pm0` to `pm1` is mostly density; growth from `pm1` to `pm5` mixes density with registration over time and does not separate them); `pm5_ego3` = ego exclusion widened to |x|, |y| < 3 m (a collapse on CAM_FRONT / CAM_BACK means ghosts of the ego body from neighbour sweeps); `pm5_noground` = neighbour points below world z 0.3 m dropped (a collapse in the far bins means grazing ground).
-
-| split | reference | used members | false-visible | rate | [0, 10) | [10, 20) | [20, 40) | [40, inf) |
-|---|---|---|---|---|---|---|---|---|
-| mini_train | train | 2395904 | 0 | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
-| mini_train | pm0 | 2395904 | 105794 | 4.42% | 0.64% | 1.63% | 4.12% | 6.86% |
-| mini_train | pm1 | 2395904 | 382229 | 15.95% | 3.36% | 9.30% | 15.83% | 21.78% |
-| mini_train | pm5 | 2395904 | 727237 | 30.35% | 9.00% | 24.21% | 29.49% | 38.27% |
-| mini_train | pm5_ego3 | 2395904 | 709119 | 29.60% | 7.75% | 23.25% | 28.91% | 37.51% |
-| mini_train | pm5_noground | 2395904 | 621225 | 25.93% | 6.05% | 13.50% | 24.75% | 37.20% |
-| mini_val | train | 622821 | 0 | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
-| mini_val | pm0 | 622821 | 23327 | 3.75% | 0.23% | 1.19% | 4.00% | 5.32% |
-| mini_val | pm1 | 622821 | 88634 | 14.23% | 2.14% | 7.36% | 15.76% | 18.07% |
-| mini_val | pm5 | 622821 | 198218 | 31.83% | 10.56% | 28.11% | 33.84% | 34.97% |
-| mini_val | pm5_ego3 | 622821 | 195392 | 31.37% | 8.48% | 27.50% | 33.39% | 34.83% |
-| mini_val | pm5_noground | 622821 | 163680 | 26.28% | 4.59% | 14.40% | 27.65% | 34.27% |
-
-Per camera, false-visible rate per reference (both splits):
-
-| camera | used | pm0 | pm1 | pm5 | pm5_ego3 | pm5_noground |
-|---|---|---|---|---|---|---|
-| CAM_FRONT | 655058 | 3.72% | 15.70% | 32.75% | 31.09% | 25.66% |
-| CAM_FRONT_RIGHT | 543238 | 3.32% | 13.77% | 27.28% | 27.22% | 22.83% |
-| CAM_BACK_RIGHT | 486404 | 3.54% | 13.33% | 25.94% | 25.75% | 22.71% |
-| CAM_BACK | 734408 | 6.24% | 20.10% | 38.11% | 36.94% | 32.26% |
-| CAM_BACK_LEFT | 252444 | 3.88% | 13.94% | 27.45% | 27.42% | 25.98% |
-| CAM_FRONT_LEFT | 347173 | 3.99% | 13.10% | 25.16% | 25.12% | 23.00% |
-
-- mini_train: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm1 82606, pm5 273452, pm5_ego3 260577, pm5_noground 134685; dropped from neighbours: 27680260 ego-body, 9924706 in boxes.
-- mini_val: neighbour sweeps per sample 5–10 (median 10); reference points per sample median: train 24304, pm0 34720, pm1 81183, pm5 266331, pm5_ego3 260846, pm5_noground 127806; dropped from neighbours: 6870304 ego-body, 2574932 in boxes.
-
-### Degree and provenance
-
-Summed over samples (edges, provenance), mean over samples of the mean in-degree over eligible receivers, max in-degree over all nodes. m3 has T = 1, so no TRACK edges.
+Degree and provenance: edges and provenance summed over samples, mean in-degree over eligible receivers averaged over samples, max in-degree over all nodes. m3 has T = 1, so no TRACK edges.
 
 mini_train (323 samples):
 
@@ -180,14 +182,11 @@ mini_val (81 samples):
 | PROJ_H2P | 198177 | 0.91 | 8 | CALIB_LIDAR=198177 |
 | NB3D | 331776 | 16.00 | 16 | CALIB_LIDAR=331776 |
 
-Caps: SPATIAL max 24 vs cap 24 (ok); PROJ_P2H max 32 vs cap 32 (ok); PROJ_H2P max 8 vs cap 8 (ok); NB3D max 16 vs cap 16 (ok).
+Caps, max over all variants: SPATIAL max 24 vs cap 24 (ok); PROJ_P2H max 32 vs cap 32 (ok); PROJ_H2P max 8 vs cap 8 (ok); NB3D max 16 vs cap 16 (ok).
 
-### Prepare time (mini_train m3)
+### Prepare time (mini_train m3, default GraphConfig)
 
-Loader delivering (sample, hubs, graph) with 8 workers (1 torch thread each) over 160 samples: wall 17.5 s = **0.109 s/sample**. Inside a worker: load (6 JPEGs + sweep) median 0.3279 s (p95 0.8833), hold-out + hubs + graph median 0.2358 s (p95 0.9241). Headnode load average before this pass: 136, 117, 110 on a shared 8-core headnode, so these are upper bounds for a dedicated node.
-
-- mini_train check pass (142 s wall incl. checks): in-worker load median 0.2448 s, prepare median 0.2172 s.
-- mini_val check pass (24 s wall incl. checks): in-worker load median 0.1746 s, prepare median 0.225 s.
+Loader delivering (sample, hubs, graph) with 8 workers (1 torch thread each) over 160 samples: wall 21.9 s = **0.137 s/sample**. Inside a worker: load (6 JPEGs + sweep) median 0.4477 s (p95 1.021), hold-out + hubs + graph median 0.2409 s (p95 0.7207). Headnode load average before this pass: 136, 133, 125 on a shared 8-core headnode, so these are upper bounds for a dedicated node. Per-variant prepare medians are in the variant table (measured inside the check pass, which also runs the checks).
 
 ## Pending
 

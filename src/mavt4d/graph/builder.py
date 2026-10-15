@@ -30,7 +30,9 @@ class GraphConfig:
     proj_hub_cap: int = 32
     proj_patch_cap: int = 8
     zbuffer_tol_m: float = 0.5
+    zbuffer_tol_rel: float = 0.0  # z-buffer tolerance grows by this fraction of the point's depth
     zbuffer_cell_px: int = 4
+    min_cos_incidence: float = 0.0  # projection edges need |hub normal . view ray| >= this (0 = no filter)
     nb3d_k: int = 16
     hubs_K: int = 256
     hubs_M: int = 32
@@ -94,7 +96,7 @@ def train_correspondences(sample: SceneSample, layout: TokenLayout, cfg: GraphCo
         tok = []
         for v, t in frames:
             uv, _, vis = project_visible(pts, pts, sample.intrinsics[v], sample.cam_to_world[v, t], H, W,
-                                         cfg.zbuffer_cell_px, cfg.zbuffer_tol_m)
+                                         cfg.zbuffer_cell_px, cfg.zbuffer_tol_m, cfg.zbuffer_tol_rel)
             rc, inside = pixel_to_patch(uv, cfg.patch, layout.Hp, layout.Wp)
             tok.append(torch.where(vis & inside, layout.cam_index(v, t, rc[:, 0], rc[:, 1]), -1))
         for i in range(len(frames)):

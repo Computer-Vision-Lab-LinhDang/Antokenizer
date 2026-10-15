@@ -71,11 +71,17 @@ def recheck_projection_edges(sample: SceneSample, hubs: HubGroups, graph: Corres
 
 
 def false_visible_counts(sample: SceneSample, hubs: HubGroups, graph: CorrespondenceGraph,
-                         ref_world: list[Tensor], cfg: GraphConfig) -> dict[tuple[int, int], dict[str, list[int]]]:
-    """Per view-frame (v, t): ``used`` members (one per hub member slot) behind kept PROJ_P2H edges, and
-    ``false`` = those that ``zbuffer_visibility`` with the graph's cell and tol rejects against
-    ``ref_world[s]``, the world-frame reference cloud of the sweep s paired with (v, t). Both are counted
-    per member-depth bin of DEPTH_BINS_M."""
+                         ref_world: list[Tensor], cfg: GraphConfig, ref_cell_px: int | None = None,
+                         ref_tol_m: float | None = None,
+                         ref_tol_rel: float | None = None) -> dict[tuple[int, int], dict[str, list[int]]]:
+    """Per view-frame (v, t): ``used`` members (one per hub member slot) behind kept PROJ_P2H edges of a graph
+    built with ``cfg``, and ``false`` = those that ``zbuffer_visibility`` rejects against ``ref_world[s]``, the
+    world-frame reference cloud of the sweep s paired with (v, t). The reference rule (cell, tol, tol_rel)
+    defaults to the builder's own; pass it explicitly to hold the yardstick fixed across builder variants.
+    Both counts are per member-depth bin of DEPTH_BINS_M."""
+    rule = (cfg.zbuffer_cell_px if ref_cell_px is None else ref_cell_px,
+            cfg.zbuffer_tol_m if ref_tol_m is None else ref_tol_m,
+            cfg.zbuffer_tol_rel if ref_tol_rel is None else ref_tol_rel)
     p2h, L = graph.edges[EdgeType.PROJ_P2H], graph.layout
     v, t, r, c, s, k = _decode(graph, p2h.src, p2h.dst)
     H, W = sample.images.shape[-2:]
@@ -91,7 +97,7 @@ def false_visible_counts(sample: SceneSample, hubs: HubGroups, graph: Correspond
             key = torch.arange(L.K).repeat_interleave(M) * n_patch + rc[:, 0] * L.Wp + rc[:, 1]
             used = vis & inside & torch.isin(key, k[sel] * n_patch + r[sel] * L.Wp + c[sel])
             ref_uv, ref_d = project(ref_world[ss], sample.intrinsics[vv], sample.cam_to_world[vv, tt])
-            ok = zbuffer_visibility(uv, depth, ref_uv, ref_d, H, W, cfg.zbuffer_cell_px, cfg.zbuffer_tol_m)
+            ok = zbuffer_visibility(uv, depth, ref_uv, ref_d, H, W, *rule)
             b = torch.bucketize(depth.contiguous(), bins.to(depth.dtype), right=True)
             out[(vv, tt)] = {"used": torch.bincount(b[used], minlength=len(bins) + 1).tolist(),
                              "false": torch.bincount(b[used & ~ok], minlength=len(bins) + 1).tolist()}

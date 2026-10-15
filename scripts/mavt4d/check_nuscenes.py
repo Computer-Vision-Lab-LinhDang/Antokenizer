@@ -3,7 +3,8 @@
     python scripts/mavt4d/check_nuscenes.py --dataroot $NUSC --version v1.0-mini --out results/e1_1
 
 Writes e1_1_report.md and e1_1_report.json: data checks, then the graph-edge checks of gate M1 (projection
-re-check, false-visible rate against LiDAR merged over +-5 sweeps, degree/provenance, prepare time).
+re-check, false-visible rate against LiDAR merged over +-5 sweeps, degree/provenance, prepare time), for the
+default GraphConfig and the projection-edge builder variants in VARIANTS under one fixed false-visible rule.
 Run under ``/usr/bin/time -v`` if you want the external peak-RSS log; the report records the same kernel
 counter through getrusage (self, and joined DataLoader workers).
 """
@@ -33,8 +34,19 @@ from mavt4d.graph.types import EdgeType
 SPLITS = ("mini_train", "mini_val")
 GCFG = GraphConfig()  # default graph configuration, as in training
 FV_MAX = 0.05  # M1: false-visible rate against LiDAR merged over +-5 sweeps
-REFS = ("train", "pm0", "pm1", "pm5", "pm5_ego3", "pm5_noground")  # false-visible references, see _GraphItems
-GROUND_Z_M = 0.3  # pm5_noground: neighbour points below this world z (keyframe ego frame, origin on the ground)
+REFS = ("train", "pm0", "pm5")  # false-visible references, see _GraphItems
+M1_RULE = {"ref_cell_px": 4, "ref_tol_m": 0.5, "ref_tol_rel": 0.0}  # M1 occlusion rule, fixed across variants
+COS_MIN = 0.2  # grazing filter: |cos incidence| >= 0.2 (~78 deg); 5% tol at fx / cell ~ 90 allows tan(theta) < 4.5
+TOL_REL = 0.05  # depth-relative tolerance replacing 0.5 m: equal to it at 10 m
+COLLINEAR = 0.05  # lambda_mid / lambda_max below this: hub members nearly on a line, normal ill-defined
+VARIANTS = {  # projection-edge builders compared under M1_RULE; "baseline" is the default GraphConfig
+    "baseline": GCFG,
+    "grazing": GraphConfig(min_cos_incidence=COS_MIN),
+    "reltol": GraphConfig(zbuffer_tol_m=0.0, zbuffer_tol_rel=TOL_REL),
+    "cell2": GraphConfig(zbuffer_cell_px=2),
+    "grazing+reltol": GraphConfig(min_cos_incidence=COS_MIN, zbuffer_tol_m=0.0, zbuffer_tol_rel=TOL_REL),
+    "all": GraphConfig(min_cos_incidence=COS_MIN, zbuffer_tol_m=0.0, zbuffer_tol_rel=TOL_REL, zbuffer_cell_px=2),
+}
 
 
 def _identity(x):
@@ -154,17 +166,29 @@ def _prepare(sample, frac: float):
     return h, hubs, graph, stats
 
 
+def _grazing_diag(hubs, graph) -> dict:
+    """Baseline P2H edges the grazing filter would drop (cos_incidence < COS_MIN) vs kept, and how many of each
+    come from near-collinear hubs (lambda_mid / lambda_max < COLLINEAR), whose PCA normal is ill-defined."""
+    e, L = graph.edges[EdgeType.PROJ_P2H], graph.layout
+    x = hubs.rel_xyz - hubs.rel_xyz.mean(2, keepdim=True)
+    ev = torch.linalg.eigvalsh(x.transpose(-1, -2) @ x)  # (S, K, 3) ascending
+    ratio = (ev[..., 1] / ev[..., 2].clamp_min(1e-12))[(e.dst - L.n_cam) // L.K, (e.dst - L.n_cam) % L.K]
+    drop, flat = e.attr[:, 2] < COS_MIN, ratio < COLLINEAR
+    return {"dropped": int(drop.sum()), "dropped_collinear": int((drop & flat).sum()),
+            "kept": int((~drop).sum()), "kept_collinear": int((~drop & flat).sum())}
+
+
 class _GraphItems(Dataset):
-    """m3 item -> prepared graph. ``check=False``: (sample, hubs, graph) plus in-worker times, as a training
-    loader would deliver them. ``check=True``: the graph-edge checks of one sample as a small dict.
+    """m3 item -> prepared graph(s). ``check=False``: (sample, hubs, graph) of the default GraphConfig plus
+    in-worker times, as a training loader would deliver them. ``check=True``: per builder variant (VARIANTS,
+    one shared hold-out + hubs), the graph-edge checks of one sample as a small dict.
 
     False-visible references (world frame, keyframe sweep paired with all 6 cameras):
-    train = the graph's own z-buffer reference (input points of the keyframe sweep; must give 0);
-    pm0 = all points of the keyframe sweep, held-out included;
-    pm5 = pm0 plus the up to +-5 neighbouring LIDAR_TOP sweeps of the scene (``neighbour_points``: ego-body
-    points and points inside the boxes interpolated at each sweep's time dropped); the M1 gate row.
-    Attribution only (never a gate): pm1 = +-1 sweep; pm5_ego3 = pm5 with the ego exclusion widened to 3 m;
-    pm5_noground = pm5 without neighbour points below GROUND_Z_M."""
+    train = the variant's own z-buffer reference (input points of the keyframe sweep) under the variant's own
+    rule; must give 0. pm0 = all points of the keyframe sweep, held-out included; pm5 = pm0 plus the up to
+    +-5 neighbouring LIDAR_TOP sweeps of the scene (``neighbour_points``: ego-body points and points inside
+    the boxes interpolated at each sweep's time dropped), the M1 gate. pm0 and pm5 use M1_RULE for every
+    variant, so the yardstick does not move with the builder."""
 
     def __init__(self, ds, frac: float, n_sweeps: int, check: bool):
         self.ds, self.frac, self.n_sweeps, self.check = ds, frac, n_sweeps, check
@@ -176,24 +200,30 @@ class _GraphItems(Dataset):
         t0 = time.perf_counter()
         sample = self.ds[i]
         t1 = time.perf_counter()
-        h, hubs, graph, stats = _prepare(sample, self.frac)
-        times = {"load_s": t1 - t0, "prepare_s": time.perf_counter() - t1}
         if not self.check:
-            return h, hubs, graph, times
+            h, hubs, graph, _ = _prepare(sample, self.frac)
+            return h, hubs, graph, {"load_s": t1 - t0, "prepare_s": time.perf_counter() - t1}
+        h = apply_holdout(sample, self.frac)
+        hubs = build_hubs(h, GCFG.hubs_K, GCFG.hubs_M)
+        hubs_s = time.perf_counter() - t1
         full = transform_points(h.lidar_to_world[0], h.lidar_points[0][:, :3])
         nb, info = self.ds.neighbour_points(i, self.n_sweeps)
-        nb1, _ = self.ds.neighbour_points(i, 1)
-        nb_ego3, _ = self.ds.neighbour_points(i, self.n_sweeps, ego_radius=3.0)
         refs = {"train": [transform_points(h.lidar_to_world[0], h.input_points(0)[:, :3])], "pm0": [full],
-                "pm1": [torch.cat([full, nb1])], "pm5": [torch.cat([full, nb])],
-                "pm5_ego3": [torch.cat([full, nb_ego3])], "pm5_noground": [torch.cat([full, nb[nb[:, 2] >= GROUND_Z_M]])]}
-        cams = self.ds.cameras
-        return {**times, "stats": asdict(stats),
-                "max_in_degree": {et.name: int(graph.in_degree(et).max()) for et in EdgeType},
-                "recheck": recheck_projection_edges(h, hubs, graph, GCFG),
-                "fv": {name: {cams[v]: c for (v, _), c in false_visible_counts(h, hubs, graph, ref, GCFG).items()}
-                       for name, ref in refs.items()},
-                "neighbours": info, "ref_points": {name: len(ref[0]) for name, ref in refs.items()}}
+                "pm5": [torch.cat([full, nb])]}
+        cams, out = self.ds.cameras, {}
+        for name, cfg in VARIANTS.items():
+            t = time.perf_counter()
+            graph, stats = build_graph(h, hubs, cfg)
+            v = {"prepare_s": hubs_s + time.perf_counter() - t, "stats": asdict(stats),
+                 "max_in_degree": {et.name: int(graph.in_degree(et).max()) for et in EdgeType},
+                 "recheck": recheck_projection_edges(h, hubs, graph, cfg),
+                 "fv": {ref: {cams[k[0]]: c for k, c in false_visible_counts(
+                     h, hubs, graph, refs[ref], cfg, **({} if ref == "train" else M1_RULE)).items()} for ref in REFS}}
+            if name == "baseline":
+                v["grazing"] = _grazing_diag(hubs, graph)
+            out[name] = v
+        return {"load_s": t1 - t0, "variants": out, "neighbours": info,
+                "ref_points": {name: len(ref[0]) for name, ref in refs.items()}}
 
 
 def _graph_loader(ds, frac: float, n_sweeps: int, check: bool, idx, workers: int):
@@ -215,8 +245,9 @@ def _degree(items: list[dict], et: str) -> dict:
             "max_in_degree": max(it["max_in_degree"][et] for it in items),
             "provenance": {k: sum(p.get(k, 0) for p in prov) for k in sorted({k for p in prov for k in p})}}
 
-def check_graph(ds, frac: float, n_sweeps: int, workers: int) -> dict:
-    items = list(_graph_loader(ds, frac, n_sweeps, True, range(len(ds)), workers))
+
+def _variant_summary(items: list[dict], cameras) -> dict:
+    """Aggregate one variant's per-sample check dicts."""
     rc = [it["recheck"] for it in items]
     hist = np.sum([r["centre_cheb_hist"] for r in rc], 0).tolist()
     fails = [d for r in rc for d in r["fail_min_dist_px"]]
@@ -228,16 +259,24 @@ def check_graph(ds, frac: float, n_sweeps: int, workers: int) -> dict:
     fv = {}
     for name in REFS:
         per_cam = {c: {"used": np.sum([it["fv"][name][c]["used"] for it in items], 0).tolist(),
-                       "false": np.sum([it["fv"][name][c]["false"] for it in items], 0).tolist()} for c in ds.cameras}
+                       "false": np.sum([it["fv"][name][c]["false"] for it in items], 0).tolist()} for c in cameras}
         used, false = (np.sum([d[k] for d in per_cam.values()], 0).tolist() for k in ("used", "false"))
         fv[name] = {"per_camera": per_cam, "used": used, "false": false}
-    deg = {et.name: _degree(items, et.name) for et in EdgeType}
-    return {"samples": len(items), "recheck": recheck, "false_visible": fv, "degree": deg,
+    return {"recheck": recheck, "false_visible": fv, "degree": {et.name: _degree(items, et.name) for et in EdgeType},
+            "prepare_s": _stats([it["prepare_s"] for it in items])}
+
+
+def check_graph(ds, frac: float, n_sweeps: int, workers: int) -> dict:
+    items = list(_graph_loader(ds, frac, n_sweeps, True, range(len(ds)), workers))
+    variants = {name: _variant_summary([it["variants"][name] for it in items], ds.cameras) for name in VARIANTS}
+    variants["baseline"]["grazing"] = {k: sum(it["variants"]["baseline"]["grazing"][k] for it in items)
+                                       for k in items[0]["variants"]["baseline"]["grazing"]}
+    return {"samples": len(items), "variants": variants,
             "neighbour_sweeps": _stats([it["neighbours"]["sweeps"] for it in items]),
             "dropped_ego_points": sum(it["neighbours"]["dropped_ego"] for it in items),
             "dropped_box_points": sum(it["neighbours"]["dropped_box"] for it in items),
             "ref_points": {name: _stats([it["ref_points"][name] for it in items]) for name in REFS},
-            "in_worker_s": {k: _stats([it[k] for it in items]) for k in ("load_s", "prepare_s")}}
+            "load_s": _stats([it["load_s"] for it in items])}
 
 
 def graph_timing(ds, frac: float, n: int, workers: int) -> dict:
@@ -355,7 +394,8 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rep = {"version": args.version, "dataroot": args.dataroot, "cameras": list(CAM6), "loadavg": os.getloadavg(),
-           "m3": {}, "m2": {}, "timing": {}, "graph": {}, "graph_config": asdict(GCFG),
+           "m3": {}, "m2": {}, "timing": {}, "graph": {}, "graph_config": asdict(GCFG), "m1_rule": M1_RULE,
+           "variant_configs": {name: asdict(c) for name, c in VARIANTS.items()},
            "heldout_frac": args.heldout_frac, "fv_sweeps": args.fv_sweeps, "cpu_count": os.cpu_count()}
     t_all = time.perf_counter()
     with open(Path(args.dataroot) / args.version / "sample.json") as f:
@@ -465,117 +505,137 @@ def _verdict(ok: bool) -> str:
 
 
 def render_graph(r: dict) -> list[str]:
-    g, cfg = r["graph"], r["graph_config"]
-    rc = {sp: g[sp]["recheck"] for sp in SPLITS}
-    edges, passed = sum(x["edges"] for x in rc.values()), sum(x["passed"] for x in rc.values())
-    reverse = all(x["h2p_is_reverse_all"] for x in rc.values())
-    fv5 = [sum(sum(g[sp]["false_visible"]["pm5"][k]) for sp in SPLITS) for k in ("false", "used")]
-    proj_ok = passed == edges and reverse and edges > 0
-    fv_ok = fv5[1] > 0 and fv5[0] / fv5[1] < FV_MAX
+    g, cfg, vc = r["graph"], r["graph_config"], r["variant_configs"]
+
+    def var(sp: str, v: str) -> dict:
+        return g[sp]["variants"][v]
+
+    def tot(v: str, f) -> int:
+        return sum(f(var(sp, v)) for sp in SPLITS)
+
+    def fv(v: str, ref: str, key: str, cam: str | None = None) -> int:
+        return tot(v, lambda x: sum((x["false_visible"][ref]["per_camera"][cam] if cam else x["false_visible"][ref])[key]))
+
+    def proj_ok(v: str) -> bool:
+        return (tot(v, lambda x: x["recheck"]["passed"]) == tot(v, lambda x: x["recheck"]["edges"]) > 0
+                and all(var(sp, v)["recheck"]["h2p_is_reverse_all"] for sp in SPLITS))
+
+    def fv_ok(v: str) -> bool:
+        return fv(v, "pm5", "used") > 0 and fv(v, "pm5", "false") / fv(v, "pm5", "used") < FV_MAX
+
+    def deg(v: str, et: str) -> float:
+        return float(np.mean([var(sp, v)["degree"][et]["mean_in_degree"] for sp in SPLITS]))
+
+    rule = r["m1_rule"]
     bins = [f"[{a:g}, {b:g})" for a, b in zip((0,) + DEPTH_BINS_M, DEPTH_BINS_M + (float("inf"),))]
     L = ["## Graph edges (T27, gate M1)", "",
          f"Every m3 sample of {' and '.join(SPLITS)}: hold-out (frac {r['heldout_frac']}) -> `build_hubs` "
-         f"(K={cfg['hubs_K']}, M={cfg['hubs_M']}) -> `build_graph` with the default `GraphConfig` (patch {cfg['patch']}, "
-         f"z-buffer cell {cfg['zbuffer_cell_px']} px, tol {cfg['zbuffer_tol_m']} m, caps hub {cfg['proj_hub_cap']} / "
-         f"patch {cfg['proj_patch_cap']}). Graph passes use {r['timing']['graph_m3']['workers']} DataLoader workers.", "",
-         "| M1 criterion | measured | threshold | verdict |", "|---|---|---|---|",
-         f"| projection edges re-project into their patch | {passed}/{edges} = {_rate(passed, edges)}; "
-         f"H2P = reverse of P2H in every sample: {reverse} | 100% | {_verdict(proj_ok)} |",
-         f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps (`pm5`, graph's cell rule) "
-         f"| {fv5[0]}/{fv5[1]} = {_rate(*fv5)} | < {FV_MAX:.0%} | {_verdict(fv_ok)} (cell rule; see attribution) |",
-         "| data_wait_frac | not measured (needs T25) | < 0.10 | pending |", "",
-         "### Projection re-check", "",
-         "An edge passes when at least one member of its hub, lifted to world in float64 and projected with "
-         "`project` (not the builder's float32 `visible_members` path), lands in the edge's patch in front of the "
-         "camera (spec T11, test 1). Visibility is judged by the false-visible check below, not here.", "",
-         "| split | P2H edges | passed | failed | hub centre in the edge's patch | centre distance [patches] median / p95 |",
-         "|---|---|---|---|---|---|"]
-    for sp, x in rc.items():
-        L.append(f"| {sp} | {x['edges']} | {x['passed']} | {x['failed']} | {_rate(x['centre_in_patch'], x['edges'])} "
-                 f"| {x['centre_cheb_median']} / {x['centre_cheb_p95']} |")
-    for sp, x in rc.items():
-        if x["failed"]:
-            d = x["fail_min_dist_px"]
-            L.append(f"\n- {sp}: failed edges' nearest member lies {_f(d['min'])}–{_f(d['max'])} px outside the patch "
-                     f"(median {_f(d['median'])}); < 0.01 px would be a float32/float64 border flip.")
-    L += ["", "The hub-centre column is information only: the task brief phrased the check as \"the hub centre "
-          "re-projects into the connected patch\", but edges are built from members (spec T11), so a hub whose "
-          f"{cfg['hubs_M']} members span several patches links to all of them and its centre lies in only one. "
-          "The gate uses the spec's member definition. The centre distance is Chebyshev in patch units "
-          f"(capped at {CHEB_MAX}).", "",
-          "### False-visible rate", "",
-          "Members counted: one per hub member slot, visible to the builder's z-buffer and inside the patch of a kept "
-          "(post-cap) PROJ_P2H edge, i.e. exactly the members behind the edge weights. A member is false-visible "
-          "when `zbuffer_visibility` with the same cell and tol rejects it against a reference cloud:", "",
-          "- `train`: the graph's own reference (input points of the keyframe sweep). Must be 0; checks the counting.",
-          "- `pm0`: every point of the keyframe sweep, held-out included (effect of hold-out sparsity alone).",
-          f"- `pm5` (gate): `pm0` plus up to ±{r['fv_sweeps']} neighbouring LIDAR_TOP sweeps inside the scene, each placed "
-          "with its own ego pose; points with |x|, |y| < 1 m in the sensor frame (ego body, as devkit `remove_close`) "
-          "and points inside the annotation boxes interpolated at the sweep's time, dilated 0.3 m (moving objects "
-          "smear across sweeps), are dropped from the neighbours. Same cell and tol as the graph, so grazing ground "
-          "at range can be rejected by a denser cloud of the same surface, which inflates this rate; it also misses "
-          "occluders the roof LiDAR never returns (parallax shadows, glass, thin objects), so it is not a strict "
-          "bound either way. The synthetic "
-          "test of T11 (`gt_visible`) excludes grazing on purpose (farthest of the 4 surrounding GT depths); no such "
-          "definition is applied to real data here.",
-          "- Attribution rows, not gates: `pm1` = ±1 sweep (±50 ms, so pose drift is negligible: a jump from `pm0` "
-          "to `pm1` is mostly density; growth from `pm1` to `pm5` mixes density with registration over "
-          "time and does not separate them); `pm5_ego3` = ego exclusion widened to |x|, |y| < 3 m (a collapse on "
-          "CAM_FRONT / CAM_BACK means ghosts of the ego body from neighbour sweeps); `pm5_noground` = neighbour points "
-          f"below world z {GROUND_Z_M} m dropped (a collapse in the far bins means grazing ground).", "",
-          "| split | reference | used members | false-visible | rate | " + " | ".join(bins) + " |",
-          "|---|---|---|---|---|" + "---|" * len(bins)]
-    for sp in SPLITS:
-        for name in REFS:
-            f = g[sp]["false_visible"][name]
-            per_bin = " | ".join(_rate(a, b) for a, b in zip(f["false"], f["used"]))
-            L.append(f"| {sp} | {name} | {sum(f['used'])} | {sum(f['false'])} | {_rate(sum(f['false']), sum(f['used']))} "
-                     f"| {per_bin} |")
-    refs = [n for n in REFS if n != "train"]
-    L += ["", "Per camera, false-visible rate per reference (both splits):", "",
-          "| camera | used | " + " | ".join(refs) + " |", "|---|---|" + "---|" * len(refs)]
+         f"(K={cfg['hubs_K']}, M={cfg['hubs_M']}, shared by all variants) -> `build_graph` per builder variant. "
+         "The builders read only the keyframe sweep's input points (held-out excluded): no sweeps, so they run "
+         f"unchanged on trainval keyframes. The ±{r['fv_sweeps']} sweeps enter only the metric. Graph passes use "
+         f"{r['timing']['graph_m3']['workers']} DataLoader workers.", "",
+         f"False-visible metric, the same for every row (M1 rule): a member behind a kept PROJ_P2H edge is "
+         f"false-visible when `zbuffer_visibility` with cell {rule['ref_cell_px']} px and tol {rule['ref_tol_m']} m "
+         f"rejects it against LiDAR merged over ±{r['fv_sweeps']} sweeps (`pm5`, gate) or against the keyframe sweep "
+         "with held-out points restored (`pm0`). `own rule` re-runs each variant's own z-buffer on its own reference "
+         "and must be 0 (counting check).", "",
+         "### Builder variants", "",
+         "| variant | z-buffer cell / tol | grazing filter | FV ±5 sweeps | FV keyframe sweep | own rule | re-check "
+         "| P2H = H2P edges | used members | mean in-degree P2H per hub / H2P per patch | prepare median [s] "
+         "| M1 re-check / FV |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for v, c in vc.items():
+        tol = (f"{c['zbuffer_tol_m']:g} m" if not c["zbuffer_tol_rel"] else
+               f"{c['zbuffer_tol_rel']:.0%} of depth" + (f" + {c['zbuffer_tol_m']:g} m" if c["zbuffer_tol_m"] else ""))
+        edges = tot(v, lambda x: x["recheck"]["edges"])
+        prep = float(np.median([var(sp, v)["prepare_s"]["median"] for sp in SPLITS]))
+        graze = f"cos ≥ {c['min_cos_incidence']:g}" if c["min_cos_incidence"] else "off"
+        L.append(f"| {v} | {c['zbuffer_cell_px']} px / {tol} | {graze} | "
+                 f"**{_rate(fv(v, 'pm5', 'false'), fv(v, 'pm5', 'used'))}** | {_rate(fv(v, 'pm0', 'false'), fv(v, 'pm0', 'used'))} "
+                 f"| {fv(v, 'train', 'false')} | {_rate(tot(v, lambda x: x['recheck']['passed']), edges)} | {edges} "
+                 f"| {fv(v, 'pm5', 'used')} | {deg(v, 'PROJ_P2H'):.2f} / {deg(v, 'PROJ_H2P'):.2f} | {_f(prep, 3)} "
+                 f"| {_verdict(proj_ok(v))} / {_verdict(fv_ok(v))} |")
+    gz = var(SPLITS[0], "baseline")["grazing"]
+    gz = {k: sum(var(sp, "baseline")["grazing"][k] for sp in SPLITS) for k in gz}
+    L += ["", f"Settings, each chosen once (no sweep): grazing filter cos ≥ {COS_MIN} (incidence ≤ ~78°; with a 5% "
+          "tolerance and fx / cell ≈ 90 px a surface stays inside the tolerance up to tan(incidence) ≈ 4.5); relative "
+          f"tolerance {TOL_REL:.0%} of depth replacing the fixed 0.5 m (equal to it at 10 m: stricter nearer, looser "
+          "farther); cell 2 px against 4 px. Prepare = hold-out + hubs + graph inside a worker, all variants timed in "
+          "the same item so they share the headnode's load.",
+          "", f"Grazing filter on the baseline graph: it would drop {gz['dropped']} of {gz['dropped'] + gz['kept']} "
+          f"P2H edges ({_rate(gz['dropped'], gz['dropped'] + gz['kept'])}); {_rate(gz['dropped_collinear'], gz['dropped'])} "
+          f"of the dropped and {_rate(gz['kept_collinear'], gz['kept'])} of the kept come from near-collinear hubs "
+          f"(λ_mid / λ_max < {COLLINEAR}), whose PCA normal, and so cos_incidence, is ill-defined.", "",
+          "False-visible (`pm5`, M1 rule) per member-depth bin, both splits:", "",
+          "| variant | " + " | ".join(bins) + " |", "|---|" + "---|" * len(bins)]
+    for v in vc:
+        f = [sum(var(sp, v)["false_visible"]["pm5"]["false"][b] for sp in SPLITS) for b in range(len(bins))]
+        u = [sum(var(sp, v)["false_visible"]["pm5"]["used"][b] for sp in SPLITS) for b in range(len(bins))]
+        L.append(f"| {v} | " + " | ".join(f"{_rate(a, b)} ({b})" for a, b in zip(f, u)) + " |")
+    L += ["", "False-visible (`pm5`, M1 rule) per camera, both splits:", "",
+          "| camera | " + " | ".join(vc) + " |", "|---|" + "---|" * len(vc)]
     for c in r["cameras"]:
-        u = sum(sum(g[sp]["false_visible"]["pm5"]["per_camera"][c]["used"]) for sp in SPLITS)
-        f = [sum(sum(g[sp]["false_visible"][n]["per_camera"][c]["false"]) for sp in SPLITS) for n in refs]
-        L.append(f"| {c} | {u} | " + " | ".join(_rate(x, u) for x in f) + " |")
+        L.append(f"| {c} | " + " | ".join(_rate(fv(v, "pm5", "false", c), fv(v, "pm5", "used", c)) for v in vc) + " |")
     L += [""]
     for sp in SPLITS:
         x = g[sp]
         L.append(f"- {sp}: neighbour sweeps per sample {x['neighbour_sweeps']['min']:.0f}–{x['neighbour_sweeps']['max']:.0f} "
                  f"(median {x['neighbour_sweeps']['median']:.0f}); reference points per sample median: "
                  + ", ".join(f"{n} {x['ref_points'][n]['median']:.0f}" for n in REFS)
-                 + f"; dropped from neighbours: {x['dropped_ego_points']} ego-body, {x['dropped_box_points']} in boxes.")
-    L += ["", "### Degree and provenance", "",
-          "Summed over samples (edges, provenance), mean over samples of the mean in-degree over eligible receivers, "
-          "max in-degree over all nodes. m3 has T = 1, so no TRACK edges.", ""]
+                 + f"; dropped from neighbours: {x['dropped_ego_points']} ego-body, {x['dropped_box_points']} in boxes "
+                 "(|x|, |y| < 1 m in the sensor frame; boxes interpolated at each sweep's time, dilated 0.3 m).")
+
+    b = "baseline"
+    rc = {sp: var(sp, b)["recheck"] for sp in SPLITS}
+    edges, passed = sum(x["edges"] for x in rc.values()), sum(x["passed"] for x in rc.values())
+    L += ["", f"### Default GraphConfig (`{b}`): patch {cfg['patch']}, cell {cfg['zbuffer_cell_px']} px, tol "
+          f"{cfg['zbuffer_tol_m']} m, caps hub {cfg['proj_hub_cap']} / patch {cfg['proj_patch_cap']}", "",
+          "| M1 criterion | measured | threshold | verdict |", "|---|---|---|---|",
+          f"| projection edges re-project into their patch | {passed}/{edges} = {_rate(passed, edges)}; H2P = reverse "
+          f"of P2H in every sample: {all(x['h2p_is_reverse_all'] for x in rc.values())} | 100% | {_verdict(proj_ok(b))} |",
+          f"| false-visible vs LiDAR merged over ±{r['fv_sweeps']} sweeps | {fv(b, 'pm5', 'false')}/{fv(b, 'pm5', 'used')} = "
+          f"{_rate(fv(b, 'pm5', 'false'), fv(b, 'pm5', 'used'))} | < {FV_MAX:.0%} | {_verdict(fv_ok(b))} |",
+          "| data_wait_frac | not measured (needs T25) | < 0.10 | pending |", "",
+          "Projection re-check: an edge passes when at least one member of its hub, lifted to world in float64 and "
+          "projected with `project` (not the builder's float32 path), lands in the edge's patch in front of the camera "
+          "(spec T11, test 1).", "",
+          "| split | P2H edges | passed | failed | hub centre in the edge's patch | centre distance [patches] median / p95 |",
+          "|---|---|---|---|---|---|"]
+    for sp, x in rc.items():
+        L.append(f"| {sp} | {x['edges']} | {x['passed']} | {x['failed']} | {_rate(x['centre_in_patch'], x['edges'])} "
+                 f"| {x['centre_cheb_median']} / {x['centre_cheb_p95']} |")
+    for v in vc:
+        for sp in SPLITS:
+            d = var(sp, v)["recheck"]["fail_min_dist_px"]
+            if d["n"]:
+                L.append(f"\n- {v} / {sp}: {d['n']} failed edges, nearest member {_f(d['min'])}–{_f(d['max'])} px outside "
+                         f"the patch (median {_f(d['median'])}); < 0.01 px would be a float32/float64 border flip.")
+    L += ["", "The hub-centre column is information only: edges are built from members (spec T11), so a hub whose "
+          f"{cfg['hubs_M']} members span several patches links to all of them and its centre lies in only one. "
+          f"Chebyshev distance in patch units, capped at {CHEB_MAX}.", "",
+          "Degree and provenance: edges and provenance summed over samples, mean in-degree over eligible receivers "
+          "averaged over samples, max in-degree over all nodes. m3 has T = 1, so no TRACK edges.", ""]
     for sp in SPLITS:
         L += [f"{sp} ({g[sp]['samples']} samples):", "",
               "| type | edges | mean in-degree | max in-degree | provenance |", "|---|---|---|---|---|"]
-        for et, d in g[sp]["degree"].items():
-            prov = ", ".join(f"{k}={v}" for k, v in d["provenance"].items()) or "-"
+        for et, d in var(sp, b)["degree"].items():
+            prov = ", ".join(f"{k}={n}" for k, n in d["provenance"].items()) or "-"
             L.append(f"| {et} | {d['edges']} | {d['mean_in_degree']:.2f} | {d['max_in_degree']} | {prov} |")
         L.append("")
     caps = {"SPATIAL": cfg["spatial_cap"], "PROJ_P2H": cfg["proj_hub_cap"], "PROJ_H2P": cfg["proj_patch_cap"],
             "NB3D": min(cfg["nb3d_k"], cfg["hubs_K"] - 1)}
-    worst = {et: max(g[sp]["degree"][et]["max_in_degree"] for sp in SPLITS) for et in caps}
-    L.append("Caps: " + "; ".join(f"{et} max {worst[et]} vs cap {c} ({'ok' if worst[et] <= c else 'EXCEEDED'})"
-                                  for et, c in caps.items()) + ".")
+    worst = {et: max(var(sp, v)["degree"][et]["max_in_degree"] for sp in SPLITS for v in vc) for et in caps}
+    L.append("Caps, max over all variants: " + "; ".join(
+        f"{et} max {worst[et]} vs cap {c} ({'ok' if worst[et] <= c else 'EXCEEDED'})" for et, c in caps.items()) + ".")
     t = r["timing"]["graph_m3"]
-    L += ["", "### Prepare time (mini_train m3)", "",
+    L += ["", "### Prepare time (mini_train m3, default GraphConfig)", "",
           f"Loader delivering (sample, hubs, graph) with {t['workers']} workers (1 torch thread each) over {t['n']} "
           f"samples: wall {t['wall_s']:.1f} s = **{t['s_per_sample']:.3f} s/sample**. Inside a worker: load (6 JPEGs + "
           f"sweep) median {_f(t['load_s']['median'])} s (p95 {_f(t['load_s']['p95'])}), hold-out + hubs + graph median "
           f"{_f(t['prepare_s']['median'])} s (p95 {_f(t['prepare_s']['p95'])}). Headnode load average before this pass: "
           f"{', '.join(f'{x:.0f}' for x in r['loadavg_graph_timing'])} on a shared {r.get('cpu_count', '?')}-core "
-          "headnode, so these are "
-          "upper bounds for a dedicated node.", ""]
-    for sp in SPLITS:
-        w = g[sp]["in_worker_s"]
-        L.append(f"- {sp} check pass ({g[sp]['wall_s']:.0f} s wall incl. checks): in-worker load median "
-                 f"{_f(w['load_s']['median'])} s, prepare median {_f(w['prepare_s']['median'])} s.")
-    L.append("")
+          "headnode, so these are upper bounds for a dedicated node. Per-variant prepare medians are in the variant "
+          "table (measured inside the check pass, which also runs the checks).", ""]
     return L
-
 
 if __name__ == "__main__":
     main()

@@ -52,9 +52,9 @@ def pixel_to_patch(uv: Tensor, patch: int, Hp: int, Wp: int) -> tuple[Tensor, Te
 
 
 def zbuffer_visibility(uv: Tensor, depth: Tensor, ref_uv: Tensor, ref_depth: Tensor, H: int, W: int,
-                       cell_px: int = 4, tol_m: float = 0.5) -> Tensor:
-    """(N,) bool: point is in the image, in front of the camera and within ``tol_m`` of the nearest
-    reference depth in its ``cell_px`` x ``cell_px`` cell. A cell with no reference counts as visible."""
+                       cell_px: int = 4, tol_m: float = 0.5, tol_rel: float = 0.0) -> Tensor:
+    """(N,) bool: point is in the image, in front of the camera and within ``tol_m + tol_rel * depth`` of the
+    nearest reference depth in its ``cell_px`` x ``cell_px`` cell. A cell with no reference counts as visible."""
     nr, nc = -(-H // cell_px), -(-W // cell_px)
 
     def cell(uv: Tensor, d: Tensor) -> tuple[Tensor, Tensor]:
@@ -66,7 +66,7 @@ def zbuffer_visibility(uv: Tensor, depth: Tensor, ref_uv: Tensor, ref_depth: Ten
     zmin = torch.full((nr * nc,), float("inf"), dtype=ref_depth.dtype, device=ref_depth.device)
     zmin.scatter_reduce_(0, ref_idx[ref_ok], ref_depth[ref_ok], "amin")
     ok, idx = cell(uv, depth)
-    return ok & (depth <= zmin[idx] + tol_m)
+    return ok & (depth <= zmin[idx] + tol_m + tol_rel * depth)
 
 
 def patch_ray_dirs(K: Tensor, cam_to_world: Tensor, Hp: int, Wp: int, patch: int) -> Tensor:
@@ -78,9 +78,9 @@ def patch_ray_dirs(K: Tensor, cam_to_world: Tensor, Hp: int, Wp: int, patch: int
 
 
 def project_visible(p_world: Tensor, ref_world: Tensor, K: Tensor, cam_to_world: Tensor, H: int, W: int,
-                    cell_px: int = 4, tol_m: float = 0.5) -> tuple[Tensor, Tensor, Tensor]:
+                    cell_px: int = 4, tol_m: float = 0.5, tol_rel: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
     """Project points (N, 3) into one camera and z-buffer them against reference points (R, 3), e.g. all
     LiDAR train points of the paired sweep. Returns uv (N, 2), depth (N,), visible (N,) bool."""
     uv, depth = project(p_world, K, cam_to_world)
     ref_uv, ref_depth = project(ref_world, K, cam_to_world)
-    return uv, depth, zbuffer_visibility(uv, depth, ref_uv, ref_depth, H, W, cell_px, tol_m)
+    return uv, depth, zbuffer_visibility(uv, depth, ref_uv, ref_depth, H, W, cell_px, tol_m, tol_rel)

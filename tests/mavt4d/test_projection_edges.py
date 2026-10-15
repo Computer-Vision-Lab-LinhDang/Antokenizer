@@ -100,6 +100,34 @@ def test_occluded_hub_has_no_edges_to_occluding_view():
     assert not on_back[(h2p.src - L.n_cam) % L.K].any()
 
 
+def test_grazing_surface_dropped_by_min_cos_incidence():
+    """Camera 1.5 m above a ground plane, looking along +x: ground from 15 to 40 m is seen at
+    cos(incidence) < 0.1, so threshold 0.2 removes its edges; a wall facing the camera keeps all of its own."""
+    gx, gy = torch.meshgrid(torch.arange(15.0, 40.0, 0.25), torch.arange(-6.0, 6.0, 0.25), indexing="ij")
+    ground = torch.stack([gx, gy, torch.full_like(gx, -1.5)], -1).reshape(-1, 3)
+    wy, wz = torch.meshgrid(torch.arange(-1.0, 1.0, 0.05), torch.arange(-0.5, 1.0, 0.05), indexing="ij")
+    wall = torch.stack([torch.full_like(wy, 12.0), wy, wz], -1).reshape(-1, 3)
+    pts = torch.cat([ground, wall])
+    c2w = torch.eye(4)
+    c2w[:3, :3] = torch.tensor([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])  # looks along +x
+    sample = SceneSample(scene_id="graze", source="synthetic", images=torch.zeros(1, 1, 3, 64, 112),
+                         frame_times=torch.zeros(1, 1, dtype=torch.float64),
+                         intrinsics=torch.tensor([[[80.0, 0, 56], [0, 80.0, 32], [0, 0, 1]]]),
+                         cam_to_world=c2w[None, None], lidar_points=[torch.cat([pts, torch.ones(len(pts), 1)], 1)],
+                         lidar_to_world=torch.eye(4)[None], lidar_times=torch.zeros(1, dtype=torch.float64),
+                         lidar_keys=["graze"])
+    hubs = build_hubs(sample, K=48, M=8)
+    L = _layout(sample, hubs)
+    on_ground = hubs.centers_world[0, :, 2] < -1.0
+    pairs = {}
+    for thr in (0.0, 0.2):
+        p2h, h2p = build_projection_edges(sample, hubs, L, replace(GCFG, min_cos_incidence=thr))
+        hub = (p2h.dst - L.n_cam) % L.K
+        pairs[thr] = {(int(a), int(b)) for a, b, g in zip(p2h.src, p2h.dst, on_ground[hub]) if not g}
+        assert torch.equal(p2h.src, h2p.dst) and (p2h.attr[:, 2] >= thr).all()
+        assert on_ground[hub].any() == (thr == 0.0)
+    assert pairs[0.0] and pairs[0.0] <= pairs[0.2]  # wall edges survive the filter
+
 def test_caps_respected(scene):
     sample, _, hubs, L, p2h, h2p = scene
     for e, (hub_cap, patch_cap) in [((p2h, h2p), (GCFG.proj_hub_cap, GCFG.proj_patch_cap)),

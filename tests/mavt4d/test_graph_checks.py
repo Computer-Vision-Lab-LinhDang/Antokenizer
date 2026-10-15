@@ -1,6 +1,8 @@
 """E1.1 graph-edge checks: projection re-check and false-visible counts against a reference cloud."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -67,6 +69,22 @@ def test_false_visible_zero_against_graphs_own_reference(scene):
     assert used >= 100 and all(sum(c["false"]) == 0 for c in fv.values())
 
 
+def test_false_visible_zero_against_own_reference_for_variant(scene):
+    """A builder variant (cell 2 px, depth-relative tol, grazing filter) agrees with itself on its own reference."""
+    sample, hubs, _ = scene
+    cfg = replace(GCFG, zbuffer_cell_px=2, zbuffer_tol_m=0.0, zbuffer_tol_rel=0.05, min_cos_incidence=0.2)
+    graph, _ = build_graph(sample, hubs, cfg)
+    fv = false_visible_counts(sample, hubs, graph, _train_refs(sample), cfg)
+    assert sum(sum(c["used"]) for c in fv.values()) >= 100 and all(sum(c["false"]) == 0 for c in fv.values())
+
+
+def test_false_visible_reference_rule_overrides_builder_rule(scene):
+    """The reference rule is held fixed by the caller: a negative tolerance rejects every used member."""
+    sample, hubs, graph = scene
+    fv = false_visible_counts(sample, hubs, graph, _train_refs(sample), GCFG, ref_cell_px=4, ref_tol_m=-1e3,
+                              ref_tol_rel=0.0)
+    assert all(c["false"] == c["used"] for c in fv.values()) and any(sum(c["used"]) for c in fv.values())
+
 def test_used_members_match_edge_weights(scene):
     """Members counted as used are exactly the visible members behind the kept edges' weights."""
     sample, hubs, graph = scene
@@ -121,13 +139,19 @@ def test_check_script_graph_pass_on_fake_nuscenes(tmp_path, monkeypatch):
     ds = nu.NuScenesSceneDataset(tmp_path, version=fk.VERSION, split="mini_train", mode="m3", cameras=fk.CAMERAS)
     g = mod.check_graph(ds, 0.3, 5, workers=0)
     assert g["samples"] == len(ds) == 4 and g["neighbour_sweeps"]["min"] == 5
-    assert g["recheck"]["edges"] > 0 and g["recheck"]["passed"] == g["recheck"]["edges"]
-    assert sum(g["false_visible"]["train"]["used"]) > 0 and sum(g["false_visible"]["train"]["false"]) == 0
-    assert g["degree"]["NB3D"]["max_in_degree"] == mod.GCFG.nb3d_k
+    assert set(g["variants"]) == set(mod.VARIANTS)
+    for v in g["variants"].values():
+        assert v["recheck"]["passed"] == v["recheck"]["edges"]
+        assert sum(v["false_visible"]["train"]["false"]) == 0  # each variant agrees with its own rule
+    base = g["variants"]["baseline"]
+    assert base["recheck"]["edges"] > 0 and sum(base["false_visible"]["train"]["used"]) > 0
+    assert base["degree"]["NB3D"]["max_in_degree"] == mod.GCFG.nb3d_k
+    assert base["grazing"]["dropped"] + base["grazing"]["kept"] == base["recheck"]["edges"]
     t = mod.graph_timing(ds, 0.3, 2, workers=0)
     assert t["n"] == 2 and t["s_per_sample"] > 0
-    rep = {"graph": {sp: {**g, "wall_s": 1.0} for sp in mod.SPLITS}, "graph_config": mod.asdict(mod.GCFG),
-           "heldout_frac": 0.3, "fv_sweeps": 5, "cameras": list(fk.CAMERAS), "timing": {"graph_m3": t},
-           "loadavg_graph_timing": (1.0, 1.0, 1.0)}
+    rep = {"graph": {sp: g for sp in mod.SPLITS}, "graph_config": mod.asdict(mod.GCFG), "m1_rule": mod.M1_RULE,
+           "variant_configs": {k: mod.asdict(c) for k, c in mod.VARIANTS.items()}, "heldout_frac": 0.3,
+           "fv_sweeps": 5, "cameras": list(fk.CAMERAS), "timing": {"graph_m3": t}, "loadavg_graph_timing": (1.0, 1.0, 1.0)}
     text = "\n".join(mod.render_graph(rep))
     assert "| projection edges re-project" in text and "**PASS**" in text and "pending" in text
+    assert all(f"| {v} |" in text for v in mod.VARIANTS)

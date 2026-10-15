@@ -3,6 +3,8 @@
 A hub's members are projected into every view-frame paired with the hub's sweep (nearest in time) and
 z-buffered against all train points of that sweep. Each (hub, patch) pair with visible members becomes one
 PROJ_P2H and one PROJ_H2P edge, weight = visible members in the patch / M, attributes from the hub centre.
+Pairs whose hub surface is seen at grazing incidence (|PCA normal . view ray| < ``min_cos_incidence``) are
+dropped before the degree caps.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ def visible_members(sample: SceneSample, hubs: HubGroups, s: int, v: int, t: int
     pts = transform_points(sample.lidar_to_world[s], sample.input_points(s)[:, :3])
     H, W = sample.images.shape[-2:]
     return project_visible(pts[hubs.member_idx[s].flatten()], pts, sample.intrinsics[v], sample.cam_to_world[v, t],
-                           H, W, cfg.zbuffer_cell_px, cfg.zbuffer_tol_m)
+                           H, W, cfg.zbuffer_cell_px, cfg.zbuffer_tol_m, cfg.zbuffer_tol_rel)
 
 
 def build_projection_edges(sample: SceneSample, hubs: HubGroups, layout: TokenLayout,
@@ -51,7 +53,7 @@ def build_projection_edges(sample: SceneSample, hubs: HubGroups, layout: TokenLa
             n = len(pair)
             a = edge_attr(hubs.centers_world[s, k], normals[s, k], sample.intrinsics[v].expand(n, 3, 3),
                           sample.cam_to_world[v, t].expand(n, 4, 4))
-            front = a[:, 5].isfinite()  # hub centre in front of the camera (log z defined)
+            front = a[:, 5].isfinite() & (a[:, 2] >= cfg.min_cos_incidence)  # in front, not grazing
             cam.append(layout.cam_index(v, t, patch // layout.Wp, patch % layout.Wp)[front])
             hub.append(layout.hub_index(s, k)[front])
             weight.append(count[front].float() / M)
