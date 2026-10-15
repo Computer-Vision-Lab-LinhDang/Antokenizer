@@ -75,3 +75,12 @@ def patch_ray_dirs(K: Tensor, cam_to_world: Tensor, Hp: int, Wp: int, patch: int
     uv1 = torch.stack([(c + 0.5) * patch, (r + 0.5) * patch, torch.ones_like(r, dtype=torch.float)], -1)
     rays = uv1.to(K.dtype) @ torch.linalg.inv(K).T @ cam_to_world[:3, :3].T
     return F.normalize(rays, dim=-1)
+
+
+def project_visible(p_world: Tensor, ref_world: Tensor, K: Tensor, cam_to_world: Tensor, H: int, W: int,
+                    cell_px: int = 4, tol_m: float = 0.5) -> tuple[Tensor, Tensor, Tensor]:
+    """Project points (N, 3) into one camera and z-buffer them against reference points (R, 3), e.g. all
+    LiDAR train points of the paired sweep. Returns uv (N, 2), depth (N,), visible (N,) bool."""
+    uv, depth = project(p_world, K, cam_to_world)
+    ref_uv, ref_depth = project(ref_world, K, cam_to_world)
+    return uv, depth, zbuffer_visibility(uv, depth, ref_uv, ref_depth, H, W, cell_px, tol_m)

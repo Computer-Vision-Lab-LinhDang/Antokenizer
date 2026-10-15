@@ -1,8 +1,13 @@
 import os
 
 import pytest
+import torch
 
 # src/ is put on sys.path by tests/conftest.py.
+
+# Shared headnodes expose a few cores but torch sizes its pool to the whole machine; oversubscription
+# made the graph tests ~8x slower there.
+torch.set_num_threads(min(4, torch.get_num_threads()))
 
 
 def pytest_collection_modifyitems(config, items):

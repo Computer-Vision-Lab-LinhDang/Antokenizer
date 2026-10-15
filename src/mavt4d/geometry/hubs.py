@@ -61,3 +61,9 @@ def build_hubs(sample: SceneSample, K: int = 256, M: int = 32) -> HubGroups | No
         out["intensity"].append(pts[members, 3:4])
         out["member_idx"].append(members)
     return HubGroups(**{f: torch.stack(v) for f, v in out.items()})
+
+
+def pca_normals(points: Tensor) -> Tensor:
+    """(G, 3) unit normals (least-variance direction, sign arbitrary) of point groups (G, M, 3)."""
+    x = points - points.mean(1, keepdim=True)
+    return torch.linalg.eigh(x.transpose(1, 2) @ x).eigenvectors[..., 0]

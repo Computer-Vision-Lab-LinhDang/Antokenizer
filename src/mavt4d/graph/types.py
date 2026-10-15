@@ -5,7 +5,10 @@ from dataclasses import dataclass, field, fields
 from enum import IntEnum
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
+
+from mavt4d.geometry.camera import invert_se3, transform_points
 
 
 class EdgeType(IntEnum):
@@ -122,3 +125,33 @@ def batch_graphs(graphs: list[CorrespondenceGraph]) -> CorrespondenceGraph:
         offset += g.num_graphs * layout.num_nodes
     return CorrespondenceGraph(layout, {et: cat_edges(v) for et, v in edges.items()},
                                sum(g.num_graphs for g in graphs))
+
+
+def edge_attr(p_world: Tensor, normal: Tensor, K: Tensor, cam_to_world: Tensor) -> Tensor:
+    """(E, EDGE_ATTR_DIM) attributes of points (E, 3) in per-edge cameras K (E, 3, 3), cam_to_world (E, 4, 4).
+
+    ``normal`` (E, 3) is a world-frame surface normal (sign irrelevant). Depth is camera-frame z, so
+    log_depth and log_z coincide. Requires z > 0.
+    """
+    p_cam = transform_points(invert_se3(cam_to_world), p_world[:, None])[:, 0]
+    z = p_cam[:, 2]
+    d = F.normalize(p_world - cam_to_world[:, :3, 3], dim=-1)
+    cos = (F.normalize(normal, dim=-1) * d).sum(-1).abs()
+    return torch.stack([z.log(), K[:, 0, 0] / z, cos, p_cam[:, 0] / z, p_cam[:, 1] / z, z.log(),
+                        d[:, 0], d[:, 1], d[:, 2], torch.ones_like(z)], -1).float()
+
+
+def rank_in_group(group: Tensor, key: Tensor) -> Tensor:
+    """(E,) rank of each element among elements of the same group by ascending ``key`` (ties by position)."""
+    if group.numel() == 0:
+        return group.clone()
+    order = torch.argsort(key, stable=True)
+    order = order[torch.argsort(group[order], stable=True)]
+    g = group[order]
+    pos = torch.arange(len(g), device=g.device)
+    start = torch.ones_like(g, dtype=torch.bool)
+    start[1:] = g[1:] != g[:-1]
+    first = torch.cummax(torch.where(start, pos, torch.zeros_like(pos)), 0).values
+    rank = torch.empty_like(pos)
+    rank[order] = pos - first
+    return rank
