@@ -166,3 +166,41 @@ def test_lidar_keys_are_sample_data_tokens(gt, make_ds):
         for key, pts in zip(s.lidar_keys, s.lidar_points):
             assert key in tb.sample_data and tb.channel(key) == "LIDAR_TOP"
             assert pts.shape == (gt["n_points"][key], 4)  # the file of that token was read
+
+
+def _file_xyz(gt, sd: str) -> np.ndarray:
+    tb = nu.NuScenesTables(gt["root"], fk.VERSION)
+    return np.fromfile(gt["root"] / tb.sample_data[sd]["filename"], dtype=np.float32).reshape(-1, 5)[:, :3]
+
+
+def test_neighbour_points_stay_in_scene_and_match_ego_chain(gt, make_ds):
+    ds = make_ds("m3")
+    for i, (scene_tok, sample) in enumerate(ds.items):
+        name = ds.tables.scene[scene_tok]["name"]
+        chain = gt["chain"][(name, "LIDAR_TOP")]  # the on-disk prev/next is linked across scenes
+        kf = gt["keyframes"][sample]["LIDAR_TOP"]
+        j = chain.index(kf)
+        sweeps = chain[max(0, j - 5):j] + chain[j + 1:j + 6]
+        ref = np.linalg.inv(gt["ego"][kf])
+        want = np.concatenate([(np.c_[_file_xyz(gt, sd), np.ones(gt["n_points"][sd])]
+                                @ (ref @ gt["ego"][sd] @ fk.sensor_matrix("LIDAR_TOP")).T)[:, :3] for sd in sweeps])
+        pts, info = ds.neighbour_points(i, n=5, ego_radius=0.0, box_margin=None)
+        assert info["sweeps"] == len(sweeps) == 5 and info["dropped_ego"] == info["dropped_box"] == 0
+        assert pts.shape == want.shape and _close(pts, want, atol=1e-3)
+
+
+def test_neighbour_points_filters(gt, make_ds):
+    ds = make_ds("m3")
+    kf = gt["keyframes"][ds.items[0][1]]["LIDAR_TOP"]
+    sweeps = gt["chain"][(fk.SCENE_NAMES[0], "LIDAR_TOP")][1:6]
+    near = sum(int(((np.abs(p[:, 0]) < 1) & (np.abs(p[:, 1]) < 1)).sum())
+               for p in (_file_xyz(gt, sd) for sd in sweeps))
+    pts, info = ds.neighbour_points(0, n=5, ego_radius=1.0, box_margin=None)
+    assert near > 0 and info["dropped_ego"] == near
+    assert len(pts) == sum(gt["n_points"][s] for s in sweeps) - near
+    # box A is annotated in both keyframes, so every in-between sweep has it; a huge dilation swallows all
+    pts, info = ds.neighbour_points(0, n=5, ego_radius=1.0, box_margin=1e4)
+    assert len(pts) == 0 and info["dropped_box"] == sum(gt["n_points"][s] for s in sweeps) - near
+    assert kf not in sweeps
+    with pytest.raises(ValueError, match="mode"):
+        make_ds("m2", clip_len=4).neighbour_points(0)

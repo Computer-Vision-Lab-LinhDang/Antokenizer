@@ -25,6 +25,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from mavt4d.data.sample import Boxes3D, SceneSample
+from mavt4d.geometry.boxes import points_in_boxes
+from mavt4d.geometry.camera import transform_points
 
 CAM6 = ("CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_BACK_RIGHT", "CAM_BACK", "CAM_BACK_LEFT", "CAM_FRONT_LEFT")  # ring
 LIDAR = "LIDAR_TOP"
@@ -195,6 +197,37 @@ class NuScenesSceneDataset(Dataset):
             frame_times=self._times([frames], t0), intrinsics=K, cam_to_world=c2w,
             **self._lidar(sweeps, ref, t0),
             boxes=[_boxes(self._chain_boxes(chain, start + j, ref)) for j in range(len(frames))])
+
+    def neighbour_points(self, i: int, n: int = 5, ego_radius: float = 1.0,
+                         box_margin: float | None = 0.3) -> tuple[Tensor, dict[str, int]]:
+        """m3 only: world points (N, 3) of the up to n LIDAR_TOP sweeps before and after item ``i``'s keyframe
+        sweep inside its scene (keyframe sweep excluded), in item ``i``'s world frame via each sweep's own ego
+        pose. Drops points with |x| and |y| < ``ego_radius`` in the sensor frame (ego body, as the devkit's
+        remove_close) and points inside the boxes interpolated at the sweep's time, dilated by ``box_margin``
+        (None = keep them), since moving objects would smear across sweeps."""
+        if self.mode != "m3":
+            raise ValueError(f"mode: neighbour_points needs m3 items, dataset is {self.mode!r}")
+        scene, sample = self.items[i]
+        lidar = self.tables.keyframe_data[sample][LIDAR]
+        chain = self._chain(scene, LIDAR)
+        j = chain.index(lidar)
+        sweeps = chain[max(0, j - n):j] + chain[j + 1:j + 1 + n]
+        info = {"sweeps": len(sweeps), "dropped_ego": 0, "dropped_box": 0}
+        if not sweeps:
+            return torch.zeros(0, 3), info
+        ref, t0 = self._reference(lidar)
+        lid = self._lidar(sweeps, ref, t0)
+        out = []
+        for sd, p, T in zip(sweeps, lid["lidar_points"], lid["lidar_to_world"]):
+            near = (p[:, 0].abs() < ego_radius) & (p[:, 1].abs() < ego_radius)
+            info["dropped_ego"] += int(near.sum())
+            w = transform_points(T, p[~near, :3])
+            if box_margin is not None:
+                inside = points_in_boxes(w, _boxes(self._chain_boxes(chain, chain.index(sd), ref)), box_margin) >= 0
+                info["dropped_box"] += int(inside.sum())
+                w = w[~inside]
+            out.append(w)
+        return torch.cat(out), info
 
     def _reference(self, lidar_sd: str) -> tuple[np.ndarray, int]:
         """global -> world (inverse ego pose of the reference sweep) and t0 in microseconds."""
