@@ -72,11 +72,13 @@ def zbuffer_visibility(uv: Tensor, depth: Tensor, ref_uv: Tensor, ref_depth: Ten
 
 
 def patch_ray_dirs(K: Tensor, cam_to_world: Tensor, Hp: int, Wp: int, patch: int) -> Tensor:
-    """Unit world-frame ray directions (Hp, Wp, 3) through each patch centre."""
+    """Unit world-frame ray directions (..., Hp, Wp, 3) through each patch centre; K (..., 3, 3) and
+    cam_to_world (..., 4, 4) may carry matching batch dimensions."""
     r, c = torch.meshgrid(torch.arange(Hp, device=K.device), torch.arange(Wp, device=K.device), indexing="ij")
     uv1 = torch.stack([(c + 0.5) * patch, (r + 0.5) * patch, torch.ones_like(r, dtype=torch.float)], -1)
-    rays = uv1.to(K.dtype) @ torch.linalg.inv(K).T @ cam_to_world[:3, :3].T
-    return F.normalize(rays, dim=-1)
+    K_inv = torch.linalg.inv(K.reshape(-1, 3, 3)).view(K.shape)  # MPS warns on inv of >1 batch dim
+    rays = uv1.reshape(-1, 3).to(K.dtype) @ K_inv.transpose(-1, -2) @ cam_to_world[..., :3, :3].transpose(-1, -2)
+    return F.normalize(rays, dim=-1).unflatten(-2, (Hp, Wp))
 
 
 def project_visible(p_world: Tensor, ref_world: Tensor, K: Tensor, cam_to_world: Tensor, H: int, W: int,
