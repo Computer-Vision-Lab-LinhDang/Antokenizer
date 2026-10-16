@@ -71,7 +71,7 @@ class HybridCDModel(nn.Module):
             raise TypeError("observation must be ObservationStep or a batch sequence")
         if len(batch) != len(previous_times):
             raise ValueError("observation batch must match state batch")
-        evidence, observed, times = [], [], []
+        times = []
         for index, item in enumerate(batch):
             if not isinstance(item, ObservationStep):
                 raise TypeError("observation batch entries must be ObservationStep")
@@ -79,11 +79,9 @@ class HybridCDModel(nn.Module):
                 raise ValueError("observation and state must share device")
             if bool((item.frame_times < previous_times[index]).any()):
                 raise ValueError("frame_times: stale frame precedes state time")
-            encoded, available = self.observer(item, modality=modality)
-            evidence.append(encoded)
-            observed.append(torch.as_tensor(available, dtype=torch.bool, device=encoded.device))
             times.append(item.end_time)
-        return torch.stack(evidence), torch.stack(observed), torch.stack(times)
+        evidence, observed = self.observer.forward_batch(batch, modality=modality)
+        return evidence, observed, torch.stack(times)
 
     def step(self, state: HybridCDKVState, observation: PhysicalStep,
              modality: str = "camera") -> HybridCDKVState:

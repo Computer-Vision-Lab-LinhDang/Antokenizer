@@ -116,8 +116,9 @@ def _crossing_groups(table: FeatureTable) -> set[str]:
     return set(groups)
 
 
-def evaluate_probe_suite(train: FeatureTable, val: FeatureTable, cfg) -> dict:
+def evaluate_probe_suite(train: FeatureTable, val: FeatureTable, cfg, *, fit_probe=None) -> dict:
     """Fit on training sources only; emit per-source scores for paired inference."""
+    fit_probe = fit_ridge_probe if fit_probe is None else fit_probe
     train_groups, val_groups = _crossing_groups(train), _crossing_groups(val)
     if train_groups & val_groups:
         raise ValueError("train and val source groups must be disjoint; overlap detected")
@@ -134,8 +135,8 @@ def evaluate_probe_suite(train: FeatureTable, val: FeatureTable, cfg) -> dict:
         train_ids = [i for i, row in enumerate(train.records) if selection(row)]
         val_ids = [i for i, row in enumerate(val.records) if selection(row)]
         labels = torch.tensor([target(train.records[i]) for i in train_ids], dtype=torch.int64)
-        probe = fit_ridge_probe(train.features[feature][train_ids], labels,
-                                classes=classes, ridge=cfg.probe_ridge)
+        probe = fit_probe(train.features[feature][train_ids], labels,
+                          classes=classes, ridge=cfg.probe_ridge)
         predictions = probe.predict(val.features[feature][val_ids]).tolist()
         rows, correct_by_group = [], defaultdict(list)
         for index, prediction in zip(val_ids, predictions):

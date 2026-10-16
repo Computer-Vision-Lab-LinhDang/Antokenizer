@@ -1,0 +1,103 @@
+{
+  "H": 128,
+  "T": 12,
+  "W": 192,
+  "architecture": {
+    "cache_steps": 16,
+    "decoder_blocks": 4,
+    "decoder_tile": 8,
+    "feedback": true,
+    "frames_per_step": 2,
+    "kv_heads": 2,
+    "modulation_dim": 16,
+    "patch_size": 16,
+    "q_heads": 8,
+    "reference_views": 1,
+    "spatial_blocks": 8,
+    "spatial_heads": 6,
+    "spatial_width": 384,
+    "stage_count": 2,
+    "state_dim": 32,
+    "state_tokens": 32,
+    "summary_tokens": 16,
+    "width": 256,
+    "window_size": 8
+  },
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "bootstrap": 1000,
+  "bootstrap_seed": 31415,
+  "checkpoint_every": 100,
+  "dataset_version": "event-cd-v1",
+  "dev_fraction": 0.1,
+  "dev_salt": "mavt-pilot-dev-v1",
+  "dt": 0.08333333333333333,
+  "eval_mask_seed": 2718,
+  "eval_reconstruction_groups": 4,
+  "future_prefix_frames": 6,
+  "future_target_frames": [
+    7,
+    9
+  ],
+  "future_weight": 0.5,
+  "global_source_groups": 32,
+  "grad_clip": 1.0,
+  "invariance_weight": 0.1,
+  "learning_rate": 0.0003,
+  "log_every": 10,
+  "mask_kinds": [
+    "clean",
+    "wide",
+    "tube",
+    "snapshot",
+    "never_seen"
+  ],
+  "mask_weights": [
+    0.2,
+    0.2,
+    0.2,
+    0.2,
+    0.2
+  ],
+  "microbatch_candidates": [
+    1,
+    2,
+    4
+  ],
+  "missing_weight": 1.0,
+  "noncollapse_weight": 0.05,
+  "overfit_recon_ratio": 0.75,
+  "overfit_seed": 17,
+  "overfit_steps": 200,
+  "overfit_temporal_ratio": 0.8,
+  "probe_ridge": 1.0,
+  "rec_weight": 1.0,
+  "seed": 17,
+  "seed_start": 0,
+  "semantic_dim": 16,
+  "source_count": 128,
+  "temporal_pairs": [
+    [
+      2,
+      7
+    ],
+    [
+      3,
+      6
+    ]
+  ],
+  "temporal_pool": [
+    8,
+    12
+  ],
+  "temporal_rms_floor": 0.02,
+  "temporal_weight": 1.0,
+  "train_steps": 1200,
+  "val_fraction": 0.2,
+  "variance_target": 0.1,
+  "version": "hybrid-synthetic-pilot-v2",
+  "weight_decay": 0.0001,
+  "world_size": 8
+}

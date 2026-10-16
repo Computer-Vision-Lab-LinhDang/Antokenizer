@@ -345,7 +345,13 @@ Technical tests qua không phải learning result. Khi chuyển sang natural vid
 source-disjoint splits và target leakage audits vẫn bắt buộc; không tạo C/D class
 loss rồi gọi representation training là không nhãn.
 
-## 10. Gate còn phải khóa cho hybrid learning
+## 10. Gate còn phải khóa cho hybrid learning benchmark đầy đủ
+
+**Bổ sung trước train, 2026-10-17:** [hybrid synthetic pilot v2](../hybrid_synthetic_pilot_v2.md)
+khóa một pilot ngắn riêng: fixture 12 frames render mới 128×192, một coupled
+hybrid/seed, training objectives, DDP và recovery. Pilot đó kiểm optimization
+và held-out short-history C/D; không thay thế long-lag suite, memory
+interventions hay baseline matrix bên dưới. Không sửa hoặc tái diễn giải v1.
 
 Các mục sau **chưa hoàn thành**; không có hybrid loss/threshold được ngầm chọn
 trong tài liệu này:

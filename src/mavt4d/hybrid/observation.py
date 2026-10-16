@@ -9,6 +9,7 @@ retains a frame, convolution state, or attention cache between calls.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor, nn
@@ -85,16 +86,20 @@ class SpatialBlock(nn.Module):
         return output[:, shift:shift + height, shift:shift + width]
 
     def forward(self, tokens: Tensor, coverage: Tensor) -> Tensor:
-        if tokens.ndim != 4 or tokens.shape[-1] != self.width or coverage.shape != tokens.shape[:-1]:
-            raise ValueError("spatial input must be [V,H,W,E] and coverage [V,H,W]")
+        if tokens.ndim not in (4, 5) or tokens.shape[-1] != self.width or coverage.shape != tokens.shape[:-1]:
+            raise ValueError("spatial input must be [V,H,W,E] or [B,V,H,W,E], with matching coverage")
+        batch = 1 if tokens.ndim == 4 else tokens.shape[0]
         valid = coverage.unsqueeze(-1) > 0
         tokens = torch.where(valid, tokens, torch.zeros_like(tokens))
         normalized = self.norm(tokens)
         if self.global_attention:
-            update = self._attend(normalized.reshape(1, -1, self.width), coverage.reshape(1, -1))
+            update = self._attend(normalized.reshape(batch, -1, self.width), coverage.reshape(batch, -1))
             update = update.reshape_as(tokens)
         else:
-            update = self._windows(normalized, coverage)
+            # Local windows may share one kernel across batch/view rows,
+            # while global attention must retain the batch boundary.
+            update = self._windows(normalized.reshape(-1, *tokens.shape[-3:]),
+                                   coverage.reshape(-1, *coverage.shape[-2:])).reshape_as(tokens)
         output = tokens + update
         output = output + self.ffn(self.ffn_norm(output))
         return torch.where(valid, output, torch.zeros_like(output))
@@ -116,6 +121,10 @@ class HybridObservationEncoder(nn.Module):
         if not isinstance(config, HybridConfig):
             raise TypeError("config must be HybridConfig")
         self.config = config
+        # Runtime precision policy: parameters and returned evidence remain
+        # FP32. This option only autocasts Patchify and spatial Transformer
+        # projections; it never changes temporal C/D or serialized KV dtypes.
+        self.spatial_autocast = False
         width = config.spatial_width
         self.patchify = nn.Conv3d(3, width,
                                  kernel_size=(config.frames_per_step, config.patch_size, config.patch_size),
@@ -175,13 +184,13 @@ class HybridObservationEncoder(nn.Module):
         origins = origins.permute(0, 2, 3, 1, 4).reshape(views, hp, wp, -1)
         return torch.cat((xy, coverage, geometry, times, per_frame, rays, origins), dim=-1)
 
-    def forward(self, observation: ObservationStep, *, modality: str = "camera") -> tuple[Tensor, Tensor]:
+    def _validate_observation(self, observation: ObservationStep, modality: str) -> Tensor:
         if not isinstance(observation, ObservationStep):
             raise TypeError("observation must be ObservationStep")
         observation.validate()
         if modality not in ("camera", "triplane"):
             raise ValueError("modality must be camera or triplane")
-        views, frames, _, height, width = observation.images.shape
+        views, frames = observation.images.shape[:2]
         if views != self.config.reference_views:
             raise ValueError("view count must match fixed reference_views")
         if frames > self.config.frames_per_step:
@@ -192,35 +201,83 @@ class HybridObservationEncoder(nn.Module):
             raise ValueError("observation and encoder weights must share a device")
         if modality == "triplane" and (views != 3 or frames != 1 or observation.intrinsics is not None):
             raise ValueError("triplane requires three planes, one real frame, and no camera calibration")
-        observed = observation.observed.any()
-        if not bool(observed):
-            return observation.images.new_zeros(self.config.summary_tokens, self.config.width), observed
+        return observation.observed.any()
+
+    def _encode_group(self, observations: Sequence[ObservationStep], *, modality: str,
+                      single: bool = False) -> Tensor:
+        """Encode a homogeneous shape group without mixing examples."""
+        observation = observations[0]
+        batch = len(observations)
+        views, frames, _, height, width = observation.images.shape
         patch = self.config.patch_size
         bottom, right = (-height) % patch, (-width) % patch
-        masked = observation.masked_images().permute(0, 2, 1, 3, 4)
+        images = torch.stack([item.images for item in observations])
+        observed = torch.stack([item.observed for item in observations])
+        masked = torch.where(observed.unsqueeze(3), images, torch.zeros_like(images))
+        masked = masked.permute(0, 1, 3, 2, 4, 5).reshape(batch * views, 3, frames, height, width)
         masked = F.pad(masked, (0, right, 0, bottom, self.config.frames_per_step - frames, 0))
-        patches = self.patchify(masked).squeeze(2).permute(0, 2, 3, 1)
-        availability = F.pad(observation.observed.to(patches.dtype), (0, right, 0, bottom))
-        hp, wp = patches.shape[1:3]
-        frame_coverage = F.avg_pool2d(availability.reshape(views * frames, 1, height + bottom, width + right),
-                                      patch, patch).reshape(views, frames, hp, wp)
-        coverage = frame_coverage.sum(dim=1) / self.config.frames_per_step
-        patches = patches + self.metadata_projection(self._metadata(observation, frame_coverage))
-        modality_index = torch.tensor(0 if modality == "camera" else 1, device=patches.device)
-        patches = patches + self.modality_embedding(modality_index)
-        if modality == "camera":
-            # Persist identity in evidence even when two cameras have absent
-            # or identical calibration. Input rows must stay stable over time.
+        hp, wp = (height + bottom) // patch, (width + right) // patch
+        availability = F.pad(observed.to(torch.float32), (0, right, 0, bottom))
+        frame_coverage = F.avg_pool2d(
+            availability.reshape(batch * views * frames, 1, height + bottom, width + right),
+            patch, patch).reshape(batch, views, frames, hp, wp)
+        coverage = frame_coverage.sum(dim=2) / self.config.frames_per_step
+        metadata = torch.stack([self._metadata(item, frame_coverage[index])
+                                for index, item in enumerate(observations)])
+        with torch.autocast(device_type=images.device.type, dtype=torch.bfloat16,
+                            enabled=self.spatial_autocast):
+            patches = self.patchify(masked).squeeze(2).permute(0, 2, 3, 1)
+            patches = patches.reshape(batch, views, hp, wp, self.config.spatial_width)
+            patches = patches + self.metadata_projection(metadata)
+            modality_index = torch.tensor(0 if modality == "camera" else 1, device=patches.device)
+            patches = patches + self.modality_embedding(modality_index)
             view_ids = torch.arange(views, device=patches.device)
-            patches = patches + self.camera_view_embedding(view_ids)[:, None, None, :]
-        else:
-            patches = patches + self.plane_embedding(torch.arange(3, device=patches.device))[:, None, None, :]
-        for block in self.blocks:
-            patches = block(patches, coverage)
-        tokens = self.pool_norm(patches.reshape(1, -1, self.config.spatial_width))
-        queries = self.pool_queries.unsqueeze(0)
-        pooled = _attention(queries, self.pool_keys(tokens), self.pool_values(tokens),
-                            self.config.q_heads, coverage.reshape(1, -1))
-        pooled = queries + self.pool_output(pooled)
-        pooled = pooled + self.pool_ffn(self.pool_ffn_norm(pooled))
-        return pooled.squeeze(0), observed
+            identity = self.camera_view_embedding(view_ids) if modality == "camera" else self.plane_embedding(view_ids)
+            patches = patches + identity[None, :, None, None, :]
+            if single:
+                # Keep the original single-item module interface for callers
+                # that inspect per-view spatial activations using hooks.
+                patches, spatial_coverage = patches[0], coverage[0]
+            else:
+                spatial_coverage = coverage
+            for block in self.blocks:
+                patches = block(patches, spatial_coverage)
+        with torch.autocast(device_type=images.device.type, enabled=False):
+            tokens = self.pool_norm(patches.float().reshape(batch, -1, self.config.spatial_width))
+            queries = self.pool_queries.unsqueeze(0).expand(batch, -1, -1)
+            pooled = _attention(queries, self.pool_keys(tokens), self.pool_values(tokens),
+                                self.config.q_heads, coverage.reshape(batch, -1))
+            pooled = queries + self.pool_output(pooled)
+            return pooled + self.pool_ffn(self.pool_ffn_norm(pooled))
+
+    def forward(self, observation: ObservationStep, *, modality: str = "camera") -> tuple[Tensor, Tensor]:
+        observed = self._validate_observation(observation, modality)
+        if not bool(observed):
+            return observation.images.new_zeros(self.config.summary_tokens, self.config.width), observed
+        return self._encode_group((observation,), modality=modality, single=True)[0], observed
+
+    def forward_batch(self, observations: Sequence[ObservationStep], *,
+                      modality: str = "camera") -> tuple[Tensor, Tensor]:
+        """Return independent FP32 evidence [B,P,E] and availability [B].
+
+        Equal shapes share Patchify/Transformer kernels. Different spatial
+        sizes or frame counts form separate groups rather than adding fake
+        image pixels or changing each example's positional metadata. Missing
+        examples skip spatial computation, as in the single-item interface.
+        """
+        if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
+            raise TypeError("observations must be a sequence of ObservationStep")
+        if not observations:
+            raise ValueError("observations must be nonempty")
+        available = torch.stack([self._validate_observation(item, modality) for item in observations])
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for index, present in enumerate(available.tolist()):
+            if present:
+                groups.setdefault(tuple(observations[index].images.shape), []).append(index)
+        output = [observations[0].images.new_zeros(self.config.summary_tokens, self.config.width)
+                  for _ in observations]
+        for indices in groups.values():
+            encoded = self._encode_group([observations[index] for index in indices], modality=modality)
+            for row, index in enumerate(indices):
+                output[index] = encoded[row]
+        return torch.stack(output), available

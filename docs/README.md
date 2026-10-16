@@ -8,6 +8,8 @@
 - [Proposed paper benchmark tables](benchmarks/mavt-paper-benchmark-tables.md): five main comparisons and three ablation groups, with unmeasured results explicitly left blank.
 - [Reference API](reference_hybrid_cd_model.md): snapshot/restart, causal execution, missing observations and tile decoding.
 - [Architecture preset](../configs/mavt4d/hybrid_cd2_kv_v2.json).
+- [Hybrid synthetic pilot v2](hybrid_synthetic_pilot_v2.md): separate training lock, DDP, W&B and checkpoint/recovery protocol.
+- [Training architecture](architecture/mavt-hybrid-training.md): batched observer, C/D losses, distributed updates and deadline handling.
 
 The hybrid is a correctness reference. Technical tests have passed; event/configuration learning and GPU performance have not been measured.
 
