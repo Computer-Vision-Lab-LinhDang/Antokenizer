@@ -1,6 +1,6 @@
 # State hybrid: ba cách tổ chức pipeline (A, B, C)
 
-Trạng thái: bản nháp để quyết định, 16/10/2026. Code tham chiếu: `src/mavt4d/model/state.py` trên nhánh
+Trạng thái: bản nháp để chốt kiến trúc, 16/10/2026. Kiến trúc đề xuất ở mục 8, quyết định cần chốt ở mục 9. Code tham chiếu: `src/mavt4d/model/state.py` trên nhánh
 `work/state-synth` (commit `3956a05`).
 
 ## 1. Bối cảnh và những gì đã chốt
@@ -183,16 +183,85 @@ thay cho KL tới N(0, I); một đầu vào hành động cho `predict` khi có
 - Kết quả job DGX `14575` (có/không tín hiệu trí nhớ) không đổi đề xuất này, nhưng nếu nhánh "có" vẫn không nhớ
   được trên cảnh mới thì đó là lý do làm A sớm: cell tường minh là chỗ ép giữ trí nhớ dễ nhất.
 
-## 8. Câu hỏi mở cho bạn
+## 8. Kiến trúc đề xuất để chốt
 
-1. **Phương án "cách khác" của bạn nằm ở đâu trên ba trục ở mục 2?** Ví dụ: hợp nhất view trước nhưng cell nằm
-   trước association, hay mỗi view một state riêng rồi mới hợp nhất. Nếu bạn chỉ ra trục nào khác A, mình bổ
-   sung thành phương án D trong tài liệu này.
-2. Bản tokenizer đầu tiên có cần prior head p(zₜ | S⁻ₜ) ngay không, hay giữ KL tới N(0, I) và chỉ thêm prior khi
-   chuyển sang predictive model?
-3. Cell đầu tiên để thử trong A là gì: none (chỉ residual, rẻ nhất để so với C), GRU, hay delta rule? Môi trường
-   DGX hiện không có gói Mamba hay linear-attention, nên SSM và delta rule cần bản PyTorch thuần.
-4. Hình học tia camera vào association (cộng vào key) có bắt buộc từ đầu không, khi ảnh và video một camera
-   không có pose?
-5. Số lớp L (association) và M (self-attn giữa token state) bắt đầu từ bao nhiêu? Ước lượng chi phí ở mục 5 dùng
-   L = 4, M = 2.
+Bản này gộp đề xuất ở mục 7 với ba phát hiện của bản review plan MAVT (16/10):
+- correspondence graph (hub, cạnh PROJ/TRACK) chưa được model nào dùng, trong khi cổng M1 đang trượt trên
+  nuScenes-mini (15,83% false-visible so với ngưỡng < 5%);
+- chữ "uncertain" chưa có cơ chế: KL tới N(0, I) trọng số 1e-4, `predict` tất định, loss L1, eval lấy `mu`;
+- quan hệ giữa state và tokenizer stage 1 (`src/mavt`) chưa được định nghĩa.
+
+### 8.1 Một bước t
+
+```
+Đầu vào   F_t   = DINOv3-B/16(view nhìn thấy)              đóng băng, cache; 768 → d
+                  + emb(tia camera) nếu có pose, emb(không pose) nếu là ảnh/video thường
+Prior     h⁻ₜ   = hₜ₋₁ + predict(hₜ₋₁, zₜ₋₁, Δt, aₜ)        aₜ = pose ego của bước t (world model)
+          p(zₜ | h⁻ₜ) = N(μᵖ, σᵖ)                           prior head, mỗi token một Gauss 32 chiều
+Associate Uₜ    = CrossAttn⁴(query = h⁻ₜ, key/value = F_t)   view ẩn bị loại bằng attention mask
+Cell      hₜ    = GRU(h⁻ₜ, Uₜ)                                cổng = "tin bằng chứng bao nhiêu"
+Mix       hₜ    = SelfAttn²(hₜ)                              hợp nhất giữa K token
+Posterior q(zₜ | hₜ) = N(μ^q, σ^q)                          bước không có view nào: q := p
+Mã        zₜ ~ q                                              K = 128 × V token × 32 chiều; đây là token
+                                                              cho mô hình sinh, predictive và world model
+Readout   rgbₜ, log_depthₜ = readout(zₜ, camera bước t)      giữ nguyên: query chỉ mang hình học
+```
+
+Trạng thái truyền qua bước là cặp (hₜ, zₜ) như RSSM: phần tất định h mang trí nhớ dài, phần ngẫu nhiên z mang
+bất định. Vì `predict` nhận zₜ₋₁ đã sample, nhiều mẫu z cho ra nhiều tương lai khác nhau.
+
+### 8.2 Loss
+
+```
+L = L1(rgb) + 0,5 · L1(log_depth)                  trên các ô được giám sát (memory signal "on")
+  + β · max(free_bits, KL(q(zₜ | hₜ) ‖ p(zₜ | h⁻ₜ)))   thay cho KL tới N(0, I)
+  + β₀ · KL(p(z₁) ‖ N(0, I))                        chỉ bước đầu, giữ thang của z
+```
+
+Bước bị ẩn không có posterior nên không có KL; readout đọc z sample từ prior và vẫn bị giám sát, đó chính là
+tín hiệu trí nhớ đang có trong `train_synth.py`.
+
+### 8.3 Đo bất định
+
+Thêm vào eval của `train_synth.py`, trên các ô bị ẩn (`drop_last`, `drop_last2`, `hide_view`):
+- best-of-8 so với trung bình 8 mẫu (PSNR trên pixel hộp): mẫu tốt nhất phải hơn trung bình rõ rệt thì mới có
+  đa giả thuyết;
+- độ trải giữa các mẫu tăng theo số bước bị ẩn liên tiếp, và gần 0 trên ô đã thấy;
+- trên E1.3: clip `occlusion_reappearance` và `same_final_position_different_direction`.
+
+### 8.4 Graph và tokenizer stage 1
+
+- **Graph** chưa nối vào bản đầu. Chỗ cắm đã có sẵn trong A: cạnh PROJ thành attention bias trong Associate, hub
+  thành token key/value thêm. Chạy thí nghiệm có/không graph trên cảnh tổng hợp (có GT visibility) trước khi
+  tiếp tục kéo M1 trên nuScenes. Nếu graph không giúp ở `hide_view`/`drop_last2`, hạ ưu tiên M1.
+- **Stage 1:** state thay tokenizer stage 1 cho dữ liệu 4D. DINOv3 đóng băng đã thay vai trò encoder RGAT; zₜ là
+  token. Ảnh là chuỗi một bước, video là V = 1.
+
+### 8.5 Thứ tự làm
+
+1. Đổi stem sang DINOv3 đóng băng có cache, K = 128 × V, attention mask cho view ẩn (chung cho mọi phương án).
+2. Chạy C (code hiện tại với stem mới) làm đối chứng.
+3. Dựng A với cell GRU, prior/posterior và eval bất định ở 8.3; so với C cùng compute trên `hide_view`,
+   `drop_last2`.
+4. Thí nghiệm graph-vào-state trên A.
+5. Cổng state trên nuScenes-mini: thắng `copy_prev` ở `drop_last` trên pixel hộp.
+
+B chỉ thêm nếu bước 3 cho thấy `hide_view` yếu.
+
+## 9. Quyết định cần bạn chốt
+
+Mỗi câu trả lời một từ; khuyến nghị in đậm.
+
+| # | Câu hỏi | Lựa chọn |
+|---|---|---|
+| 1 | Khung module state | **A** / B / C / khác |
+| 2 | Cell đầu tiên trong A | **GRU** / none / delta |
+| 3 | Prior/posterior kiểu RSSM ngay từ bản đầu | **Có** / không |
+| 4 | Graph vào state | **Sau** (thí nghiệm ở bước 4) / ngay |
+| 5 | State thay tokenizer stage 1 hay đọc token của stage 1 | **Thay** / đọc |
+| 6 | Hành động aₜ cho world model | **Pose** ego / điều khiển |
+
+Nếu câu 1 là "khác", phương án của bạn khác A ở trục nào trong mục 2 là đủ để mình viết lại mục 8.
+
+Các câu nhỏ hơn đã lấy mặc định và có thể đổi sau: hình học tia dùng khi có pose, emb "không pose" khi không có;
+L = 4 lớp Associate, M = 2 lớp Mix; DGX không có gói Mamba nên delta rule nếu chọn sẽ viết bằng PyTorch thuần.
