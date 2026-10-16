@@ -1,0 +1,21 @@
+{
+  "stage_count": 2,
+  "state_tokens": 32,
+  "state_dim": 32,
+  "summary_tokens": 16,
+  "width": 256,
+  "spatial_width": 384,
+  "spatial_heads": 6,
+  "spatial_blocks": 8,
+  "patch_size": 16,
+  "window_size": 8,
+  "q_heads": 8,
+  "kv_heads": 2,
+  "cache_steps": 16,
+  "decoder_blocks": 4,
+  "decoder_tile": 8,
+  "modulation_dim": 16,
+  "frames_per_step": 2,
+  "reference_views": 1,
+  "feedback": true
+}
