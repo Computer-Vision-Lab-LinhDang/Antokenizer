@@ -118,6 +118,10 @@ nonfinal microbatches. One online W&B run on rank zero records train losses,
 gradient norm, progress, throughput, summed and maximum-rank allocated/peak memory, available
 AMD device utilization/power/VRAM counters, evaluation progress and results.
 Missing telemetry is marked unavailable rather than replaced by zero.
+W&B owns its transport history index, including after resume. Charts use the
+explicit `progress/logical_step` axis, while `progress/optimizer_step` and phase
+identify the actual learning update. The local journal keeps a monotonic event
+counter; it is not used to force W&B history indices.
 
 Atomic training checkpoints contain model and auxiliary heads, optimizer,
 phase/next-step cursor, frozen configuration and dataset identities, each rank's

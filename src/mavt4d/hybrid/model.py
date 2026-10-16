@@ -61,8 +61,9 @@ class HybridCDModel(nn.Module):
         if parameter.dtype != torch.float32 or state.c.device != parameter.device:
             raise ValueError("state and FP32 model must share device")
 
-    def _encode_step(self, previous_times: Tensor, observation: PhysicalStep,
-                     modality: str) -> tuple[Tensor, Tensor, Tensor]:
+    def _prepare_step(self, previous_times: Tensor,
+                      observation: PhysicalStep) -> tuple[Sequence[ObservationStep], Tensor]:
+        """Normalize one physical batch while checking each stream's time."""
         if isinstance(observation, ObservationStep):
             batch = (observation,)
         elif isinstance(observation, Sequence) and not isinstance(observation, (str, bytes)):
@@ -80,8 +81,13 @@ class HybridCDModel(nn.Module):
             if bool((item.frame_times < previous_times[index]).any()):
                 raise ValueError("frame_times: stale frame precedes state time")
             times.append(item.end_time)
+        return batch, torch.stack(times)
+
+    def _encode_step(self, previous_times: Tensor, observation: PhysicalStep,
+                     modality: str) -> tuple[Tensor, Tensor, Tensor]:
+        batch, times = self._prepare_step(previous_times, observation)
         evidence, observed = self.observer.forward_batch(batch, modality=modality)
-        return evidence, observed, torch.stack(times)
+        return evidence, observed, times
 
     def step(self, state: HybridCDKVState, observation: PhysicalStep,
              modality: str = "camera") -> HybridCDKVState:
@@ -96,17 +102,24 @@ class HybridCDModel(nn.Module):
             raise ValueError("method: expected sequential or associative")
         if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
             raise TypeError("steps: expected sequence of physical observations")
-        evidence, observed, times = [], [], []
+        observations, times = [], []
         previous_times = state.last_time
         for item in steps:
-            encoded, available, current_times = self._encode_step(previous_times, item, modality)
-            evidence.append(encoded)
-            observed.append(available)
+            batch, current_times = self._prepare_step(previous_times, item)
+            observations.extend(batch)
             times.append(current_times)
             previous_times = current_times
-        if not evidence:
+        if not times:
             return ()
-        return self.forward_encoded(state, torch.stack(evidence), torch.stack(observed),
+        # Spatial encoding has no recurrent state. Flatten time into its batch
+        # axis so equal shapes share kernels, while spatial attention continues
+        # to isolate every physical observation (including its own views).
+        # Restore [T,B,...] before any causal temporal computation.
+        evidence, observed = self.observer.forward_batch(observations, modality=modality)
+        length, batch_size = len(times), len(state.last_time)
+        evidence = evidence.reshape(length, batch_size, *evidence.shape[1:])
+        observed = observed.reshape(length, batch_size)
+        return self.forward_encoded(state, evidence, observed,
                                     torch.stack(times), method=method)
 
     def forward_encoded(self, state: HybridCDKVState, evidence: Tensor,

@@ -7,7 +7,7 @@ the reference. This diagram adds the batch and training runtime around them.
 flowchart TD
   A[Audited source-group fixtures] --> B[Deterministic rank and update schedule]
   B --> C[Shared anisotropic mask and photometric views]
-  C --> D[Batched Patchify and 8 spatial Transformer blocks]
+  C --> D[T by B batched Patchify and 8 spatial Transformer blocks]
   D --> E[GQA1 and coupled C1/D1 scan]
   E --> F[GQA2 and coupled C2/D2 scan]
   K[Bounded KV1 and KV2] <--> E
@@ -29,8 +29,12 @@ flowchart TD
   S --> O
 ```
 
-Spatial batching keeps attention isolated between examples. Selective BF16
+Spatial batching folds physical steps and examples into independent rows;
+attention remains isolated between them, including future steps. Selective BF16
 applies to spatial compute; FP32 evidence enters the original temporal pipeline.
+Temporal projection and FFN batch observed rows after the unchanged causal
+attention gathers. Missing dynamics evaluate only missing rows and reuse equal
+time gaps, retaining parameter and timestamp gradient semantics.
 Each source keeps its camera calibration when decoding, even when multiple
 sources share a spatial batch. C/D are the recurrent scene variables; KV is
 explicit additional memory. Optimizer/RNG/checkpoint data belong to training

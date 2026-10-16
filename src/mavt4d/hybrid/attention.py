@@ -101,13 +101,11 @@ class TemporalGQA(nn.Module):
         all_times = torch.cat((initial_times, times.transpose(0, 1)), dim=1)
         all_ids = torch.cat((initial_ids, step_ids.transpose(0, 1)), dim=1)
         all_valid = torch.cat((initial_valid, observed.T[..., None].expand(-1, -1, cfg.summary_tokens)), dim=1)
-        result = []
+        aggregates = []
         repetitions = cfg.q_heads // cfg.kv_heads
         for t in range(length):
-            per_stream = []
             for stream in range(batch):
                 if not bool(observed[t, stream]):
-                    per_stream.append(inputs.new_zeros(cfg.summary_tokens, cfg.width))
                     continue
                 current_id = step_ids[t, stream]
                 # IDs, not ring positions or timestamps, define the window.
@@ -133,8 +131,15 @@ class TemporalGQA(nn.Module):
                 bias = self.time_bias(torch.log1p(elapsed).float()[:, None]).T
                 aggregate = (torch.softmax(logits + bias[:, None, :], dim=-1) @ values)
                 aggregate = aggregate.permute(1, 0, 2).reshape(cfg.summary_tokens, cfg.width)
-                output = inputs[t, stream] + self.out_projection(aggregate)
-                output = output + self.ffn(self.ffn_norm(output))
-                per_stream.append(output)
-            result.append(torch.stack(per_stream))
-        return torch.stack(result), k, v
+                aggregates.append(aggregate)
+        if not aggregates:
+            # Preserve the missing-step bypass, including unused tail gradients.
+            return torch.zeros_like(inputs), k, v
+        # Gather/reduction remains chronological per stream. The row-local tail
+        # has no temporal dependencies and can use one GEMM batch for all active
+        # rows, in the same time-major order as the projection indices above.
+        output = active + self.out_projection(torch.stack(aggregates))
+        output = output + self.ffn(self.ffn_norm(output))
+        result = inputs.new_zeros(length * batch, cfg.summary_tokens, cfg.width)
+        result = result.index_copy(0, indices, output).reshape_as(inputs)
+        return result, k, v

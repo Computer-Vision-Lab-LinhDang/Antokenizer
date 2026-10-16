@@ -28,6 +28,15 @@ class RunLogger:
         if rank != 0:
             return
         self.output.mkdir(parents=True, exist_ok=True)
+        progress = self.output / "progress.jsonl"
+        if progress.exists():
+            # This is only the local journal sequence. It is deliberately not
+            # used as W&B's transport step, whose resumed server tail can be
+            # ahead of the SDK's initially reported run.step.
+            with progress.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        self._last_step = max(self._last_step, int(json.loads(line)["step"]))
         if not enabled:
             return
         if os.environ.get("WANDB_MODE", "online") != "online":
@@ -45,7 +54,8 @@ class RunLogger:
         if self.run is None:
             raise RuntimeError("W&B did not return an online run")
         self.run_id, self.url = self.run.id, self.run.url
-        self._last_step = int(getattr(self.run, "step", 0)) - 1
+        self.run.define_metric("progress/logical_step")
+        self.run.define_metric("*", step_metric="progress/logical_step", step_sync=True)
         (self.output / "wandb-run.json").write_text(
             json.dumps({"id": self.run_id, "url": self.url}, sort_keys=True) + "\n",
             encoding="utf-8")
@@ -53,9 +63,11 @@ class RunLogger:
     def log(self, metrics: Mapping[str, Any], *, step: int) -> None:
         if self.rank != 0:
             return
+        logical_step = step
         step = max(step, self._last_step + 1)
         self._last_step = step
         values = dict(metrics)
+        values["progress/logical_step"] = logical_step
         for name, value in values.items():
             if isinstance(value, float) and not math.isfinite(value):
                 raise ValueError(f"nonfinite logging metric: {name}")
@@ -64,7 +76,10 @@ class RunLogger:
             stream.write(json.dumps(local, sort_keys=True, allow_nan=False) + "\n")
             stream.flush()
         if self.run is not None:
-            self.run.log(values, step=step)
+            # Omit step: W&B's backend owns its monotonic history counter.
+            # Passing a resumed optimizer/local counter can silently drop
+            # events when the server already has later history records.
+            self.run.log(values)
 
     def checkpoint(self, path: str | Path, *, metadata: Mapping[str, Any]) -> None:
         if self.rank != 0 or self.run is None:

@@ -57,14 +57,30 @@ class HybridCoupledCell(nn.Module):
         if not bool(torch.isfinite(clean).all()):
             raise ValueError("cell observed evidence must be finite")
         identity = torch.eye(2, device=evidence.device, dtype=torch.float32)
-        omega = self.missing_rotation
-        zero = torch.zeros_like(omega)
-        skew = torch.stack((zero, -omega, omega, zero), dim=-1).reshape(cfg.state_tokens, cfg.state_dim, 2, 2)
-        generator = skew - self.missing_damping @ self.missing_damping.transpose(-1, -2)
-        missing_a = self._normalize(torch.matrix_exp(delta_time.float()[:, None, None, None, None] * generator))
-        missing_b = evidence.new_zeros(batch, cfg.state_tokens, cfg.state_dim, 2)
-
         indices = observed.nonzero(as_tuple=False).flatten()
+        # The dense reference forms a missing transition for every row before
+        # overwriting observed rows. Preserve its zero (not absent) parameter
+        # gradients, including AdamW weight decay, without doing those exp/SVDs.
+        zero_dependency = (self.missing_rotation.sum() + self.missing_damping.sum()) * 0
+        missing_a = evidence.new_zeros(batch, cfg.state_tokens, cfg.state_dim, 2, 2) + zero_dependency
+        if len(indices) < batch:
+            missing = (~observed).nonzero(as_tuple=False).flatten()
+            gaps = delta_time.index_select(0, missing).float()
+            # Equal FP32 gaps have identical transition matrices. Physical
+            # timestamps normally do not require gradients; retain the dense
+            # gap path if a caller explicitly differentiates their timestamps.
+            if gaps.requires_grad:
+                unique_gaps = gaps
+                inverse = torch.arange(len(gaps), device=gaps.device)
+            else:
+                unique_gaps, inverse = torch.unique(gaps, sorted=True, return_inverse=True)
+            omega = self.missing_rotation
+            zero = torch.zeros_like(omega)
+            skew = torch.stack((zero, -omega, omega, zero), dim=-1).reshape(cfg.state_tokens, cfg.state_dim, 2, 2)
+            generator = skew - self.missing_damping @ self.missing_damping.transpose(-1, -2)
+            transitions = self._normalize(torch.matrix_exp(unique_gaps[:, None, None, None, None] * generator))
+            missing_a = missing_a.index_copy(0, missing, transitions.index_select(0, inverse))
+        missing_b = evidence.new_zeros(batch, cfg.state_tokens, cfg.state_dim, 2)
         if len(indices) == 0:
             return missing_a, missing_b
         active = self.evidence_norm(clean.index_select(0, indices))

@@ -79,7 +79,8 @@ def test_rank_zero_online_logging_only_and_checkpoint_artifact(tmp_path):
     class FakeRun:
         id = "run-id"
         url = "https://wandb.example/project/runs/run-id"
-        def log(self, values, step): calls.append(("log", values, step))
+        def log(self, values, step=None): calls.append(("log", values, step))
+        def define_metric(self, name, **kwargs): calls.append(("metric", name, kwargs))
         def log_artifact(self, artifact, aliases): calls.append(("artifact", artifact, aliases))
         def finish(self, exit_code): calls.append(("finish", exit_code))
     class Artifact:
@@ -104,6 +105,41 @@ def test_rank_zero_online_logging_only_and_checkpoint_artifact(tmp_path):
     assert (tmp_path / "wandb-run.json").exists()
     assert json.loads((tmp_path / "progress.jsonl").read_text())["train/loss"] == 1.25
     assert any(call[0] == "artifact" for call in calls)
+
+
+def test_resumed_wandb_uses_backend_steps_when_sdk_step_is_stale(tmp_path):
+    (tmp_path / "progress.jsonl").write_text(json.dumps({"step": 1403,
+        "progress/optimizer_step": 3, "progress/phase": "main"}) + "\n")
+    accepted, explicit_steps, definitions = [], [], []
+    class StaleRun:
+        id = "existing-run"
+        url = "https://wandb.example/project/runs/existing-run"
+        step = 0  # Observed W&B resume state despite the server's later history.
+        server_next_step = 1404
+        def log(self, values, **kwargs):
+            explicit_steps.append(kwargs.get("step"))
+            offered_step = kwargs.get("step", self.server_next_step)
+            if offered_step < self.server_next_step:
+                return  # W&B drops stale explicit history steps.
+            accepted.append((offered_step, dict(values)))
+            self.server_next_step = offered_step + 1
+        def define_metric(self, name, **kwargs):
+            definitions.append((name, kwargs))
+        def finish(self, exit_code):
+            pass
+    run = StaleRun()
+    sdk = SimpleNamespace(init=lambda **kwargs: run)
+    logger = RunLogger(tmp_path, rank=0, config={"seed": 17}, run_id=run.id, sdk=sdk)
+    logger.log({"main/loss": .8, "progress/optimizer_step": 4, "progress/phase": "main"}, step=204)
+    logger.log({"progress/status": "stopped"}, step=1403)
+    logger.finish()
+    assert len(accepted) == 2 and explicit_steps == [None, None]
+    assert accepted[0][1]["progress/optimizer_step"] == 4
+    assert accepted[0][1]["progress/logical_step"] == 204
+    assert [step for step, _ in accepted] == [1404, 1405]
+    local = [json.loads(line) for line in (tmp_path / "progress.jsonl").read_text().splitlines()]
+    assert [row["step"] for row in local] == [1403, 1404, 1405]
+    assert ("*", {"step_metric": "progress/logical_step", "step_sync": True}) in definitions
 
 
 def test_production_rejects_cpu_before_work(tmp_path):
