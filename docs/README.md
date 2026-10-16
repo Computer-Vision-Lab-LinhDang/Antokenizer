@@ -5,6 +5,7 @@
 - [Design plan](plans/mavt-hybrid-v2-design.md): architecture, state contract, update equations and implementation scope.
 - [Interactive architecture](architecture/mavt-hybrid-v2.html) · [diagram source](architecture/mavt-hybrid-v2.json): code-backed data flow pinned to the reference implementation. Download the HTML and open it in a browser; the GitHub file view does not render the interactive diagram.
 - [Benchmark protocol](benchmarks/mavt-hybrid-v2-protocol.md): event-history tests for C, configuration tests for D, cache interventions and prerequisites for training.
+- [Proposed paper benchmark tables](benchmarks/mavt-paper-benchmark-tables.md): five main comparisons and three ablation groups, with unmeasured results explicitly left blank.
 - [Reference API](reference_hybrid_cd_model.md): snapshot/restart, causal execution, missing observations and tile decoding.
 - [Architecture preset](../configs/mavt4d/hybrid_cd2_kv_v2.json).
 
