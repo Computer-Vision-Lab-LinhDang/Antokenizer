@@ -1,15 +1,15 @@
 # Data contract — MAVT chặng 1 (cổng G1)
 
-**Phiên bản:** v1, 15/10/2026. **Phạm vi:** dữ liệu đang có trên DGX (`~/edtech/antoken`) và kim.long (lịch sử, không còn dùng).
+**Phiên bản:** v1, 15/10/2026. **Phạm vi:** contract cho các nguồn dữ liệu MAVT. Tình trạng hiện diện bên dưới là bản kiểm ngày 15/10/2026, không phải inventory hiện tại của một môi trường triển khai.
 Mỗi nguồn ghi rõ bằng chứng nào là nhãn thật, nhãn giả, hay không có. Thiếu nhãn là mask `False`, không bao giờ là giá trị 0. Thiếu hành động khác hành động bằng 0.
 
 ## Nguồn và bằng chứng
 
-| Nguồn | Tầng · modality | Nhãn thật | Nhãn giả (ai tạo) | Không có → mask | Đơn vị · scale | Thời gian | Khoá split | Trên DGX |
+| Nguồn | Tầng · modality | Nhãn thật | Nhãn giả (ai tạo) | Không có → mask | Đơn vị · scale | Thời gian | Khoá split | Bản kiểm 15/10/2026 |
 |---|---|---|---|---|---|---|---|---|
 | Open Images V7 train shard 1–2 | C · ảnh | – | – | camera, hình học, chuyển động | pixel, không metric | – | `img:<image id>` (tên file) | đang giải nén, manifest `openimages_v2.jsonl` |
 | OpenVid-1M part 0 + 100 | B · video | – | caption, `aesthetic`, `motion`, `temporal_consistency`, `camera_motion` (tác giả OpenVid); track RAFT (dự kiến, Plan T14) | intrinsics, pose, depth | pixel, không metric | `fps`, `frames`, `duration` từ file; cửa sổ 16 frame, stride 2 | nguồn video: `yt:<id>`, `tt:<id>`, `<site>:<id>`; tên lạ → `clip:<stem>` | 35.117 clip, manifest `openvid_v2.jsonl` |
-| Objaverse-LVIS triplane | asset 3D | – | caption Cap3D (31.669), còn lại tên lớp LVIS | depth, normal, view giữ riêng (GLB đã xoá) | chuẩn hoá khối đơn vị, **không cùng đơn vị với cảnh metric** | – | `obj:<uid>` | không có (chỉ ở kim.long) |
+| Objaverse-LVIS triplane | asset 3D | – | caption Cap3D (31.669), còn lại tên lớp LVIS | depth, normal, view giữ riêng (GLB không kèm bản triplane) | chuẩn hoá khối đơn vị, **không cùng đơn vị với cảnh metric** | – | `obj:<uid>` | chưa có trong bản kiểm này |
 | nuScenes v1.0 (mini, keyframe trainval 01–10) | A · video đa camera + LiDAR | 6 camera, intrinsics, pose ego theo từng camera, LiDAR, box 3D có `instance_id` | – | sweep 12 Hz (chỉ có ở mini) | mét; gốc thế giới = khung ego tại frame tham chiếu (Plan §1.7) | timestamp µs; keyframe 2 Hz | scene chính thức train/val; điểm LiDAR giữ riêng theo `sha1(source/lidar_key)` (Plan T7) | có |
 | OmniWorld-Game @ 4e34897 (7/479 cảnh, 8,4 GB) | B · video 1280×720, 24/30 fps, cảnh game | – | depth, pose camera (OpenCV world-to-camera), flow tiến, mask tiền cảnh và mask động, caption: nhãn do OmniWorld tạo, không phải log của engine; 183/479 cảnh không có flow | LiDAR, box, instance | đơn vị cảnh × `Metric Scale` trong metadata ≈ mét (depth trung vị đo được 7,5–20 m) | `split_info.json`: cảnh cắt thành split liên tục; `Test Split Index` của tác giả | theo cảnh (`uid`); không trộn split của một cảnh qua hai phía | có, `data/datasets/omniworld` |
 | Imagenette2-320 val | chỉ đánh giá | nhãn lớp | – | – | pixel | – | tập ngoài | có |

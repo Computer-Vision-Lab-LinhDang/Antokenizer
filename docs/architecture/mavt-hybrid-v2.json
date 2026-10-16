@@ -1,0 +1,477 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "MAVT Hybrid v2 — reference đã triển khai; chưa train",
+    "output": "docs/architecture/mavt-hybrid-v2.html",
+    "locale": "vi",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Computer-Vision-Lab-LinhDang/Antokenizer.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "20330de9afe278abee5694a2de65b1068ba95305"
+    }
+  },
+  "stages": [
+    {
+      "label": "Quan sát hiện tại"
+    },
+    {
+      "label": "Temporal attention 1"
+    },
+    {
+      "label": "C/D scan 1"
+    },
+    {
+      "label": "Attention + scan 2"
+    },
+    {
+      "label": "Giải mã & cache"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "input",
+      "type": "frontend",
+      "label": "Masked tubelet",
+      "sublabel": "2 frames; availability + time",
+      "stage": 0,
+      "row": 0,
+      "sources": [
+        {
+          "path": "src/mavt4d/contracts.py",
+          "line": 253,
+          "end_line": 317,
+          "label": "RGB, availability, time, geometry"
+        }
+      ]
+    },
+    {
+      "id": "patch",
+      "type": "backend",
+      "label": "Shared Patchify",
+      "sublabel": "2 x 16 x 16 -> width 384",
+      "stage": 0,
+      "row": 2,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/observation.py",
+          "line": 178,
+          "end_line": 217,
+          "label": "Mask before shared projection"
+        }
+      ]
+    },
+    {
+      "id": "spatial",
+      "type": "backend",
+      "label": "8 spatial blocks",
+      "sublabel": "384 wide; 6 heads; no cache",
+      "stage": 0,
+      "row": 4,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/observation.py",
+          "line": 41,
+          "end_line": 100,
+          "label": "Local and global spatial attention"
+        },
+        {
+          "path": "src/mavt4d/hybrid/observation.py",
+          "line": 127,
+          "end_line": 137,
+          "label": "Eight configured blocks"
+        }
+      ]
+    },
+    {
+      "id": "pool",
+      "type": "backend",
+      "label": "16 evidence slots",
+      "sublabel": "Fixed-query pool -> 16 x 256",
+      "stage": 1,
+      "row": 4,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/observation.py",
+          "line": 218,
+          "end_line": 226,
+          "label": "Fixed-query pooling"
+        }
+      ]
+    },
+    {
+      "id": "kv1",
+      "type": "database",
+      "label": "KV1 ring",
+      "sublabel": "16 steps x 16 tokens; 64 KiB",
+      "stage": 1,
+      "row": 0,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/state.py",
+          "line": 134,
+          "end_line": 202,
+          "label": "Explicit KV ring allocation"
+        },
+        {
+          "path": "src/mavt4d/hybrid/model.py",
+          "line": 164,
+          "end_line": 188,
+          "label": "Accepted-step ring update"
+        }
+      ]
+    },
+    {
+      "id": "attn1",
+      "type": "backend",
+      "label": "GQA 1",
+      "sublabel": "256 wide; 8 Q / 2 KV heads",
+      "stage": 1,
+      "row": 2,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/attention.py",
+          "line": 80,
+          "end_line": 140,
+          "label": "BF16 causal GQA reads"
+        },
+        {
+          "path": "src/mavt4d/hybrid/model.py",
+          "line": 150,
+          "end_line": 154,
+          "label": "Stage one call path"
+        }
+      ]
+    },
+    {
+      "id": "query",
+      "type": "frontend",
+      "label": "Coords / view",
+      "sublabel": "Query tai state da rollout",
+      "stage": 2,
+      "row": 0,
+      "sources": [
+        {
+          "path": "src/mavt4d/contracts.py",
+          "line": 320,
+          "end_line": 355,
+          "label": "Query coordinates and view identity"
+        }
+      ]
+    },
+    {
+      "id": "scan1",
+      "type": "backend",
+      "label": "C/D scan 1",
+      "sublabel": "C1,D1: each 32 x 32; affine",
+      "stage": 2,
+      "row": 2,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/cells.py",
+          "line": 34,
+          "end_line": 109,
+          "label": "Coupled coefficients and affine scan"
+        }
+      ]
+    },
+    {
+      "id": "mixer",
+      "type": "backend",
+      "label": "Current readout",
+      "sublabel": "Mix evidence + C1,D1 at t",
+      "stage": 2,
+      "row": 4,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/cells.py",
+          "line": 112,
+          "end_line": 140,
+          "label": "Current lower-state readout"
+        }
+      ]
+    },
+    {
+      "id": "attn2",
+      "type": "backend",
+      "label": "GQA 2",
+      "sublabel": "256 wide; 8 Q / 2 KV heads",
+      "stage": 3,
+      "row": 4,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/attention.py",
+          "line": 80,
+          "end_line": 140,
+          "label": "BF16 causal GQA reads"
+        },
+        {
+          "path": "src/mavt4d/hybrid/model.py",
+          "line": 154,
+          "end_line": 158,
+          "label": "Stage two call path"
+        }
+      ]
+    },
+    {
+      "id": "scan2",
+      "type": "backend",
+      "label": "C/D scan 2",
+      "sublabel": "C2,D2: each 32 x 32; affine",
+      "stage": 3,
+      "row": 2,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/cells.py",
+          "line": 34,
+          "end_line": 109,
+          "label": "Coupled coefficients and affine scan"
+        },
+        {
+          "path": "src/mavt4d/hybrid/model.py",
+          "line": 155,
+          "end_line": 160,
+          "label": "Second stage carry"
+        }
+      ]
+    },
+    {
+      "id": "code",
+      "type": "backend",
+      "label": "Read C/D code",
+      "sublabel": "All 4 state banks; 4096 FP32",
+      "stage": 3,
+      "row": 0,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/state.py",
+          "line": 110,
+          "end_line": 130,
+          "label": "C/D-only readout contract"
+        },
+        {
+          "path": "src/mavt4d/hybrid/state.py",
+          "line": 273,
+          "end_line": 276,
+          "label": "Extract code without KV"
+        }
+      ]
+    },
+    {
+      "id": "decoder",
+      "type": "backend",
+      "label": "4 decoder blocks",
+      "sublabel": "C values; D bottleneck 16",
+      "stage": 4,
+      "row": 0,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/decoder.py",
+          "line": 72,
+          "end_line": 130,
+          "label": "C values and bounded D modulation"
+        },
+        {
+          "path": "src/mavt4d/hybrid/decoder.py",
+          "line": 177,
+          "end_line": 193,
+          "label": "C-only tile content"
+        }
+      ]
+    },
+    {
+      "id": "rgb",
+      "type": "frontend",
+      "label": "Patch -> RGB",
+      "sublabel": "8 x 8 tile; 256 -> 192 head",
+      "stage": 4,
+      "row": 2,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/decoder.py",
+          "line": 30,
+          "end_line": 69,
+          "label": "Tile mapping and image assembly"
+        },
+        {
+          "path": "src/mavt4d/hybrid/decoder.py",
+          "line": 177,
+          "end_line": 234,
+          "label": "Tile, pixel and render APIs"
+        }
+      ]
+    },
+    {
+      "id": "kv2",
+      "type": "database",
+      "label": "KV2 ring",
+      "sublabel": "16 steps x 16 tokens; 64 KiB",
+      "stage": 4,
+      "row": 4,
+      "sources": [
+        {
+          "path": "src/mavt4d/hybrid/state.py",
+          "line": 134,
+          "end_line": 202,
+          "label": "Explicit KV ring allocation"
+        },
+        {
+          "path": "src/mavt4d/hybrid/model.py",
+          "line": 164,
+          "end_line": 188,
+          "label": "Accepted-step ring update"
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "from": "input",
+      "to": "patch",
+      "label": "mask truoc",
+      "variant": "emphasis"
+    },
+    {
+      "from": "patch",
+      "to": "spatial",
+      "label": "patch tokens",
+      "variant": "emphasis"
+    },
+    {
+      "from": "spatial",
+      "to": "pool",
+      "label": "current features",
+      "variant": "emphasis"
+    },
+    {
+      "from": "pool",
+      "to": "attn1",
+      "label": "16 x 256",
+      "variant": "emphasis"
+    },
+    {
+      "from": "kv1",
+      "to": "attn1",
+      "label": "doc qua khu"
+    },
+    {
+      "from": "attn1",
+      "to": "kv1",
+      "label": "ghi K/V input"
+    },
+    {
+      "from": "attn1",
+      "to": "scan1",
+      "label": "he so A1,b1",
+      "variant": "emphasis"
+    },
+    {
+      "from": "scan1",
+      "to": "mixer",
+      "label": "C1,D1",
+      "variant": "emphasis"
+    },
+    {
+      "from": "attn1",
+      "to": "mixer",
+      "label": "current input"
+    },
+    {
+      "from": "mixer",
+      "to": "attn2",
+      "label": "16 x 256",
+      "variant": "emphasis"
+    },
+    {
+      "from": "kv2",
+      "to": "attn2",
+      "label": "doc qua khu"
+    },
+    {
+      "from": "attn2",
+      "to": "kv2",
+      "label": "ghi K/V input"
+    },
+    {
+      "from": "attn2",
+      "to": "scan2",
+      "label": "he so A2,b2",
+      "variant": "emphasis"
+    },
+    {
+      "from": "scan1",
+      "to": "code",
+      "label": "C1,D1"
+    },
+    {
+      "from": "scan2",
+      "to": "code",
+      "label": "C2,D2",
+      "variant": "emphasis"
+    },
+    {
+      "from": "code",
+      "to": "decoder",
+      "label": "C,D",
+      "variant": "emphasis"
+    },
+    {
+      "from": "query",
+      "to": "decoder",
+      "label": "coords + view"
+    },
+    {
+      "from": "decoder",
+      "to": "rgb",
+      "label": "C content only",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Reference v2 đã qua kiểm kỹ thuật; chưa train",
+      "items": [
+        "83 hybrid tests và tổng 576 regression tests CPU qua; đã loại các test có optimizer steps.",
+        "Restart từ C/D + KV + metadata trong process mới; causality và full/chunk/step/scan parity đã kiểm.",
+        "Config hash bao gồm feedback; camera row ID cố định khớp DecoderQuery.view_ids.",
+        "Reference v1 và protocol pilot giữ nguyên. Chưa có bằng chứng C/D học được event/configuration."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Toàn bộ state phải xuất để restart",
+      "items": [
+        "S = C1,D1,C2,D2 + K1,V1,K2,V2 + metadata; C/D riêng chỉ là mã decoder.",
+        "C/D: 16 KiB FP32. Hai KV: 128 KiB BF16. Metadata tensor: 800 byte.",
+        "Tổng tensor mỗi stream: 148.256 byte = 144,78125 KiB; cộng header 68 byte và overhead serialization.",
+        "KV mỗi tầng: 16 bước gồm bước hiện tại, 16 token/bước; ring được già hóa khi mất snapshot."
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Scan song song theo tầng",
+      "items": [
+        "Mỗi cặp C/D cập nhật s_t = A_t s_(t-1) + b_t bằng block 2x2, có C→D và D→C.",
+        "Hệ số chỉ đọc input tầng hiện tại; không dùng state trước của chính tầng để tính gate.",
+        "Tính attention 1 → scan 1 → mixer → attention 2 → scan 2; không phải một scan cho toàn network.",
+        "Mixer nhận cả input và C1,D1 hiện tại; nonlinear readout không ghi đè state affine.",
+        "Reference scan là đại số song song theo tầng; window gather và trả T snapshots chưa phải kernel tuyến tính tối ưu."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Decoder và bằng chứng event",
+      "items": [
+        "4 query cross-attention block, width 256, 8 heads, FFN 1024; không đọc KV hay ảnh gốc.",
+        "Mỗi query trả tile RGB 8x8: ảnh 256x256 dùng 1024 queries. Head 256→192 và reshape không overlap.",
+        "64 C tokens cấp content values; D qua bottleneck 16 chỉ đổi routing/gain. C=0 ⇒ RGB=0.",
+        "C-only matched-suffix, lag 64 và can thiệp KV: protocol đánh giá kế tiếp; chưa chạy.",
+        "D→configuration và counterfactual: chưa đo; rollout cùng cell phải chạy trước query tương lai.",
+        "Nội dung sơ đồ bằng tiếng Việt; các nút điều khiển Viewer dùng bản tiếng Anh dự phòng."
+      ]
+    }
+  ]
+}

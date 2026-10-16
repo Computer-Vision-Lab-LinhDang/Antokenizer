@@ -4,6 +4,8 @@ This module implements a two-stage causal hybrid with explicit recurrent state.
 It is a correctness reference, not a trained model or an optimized Mamba kernel.
 The existing `mavt4d.reference` model and synthetic pilot v1 are unchanged.
 
+Related documents: [design plan](plans/mavt-hybrid-v2-design.md), [architecture](architecture/mavt-hybrid-v2.html), and [benchmark protocol](benchmarks/mavt-hybrid-v2-protocol.md).
+
 ## Configuration and data flow
 
 `configs/mavt4d/hybrid_cd2_kv_v2.json` contains the default architecture. Load it

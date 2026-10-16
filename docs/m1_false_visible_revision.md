@@ -125,4 +125,4 @@ python scripts/mavt4d/calibrate_false_visible.py --out results/e1_1
 PYTHONPATH=src python scripts/mavt4d/check_nuscenes.py --dataroot $NUSC --version v1.0-mini --out results/e1_1
 ```
 
-Lệnh đầu chạy được trên CPU, khoảng 1 phút. Lệnh thứ hai chạy trên headnode DGX, khoảng 11 phút với 8 worker.
+Lệnh đầu đã được đo trên CPU, khoảng 1 phút. Lệnh thứ hai khoảng 11 phút với 8 worker; thời gian thực tế phụ thuộc môi trường chạy.
