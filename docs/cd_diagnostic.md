@@ -20,6 +20,10 @@ slightly. Three mechanisms need distinguishing before extending training:
 3. Whole-image L1 is dominated by static background. A small **error difference**
    after swapping D does not alone imply small **prediction change**, nor prove
    that D has no effect on moving objects. Report both explicitly.
+4. The frozen objective supervises ordered history through C but has no D-only
+   configuration loss or counterfactual swap constraint. C may retain
+   configuration, and reconstruction may use little D. Increasing D sensitivity
+   does not by itself make the intended C/D factorization identifiable.
 
 The labels used below arrange diagnostic pairs only. They never enter the model
 or any optimization loss. No held-out source is used for tuning or arm selection.
@@ -98,3 +102,37 @@ Interpret relative improvements against the matched baseline and measured
 gradients. A larger D prediction change alone is not success: it must also help
 the paired configuration target without destroying reconstruction. A faster tiny
 history fit does not establish useful event semantics or long-term memory.
+
+## Subsequent two-GPU run
+
+`run_hybrid_cd_longrun.py` requires an explicit reviewed arm. It never selects an
+arm automatically from the diagnostic or launches from a previous run. Start
+fresh from the canonical seed, applying only the selected arm's intervention.
+The original six-component objective and train/dev source split stay fixed.
+
+The separate long-run lock uses two DDP ranks, one source group per rank, thus
+16 clips per optimizer update. The base budget is 10,000 updates. At a completed
+budget boundary it may extend to 15,000 and then 20,000 only when measured update
+time plus amortized dev/checkpoint time, with a 15% margin, fits before the
+optimization cutoff. Extension decisions never inspect losses or quality.
+
+This changes effective batch size from the original pilot's 256 clips. Therefore
+10,000 updates means 160,000 clip presentations, compared with 307,200 during
+the original 1,200-update main phase; 20,000 updates means 320,000 presentations.
+More updates alone must not be described as more total data exposure or as a
+controlled matched-budget comparison to the original pilot.
+
+Every 200 updates, evaluate the **complete fixed dev partition**, with fixed
+source-specific mask and augmentation seeds and equal source weighting. Select
+`best.pt` by the unchanged weighted dev objective; report history and
+reconstruction components alongside it. Both ranks contribute their RNG state to
+the atomic best checkpoint. The checkpoint's model/optimizer step can be earlier
+than the final training step. Only this final selected artifact is sent to W&B.
+Training curves log every ten updates, and small fixed-source inference panels
+log at initialization, every 1,000 updates, and finalization when time permits.
+
+There is no held-out evaluation or retuning interface in this run. The same
+optimizer/work/external hard deadlines apply. A partial result records its actual
+step and most recent complete dev evaluation. Board utilization/power counters
+are filtered to the explicitly assigned physical GPU IDs and are snapshots,
+not integrated energy measurements; unavailable counters are not zero-filled.
