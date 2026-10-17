@@ -120,7 +120,8 @@ def save_checkpoint(path, model, optimizer, *, step, config, extra):
         "python": random.getstate(),
         "numpy": np.random.get_state(),
     }
-    if torch.cuda.is_available():
+    # CPU checkpoints must not enumerate or initialize an accelerator runtime.
+    if torch.cuda.is_initialized():
         rng["cuda"] = torch.cuda.get_rng_state_all()
     payload = {
         "schema": 1,
@@ -150,8 +151,8 @@ def restore_checkpoint(path, model, optimizer, *, expected_config):
     random.setstate(payload["rng"]["python"])
     np.random.set_state(payload["rng"]["numpy"])
     if "cuda" in payload["rng"]:
-        if not torch.cuda.is_available():
-            raise ValueError("CUDA RNG cannot be restored on CPU")
+        if not torch.cuda.is_initialized():
+            raise ValueError("CUDA RNG restore requires an initialized CUDA runtime")
         torch.cuda.set_rng_state_all(payload["rng"]["cuda"])
     return payload
 

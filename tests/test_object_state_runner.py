@@ -295,12 +295,40 @@ def test_cpu_checkpoint_resume_replays_optimizer_and_sampled_rays_exactly(tmp_pa
         torch.testing.assert_close(value, resumed.state_dict()[name], rtol=0, atol=0)
 
 
-def test_full_cpu_runner_writes_checkpoints_images_and_full_frame_counts(tmp_path):
+def test_full_cpu_runner_writes_checkpoints_images_and_full_frame_counts(
+    tmp_path, monkeypatch
+):
     import json
     from datetime import datetime, timedelta, timezone
     from mavt4d.object_state.model import ObjectStateModel
     from mavt4d.object_state.data import FactorialSceneDataset
     from mavt4d.object_state.runner import RunLogger, RuntimeConfig, run_training
+    from mavt4d.object_state import runner as runner_module
+
+    events = []
+    original_update, original_save, original_eval = (
+        runner_module.run_update,
+        runner_module.save_checkpoint,
+        runner_module.evaluate,
+    )
+
+    def update(*args, **kwargs):
+        result = original_update(*args, **kwargs)
+        events.append("update_completed")
+        return result
+
+    def save(*args, **kwargs):
+        result = original_save(*args, **kwargs)
+        events.append("checkpoint_finalized")
+        return result
+
+    def evaluation(*args, **kwargs):
+        events.append("evaluation_started")
+        return original_eval(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "run_update", update)
+    monkeypatch.setattr(runner_module, "save_checkpoint", save)
+    monkeypatch.setattr(runner_module, "evaluate", evaluation)
 
     architecture, config, scene = _tiny()
     now = datetime.now(timezone.utc)
@@ -309,6 +337,8 @@ def test_full_cpu_runner_writes_checkpoints_images_and_full_frame_counts(tmp_pat
         train_until=(now + timedelta(minutes=5)).isoformat(),
         eval_until=(now + timedelta(minutes=6)).isoformat(),
         hard_stop=(now + timedelta(minutes=7)).isoformat(),
+        eval_every=1,
+        save_every_seconds=0,
     )
     runtime = RuntimeConfig(eval_sources=1, periodic_eval_sources=1, eval_rays=8)
     model = ObjectStateModel(architecture)
@@ -332,6 +362,7 @@ def test_full_cpu_runner_writes_checkpoints_images_and_full_frame_counts(tmp_pat
         config_payload=contract,
     )
     assert summary["updates"] == 1 and summary["source_cursor"] == 1
+    assert events[events.index("update_completed") + 1] == "checkpoint_finalized"
     assert summary["final_evaluation_complete"]
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert (tmp_path / latest["checkpoint"]).exists()
@@ -341,3 +372,37 @@ def test_full_cpu_runner_writes_checkpoints_images_and_full_frame_counts(tmp_pat
     assert result["frames_completed"] == result["frames_expected"] == 16
     assert result["metrics"]["future/model"]["rays"] == 8 * 2 * 16 * 32
     assert list((tmp_path / "visuals").glob("*.png"))
+
+
+def test_final_evaluation_budget_is_bounded_by_runtime_and_absolute_cutoff():
+    from mavt4d.object_state.runner import RuntimeConfig, final_evaluation_deadline
+    from mavt4d.object_state.training import Deadline
+
+    _, config, _ = _tiny()
+    deadline = Deadline(config, clock=lambda: 1000.0)
+    deadline.evaluate = 4000.0
+    runtime = RuntimeConfig(final_eval_seconds=600.0)
+    assert final_evaluation_deadline(deadline, runtime) == 1600.0
+    deadline.evaluate = 1300.0
+    assert final_evaluation_deadline(deadline, runtime) == 1300.0
+    with pytest.raises(ValueError):
+        RuntimeConfig(final_eval_seconds=0.0)
+
+
+def test_cpu_rng_and_loader_never_probe_cuda_availability(monkeypatch):
+    from mavt4d.object_state.runner import _loader, _rng_state, _restore_rng
+
+    def forbidden():
+        raise AssertionError("CPU primitives must not enumerate CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", forbidden)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    state = _rng_state()
+    assert "cuda" not in state
+    _restore_rng(state)
+    _, config, _ = _tiny()
+    loader = _loader([torch.zeros(1)], config, cursor=0, updates=1, micro_groups=1)
+    assert not loader.pin_memory
+    torch.testing.assert_close(next(iter(loader)), torch.zeros(1, 1))
+    with pytest.raises(ValueError, match="initialized CUDA"):
+        _restore_rng({**state, "cuda": [torch.zeros(1, dtype=torch.uint8)]})

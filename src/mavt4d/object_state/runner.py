@@ -46,6 +46,7 @@ class RuntimeConfig:
     periodic_eval_sources: int = 2
     eval_rays: int = 256
     periodic_eval_seconds: float = 180.0
+    final_eval_seconds: float = 600.0
     run_name: str = "MAVT-object-state-full"
     project: str = "semantic-router"
     capacity_fraction: float = 0.9
@@ -56,10 +57,18 @@ class RuntimeConfig:
             for value in (self.eval_sources, self.periodic_eval_sources, self.eval_rays)
         ):
             raise ValueError("evaluation counts must be positive integers")
-        if not 0 < self.capacity_fraction <= 0.9 or self.periodic_eval_seconds <= 0:
+        if not 0 < self.capacity_fraction <= 0.9 or any(
+            not math.isfinite(value) or value <= 0
+            for value in (self.periodic_eval_seconds, self.final_eval_seconds)
+        ):
             raise ValueError(
                 "capacity must leave at least 10% VRAM and evaluation needs a deadline"
             )
+
+
+def final_evaluation_deadline(deadline: Deadline, runtime: RuntimeConfig) -> float:
+    """Reserve remaining evaluation time for callers' external benchmarks."""
+    return min(deadline.evaluate, deadline.clock() + runtime.final_eval_seconds)
 
 
 class SourceBatchSampler(Sampler[list[int]]):
@@ -248,7 +257,7 @@ def _rng_state():
         "numpy": np.random.get_state(),
         "python": random.getstate(),
     }
-    if torch.cuda.is_available():
+    if torch.cuda.is_initialized():
         result["cuda"] = torch.cuda.get_rng_state_all()
     return result
 
@@ -258,6 +267,8 @@ def _restore_rng(state):
     np.random.set_state(state["numpy"])
     random.setstate(state["python"])
     if "cuda" in state:
+        if not torch.cuda.is_initialized():
+            raise ValueError("CUDA RNG restore requires an initialized CUDA runtime")
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
@@ -544,7 +555,7 @@ def _loader(dataset, config, *, cursor, updates, micro_groups):
         )
     options = {
         "num_workers": workers,
-        "pin_memory": torch.cuda.is_available(),
+        "pin_memory": torch.cuda.is_initialized(),
         "generator": torch.Generator().manual_seed(config.seed + 991),
     }
     if workers:
@@ -665,19 +676,22 @@ def run_training(
         )
         step += 1
         consumed_cursor += config.effective_groups
+        # With save_every_seconds=0 every completed update is durable before
+        # logging or evaluation can block or be interrupted.
+        if time.monotonic() - last_checkpoint_time >= config.save_every_seconds:
+            snapshot("periodic")
+            last_checkpoint_time = time.monotonic()
         estimated_update = max(estimated_update * 0.8, metrics["update_seconds"] * 1.2)
         logger.log({"train/" + key: value for key, value in metrics.items()}, step=step)
         if step % config.eval_every == 0 and deadline.can_train(
             runtime.periodic_eval_seconds
         ):
             periodic("dev_sampled")
-        if time.monotonic() - last_checkpoint_time >= config.save_every_seconds:
-            snapshot("periodic")
-            last_checkpoint_time = time.monotonic()
     final_checkpoint = snapshot("final")
     # Workers may have prefetched deterministic indices. Resume stores only the
     # consumed cursor; queued work does not enter a checkpoint or a next run.
     del batches, loader
+    final_end = final_evaluation_deadline(deadline, runtime)
     result = evaluate(
         model,
         datasets["test"],
@@ -685,9 +699,11 @@ def run_training(
         source_limit=runtime.eval_sources,
         rays=None,
         seed=config.seed + 9000,
-        deadline=lambda: deadline.can_evaluate(),
+        deadline=lambda: deadline.clock() < final_end,
         visuals=True,
     )
+    result["budget_seconds"] = runtime.final_eval_seconds
+    result["deadline_utc_unix"] = final_end
     final_eval = _record_evaluation(
         result, output=output, logger=logger, step=step, phase="final_test_full_frame"
     )
@@ -866,6 +882,8 @@ def main(argv=None):
             restored = restore_checkpoint(
                 args.checkpoint, model, optimizer, expected_config=payload
             )
+            eval_clock = Deadline(config)
+            final_end = final_evaluation_deadline(eval_clock, runtime)
             result = evaluate(
                 model,
                 datasets["test"],
@@ -873,9 +891,11 @@ def main(argv=None):
                 source_limit=runtime.eval_sources,
                 rays=None,
                 seed=config.seed + 9000,
-                deadline=Deadline(config).can_evaluate,
+                deadline=lambda: eval_clock.clock() < final_end,
                 visuals=True,
             )
+            result["budget_seconds"] = runtime.final_eval_seconds
+            result["deadline_utc_unix"] = final_end
             result = _record_evaluation(
                 result,
                 output=args.output,

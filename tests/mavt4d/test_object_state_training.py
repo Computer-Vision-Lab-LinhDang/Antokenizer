@@ -63,6 +63,26 @@ def test_checkpoint_restarts_optimizer_and_rng(tmp_path):
         save_checkpoint(path, model, opt, step=2, config={}, extra={})
 
 
+def test_cpu_checkpoint_never_probes_cuda_availability(tmp_path, monkeypatch):
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+
+    def forbidden():
+        raise AssertionError("CPU checkpoint must not enumerate CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", forbidden)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    path = tmp_path / "cpu.pt"
+    save_checkpoint(path, model, optimizer, step=0, config={}, extra={})
+    result = restore_checkpoint(path, model, optimizer, expected_config={})
+    assert "cuda" not in result["rng"]
+    result["rng"]["cuda"] = [torch.zeros(1, dtype=torch.uint8)]
+    gpu_path = tmp_path / "cuda-state.pt"
+    torch.save(result, gpu_path)
+    with pytest.raises(ValueError, match="initialized CUDA"):
+        restore_checkpoint(gpu_path, model, optimizer, expected_config={})
+
+
 def test_production_defaults_are_full_architecture_and_online():
     cfg = TrainingConfig()
     assert cfg.wandb_online
@@ -237,6 +257,6 @@ def test_future_pose_keeps_prefix_identity_assignment():
         torch.tensor([[0, 1]]),
         torch.ones(1, 2, dtype=torch.bool),
     )
-    assert float(loss) == pytest.approx(2 / 3)
+    assert float(loss.detach()) == pytest.approx(2 / 3)
     loss.backward()
     assert reversed_slots.grad.abs().sum() > 0
