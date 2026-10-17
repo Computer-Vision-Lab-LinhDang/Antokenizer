@@ -17,9 +17,16 @@ def main():
     parser.add_argument("--git-revision", required=True)
     parser.add_argument("--microbatch-groups", type=int, default=1)
     parser.add_argument("--capacity-only", action="store_true")
+    parser.add_argument(
+        "--initial-checkpoint",
+        type=Path,
+        help="Trusted best.pt for a new batch segment; preserves model/Adam/RNG, starts segment step0",
+    )
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--no-spatial-bf16", action="store_true")
     args = parser.parse_args()
+    if args.capacity_only and args.initial_checkpoint is not None:
+        parser.error("capacity probes must use disposable fresh models")
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
     from mavt4d.hybrid_pilot.config import HybridPilotConfig
     from mavt4d.hybrid_pilot.runner import parse_utc
@@ -47,6 +54,7 @@ def main():
             **common,
             git_revision=args.git_revision,
             microbatch_groups=args.microbatch_groups,
+            initial_checkpoint=args.initial_checkpoint,
         )
     print(json.dumps(result, sort_keys=True))
 

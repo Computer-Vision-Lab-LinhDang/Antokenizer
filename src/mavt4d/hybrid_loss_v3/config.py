@@ -23,7 +23,8 @@ class LossV3TrialConfig:
 
     def __post_init__(self):
         if (
-            self.version != "hybrid-cd-loss-v3-trial-v1"
+            self.version
+            not in ("hybrid-cd-loss-v3-trial-v1", "hybrid-cd-loss-v3-vram-trial-v1")
             or self.selection != "loss-v3-common-dev-v1"
         ):
             raise ValueError("unsupported loss v3 trial version")
@@ -50,8 +51,39 @@ class LossV3TrialConfig:
             raise ValueError(
                 "microbatch_candidates must be a nonempty increasing tuple"
             )
+        if self.capacity_policy == "largest_safe" and (
+            self.effective_source_groups != 64
+            or self.microbatch_candidates != (8, 16, 32, 64)
+            or self.capacity_warmup != 1
+            or self.capacity_repeats != 1
+            or self.memory_headroom != 0.1
+        ):
+            raise ValueError(
+                "VRAM profile freezes batch64, candidates8/16/32/64 and 10% headroom"
+            )
         for candidate in self.microbatch_candidates:
             self.accumulation(candidate)
+
+    @property
+    def capacity_policy(self):
+        return (
+            "largest_safe"
+            if self.version == "hybrid-cd-loss-v3-vram-trial-v1"
+            else "fastest_safe"
+        )
+
+    @property
+    def capacity_order(self):
+        if self.capacity_policy == "largest_safe":
+            return tuple(reversed(self.microbatch_candidates))
+        return self.microbatch_candidates
+
+    def validate_production(self):
+        required_groups = 64 if self.capacity_policy == "largest_safe" else 8
+        if self.effective_source_groups != required_groups:
+            raise ValueError(
+                f"production profile freezes {required_groups} effective source groups"
+            )
 
     def accumulation(self, microbatch_groups):
         if (

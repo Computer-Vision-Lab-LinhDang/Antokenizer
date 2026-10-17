@@ -1,0 +1,14 @@
+{
+  "version": "hybrid-cd-loss-v3-vram-trial-v1",
+  "seed": 17,
+  "steps": 1000,
+  "effective_source_groups": 64,
+  "microbatch_candidates": [8, 16, 32, 64],
+  "dev_every": 200,
+  "image_every": 200,
+  "log_every": 1,
+  "memory_headroom": 0.1,
+  "capacity_warmup": 1,
+  "capacity_repeats": 1,
+  "selection": "loss-v3-common-dev-v1"
+}

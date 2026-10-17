@@ -29,6 +29,176 @@ def test_config_locks_single_gpu_and_accumulation():
         replace(cfg, seed=29)
 
 
+def test_vram_profile_is_separate_and_immutable():
+    root = Path(__file__).resolve().parents[2]
+    original = LossV3TrialConfig.load(root / "configs/mavt4d/hybrid_loss_v3_trial.json")
+    cfg = LossV3TrialConfig.load(root / "configs/mavt4d/hybrid_loss_v3_vram_trial.json")
+    assert original.effective_source_groups == 8
+    assert cfg.version == "hybrid-cd-loss-v3-vram-trial-v1"
+    assert cfg.effective_source_groups == 64
+    assert cfg.microbatch_candidates == (8, 16, 32, 64)
+    assert (cfg.capacity_warmup, cfg.capacity_repeats) == (1, 1)
+    assert cfg.capacity_policy == "largest_safe"
+    assert original.capacity_policy == "fastest_safe"
+    assert cfg.capacity_order == (64, 32, 16, 8)
+    assert cfg.sha256 != original.sha256
+    with pytest.raises(ValueError, match="VRAM profile"):
+        replace(cfg, effective_source_groups=32)
+    with pytest.raises(ValueError, match="VRAM profile"):
+        replace(cfg, memory_headroom=0.05)
+
+
+def test_largest_capacity_chooses_memory_safe_not_fastest():
+    from mavt4d.hybrid_loss_v3.runner import choose_capacity
+
+    rows = [
+        dict(
+            microbatch_groups=8,
+            status="complete",
+            headroom_ok=True,
+            seconds_per_update=1.0,
+        ),
+        dict(
+            microbatch_groups=32,
+            status="complete",
+            headroom_ok=True,
+            seconds_per_update=3.0,
+        ),
+        dict(
+            microbatch_groups=64,
+            status="complete",
+            headroom_ok=False,
+            seconds_per_update=4.0,
+        ),
+    ]
+    assert choose_capacity(rows, policy="largest_safe") == 32
+    assert choose_capacity(rows) == 8
+
+
+def test_vram_capacity_attempts_descending_and_stops_first_safe(tmp_path, monkeypatch):
+    from test_hybrid_pilot_objectives import tiny_config
+    from mavt4d.hybrid_loss_v3 import runner
+
+    cfg = LossV3TrialConfig.load(
+        Path(__file__).resolve().parents[2]
+        / "configs/mavt4d/hybrid_loss_v3_vram_trial.json"
+    )
+
+    class Data:
+        train_groups = ("source",)
+
+    monkeypatch.setattr(runner, "HybridPilotDataset", lambda *args: Data())
+    monkeypatch.setattr(runner, "labels_for_dataset", lambda *args: {})
+    monkeypatch.setattr(
+        runner, "initialize", lambda *args, **kwargs: torch.nn.Linear(1, 1)
+    )
+    calls = []
+
+    def measure(module, optimizer, dataset, labels, schedule, microbatch, *args, phase):
+        calls.append((microbatch, phase))
+        if microbatch == 64:
+            raise torch.cuda.OutOfMemoryError("test allocation failure")
+        return {"loss": 1.0}
+
+    monkeypatch.setattr(runner, "optimization_step", measure)
+    now = datetime.now(timezone.utc)
+    result = runner.capacity_probe(
+        tiny_config(),
+        cfg,
+        tmp_path / "data",
+        tmp_path / "probe",
+        optimization_at=now + timedelta(minutes=5),
+        work_at=now + timedelta(minutes=10),
+        device="cpu",
+        allow_cpu=True,
+        spatial_bf16=False,
+    )
+    assert calls == [(64, "tiny"), (32, "tiny"), (32, "main")]
+    assert result["selected_microbatch"] == 32
+    assert result["records"][0]["status"] == "out_of_memory"
+    assert result["candidate_order"] == (64, 32, 16, 8)
+
+
+def test_checkpoint_segment_restores_optimizer_rng_and_private_lineage(tmp_path):
+    import random
+    import numpy as np
+    from mavt4d.hybrid_loss_v3.runner import initialize_from_checkpoint
+    from mavt4d.hybrid_pilot.runner import save_checkpoint
+    from mavt4d.hybrid_pilot.data import file_sha256
+
+    context = DistributedContext(0, 1, 0, torch.device("cpu"))
+    module = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(module.parameters())
+    module(torch.ones(2)).sum().backward()
+    optimizer.step()
+    lock = {
+        key: key
+        for key in (
+            "schema",
+            "arm",
+            "base_config",
+            "base_config_sha256",
+            "objective",
+            "dataset_sha256",
+            "manifest_sha256",
+            "partition_sha256",
+            "world_size",
+            "spatial_bf16",
+            "recurrent_decoder_dtype",
+            "held_out_evaluated",
+        )
+    }
+    metadata = {
+        **lock,
+        "phase": "loss-v3-B",
+        "selection_metric": "loss-v3-common-dev-v1",
+        "step": 200,
+        "next_step": 201,
+    }
+    checkpoint = tmp_path / "private-location.pt"
+    save_checkpoint(checkpoint, module, optimizer, metadata, context)
+    expected_rng = (torch.rand(2), random.random(), np.random.rand())
+    target = torch.nn.Linear(2, 1)
+    target_optimizer = torch.optim.AdamW(target.parameters())
+    lineage = initialize_from_checkpoint(
+        checkpoint, target, target_optimizer, context, lock
+    )
+    assert lineage == {
+        "kind": "new_batch_segment",
+        "parent_checkpoint_sha256": file_sha256(checkpoint),
+        "parent_step": 200,
+        "segment_start_step": 0,
+        "exact_resume": False,
+    }
+    assert str(tmp_path) not in json.dumps(lineage)
+    assert all(
+        torch.equal(a, b) for a, b in zip(module.parameters(), target.parameters())
+    )
+    assert (
+        target_optimizer.state_dict()["state"][0]["step"]
+        == optimizer.state_dict()["state"][0]["step"]
+    )
+    assert torch.equal(torch.rand(2), expected_rng[0])
+    assert random.random() == expected_rng[1] and np.random.rand() == expected_rng[2]
+    for key in (
+        "base_config_sha256",
+        "objective",
+        "dataset_sha256",
+        "manifest_sha256",
+        "partition_sha256",
+        "spatial_bf16",
+        "recurrent_decoder_dtype",
+    ):
+        with pytest.raises(ValueError, match=key):
+            initialize_from_checkpoint(
+                checkpoint,
+                target,
+                target_optimizer,
+                context,
+                {**lock, key: "different"},
+            )
+
+
 def test_production_rejects_extra_gpu_and_rank(monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "2")
     with pytest.raises(ValueError, match="one"):

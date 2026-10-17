@@ -4,7 +4,7 @@ The implementation uses the existing hybrid backbone/decoder and a separate
 `hybrid_loss_v3` objective/runner. The v2 configuration and previous results are
 unchanged. This is a seed-17 optimization check, not the four-arm paper result.
 
-## Frozen trial
+## Original frozen trial profile
 
 - [`hybrid_loss_v3_trial.json`](../../configs/mavt4d/hybrid_loss_v3_trial.json):
   1,000 maximum updates, eight source groups (64 clips) per update. The existing
@@ -29,7 +29,7 @@ output directory before the actual run. Supply `--base-config`, `--config`,
 `--stop-work-at`. Both deadlines must include an explicit timezone; the work
 cutoff must be later. The caller must enforce the allocated job's hard cutoff.
 
-Capacity uses disposable independently initialized models, one clean warmup
+For the original profile, capacity uses disposable independently initialized models, one clean warmup
 update and two timed complete effective main-mask updates per candidate. The
 clean warmup exercises all eligible pair renders, conservatively covering their
 memory cost; timing uses the same fixed step-1 source/mask schedule for all candidates. Capacity
@@ -40,8 +40,9 @@ training if no candidate completes. A different main-training mask mix can
 change measured throughput; report actual training throughput separately.
 
 Launch the actual trial in another fresh output directory with
-`--microbatch-groups` set to the selected value. It starts from the canonical
-seed-17 initialization, never from capacity/old trial weights. W&B project is
+`--microbatch-groups` set to the selected value. Without `--initial-checkpoint`,
+it starts from the canonical seed-17 initialization. Capacity weights are never
+used for training. W&B project is
 `semantic-router`, display name **semantic router**, with a fresh run ID. Secrets
 come only through the existing SDK environment/credential mechanism, never the
 scientific config or committed command examples.
@@ -55,6 +56,42 @@ may be renumbered inside the container; it is not a physical-device identity.
 Run child timeouts **inside** the container and bound PID1 by the original
 absolute hard deadline. A timeout on the Docker client alone does not ensure
 the workload stops, and restarting must not extend the allocation window.
+
+## Separate VRAM-oriented profile and checkpoint segment
+
+[`hybrid_loss_v3_vram_trial.json`](../../configs/mavt4d/hybrid_loss_v3_vram_trial.json)
+is a new immutable profile, `hybrid-cd-loss-v3-vram-trial-v1`. It increases the
+effective update to **64 source groups = 512 clips**. The original profile
+remains **8 groups = 64 clips**, selecting the fastest measured safe candidate;
+its config, previous logs and checkpoints are unchanged.
+
+The VRAM profile records candidates `[8,16,32,64]` groups but tests them in
+descending order **64 → 32 → 16 → 8**. It selects the largest complete candidate
+with **10% VRAM headroom**, then stops calibration at the first safe result.
+Headroom requires both peak reserved memory at most 90% of device capacity and
+available memory at least 10%. Incomplete, OOM or insufficient-headroom candidates
+cannot win. Accumulation is `64 / microbatch_groups`, preserving 512 clips per
+update. Each attempted candidate runs **one clean warmup update and one timed
+main-mask update**. Calibration remains disposable and bounded by the original
+deadlines; no completed safe candidate means no training launch. This is a
+largest-safe search within the declared candidate list, not a measured hardware
+maximum or a guarantee of higher throughput.
+
+For a new batch segment, pass `--initial-checkpoint` only to the actual trial,
+in a fresh output directory. The runner validates compatibility and restores
+module weights, AdamW state and rank RNG from that checkpoint. The new run lock
+records `parent_checkpoint_sha256`, `parent_step`, `segment_start_step=0` and
+`exact_resume=false`. The new segment's optimizer counter and step-indexed input
+schedule start at zero. This is **not an exact resume** of the old training
+trajectory. A best-only parent checkpoint can precede the parent's final step;
+report its actual step instead of claiming those later updates were retained.
+
+Keep the same W&B display name with a **new run ID** and retain the parent run.
+The scientific loss, backbone, decoder and dev-selection rule do not change.
+The larger effective batch and input exposure do change the optimization
+schedule: this segment is not a matched-budget cell of the planned 2×2 study.
+Log segment-local and parent checkpoint provenance separately. Calibration and
+restart do not reset or extend the original allocation deadline.
 
 ## Selection, evidence and stopping
 

@@ -22,6 +22,7 @@ from mavt4d.hybrid_pilot.runner import (
     DistributedContext,
     _write_json,
     require_finite_loss,
+    load_checkpoint,
     save_checkpoint,
     scheduled_step,
 )
@@ -84,6 +85,41 @@ def _optimizer(module, base):
         betas=base.betas,
         weight_decay=base.weight_decay,
     )
+
+
+def initialize_from_checkpoint(path, module, optimizer, context, lock):
+    """Start an explicit new batch segment, retaining model, Adam and rank RNG."""
+    expected = {
+        key: lock[key]
+        for key in (
+            "schema",
+            "arm",
+            "base_config",
+            "base_config_sha256",
+            "objective",
+            "dataset_sha256",
+            "manifest_sha256",
+            "partition_sha256",
+            "world_size",
+            "spatial_bf16",
+            "recurrent_decoder_dtype",
+            "held_out_evaluated",
+        )
+    }
+    expected.update(phase="loss-v3-B", selection_metric="loss-v3-common-dev-v1")
+    digest = file_sha256(path)
+    metadata = load_checkpoint(path, module, optimizer, context, expected=expected)
+    if type(metadata.get("step")) is not int or metadata["step"] < 0:
+        raise ValueError("checkpoint step must be a nonnegative optimizer boundary")
+    if file_sha256(path) != digest:
+        raise ValueError("checkpoint changed during initialization")
+    return {
+        "kind": "new_batch_segment",
+        "parent_checkpoint_sha256": digest,
+        "parent_step": metadata["step"],
+        "segment_start_step": 0,
+        "exact_resume": False,
+    }
 
 
 def _synchronize(device):
@@ -198,8 +234,8 @@ def capacity_probe(
 ):
     """Disposable models; each candidate measures complete effective updates."""
     context = validate_device(device, allow_cpu=allow_cpu)
-    if not allow_cpu and cfg.effective_source_groups != 8:
-        raise ValueError("production trial freezes eight effective source groups")
+    if not allow_cpu:
+        cfg.validate_production()
     deadlines = DeadlineController(optimization_at, work_at)
     if datetime.now(timezone.utc) >= optimization_at:
         raise ValueError("capacity optimization deadline has already passed")
@@ -218,7 +254,7 @@ def capacity_probe(
     records = []
     deadlines.install()
     try:
-        for microbatch in cfg.microbatch_candidates:
+        for microbatch in cfg.capacity_order:
             if deadlines.should_stop(context):
                 break
             module = optimizer = None
@@ -292,27 +328,42 @@ def capacity_probe(
                     "version": cfg.version,
                     "config_sha256": cfg.sha256,
                     "effective_source_groups": cfg.effective_source_groups,
+                    "capacity_policy": cfg.capacity_policy,
+                    "candidate_order": cfg.capacity_order,
                     "records": records,
-                    "selected_microbatch": choose_capacity(records),
+                    "selected_microbatch": choose_capacity(
+                        records, policy=cfg.capacity_policy
+                    ),
                     "held_out_evaluated": False,
                 },
             )
             print(json.dumps(record), flush=True)
+            if (
+                cfg.capacity_policy == "largest_safe"
+                and choose_capacity(records, policy=cfg.capacity_policy) is not None
+            ):
+                break
         return {
             "records": records,
-            "selected_microbatch": choose_capacity(records),
+            "selected_microbatch": choose_capacity(records, policy=cfg.capacity_policy),
+            "capacity_policy": cfg.capacity_policy,
+            "candidate_order": cfg.capacity_order,
             "config_sha256": cfg.sha256,
         }
     finally:
         deadlines.restore()
 
 
-def choose_capacity(records):
+def choose_capacity(records, *, policy="fastest_safe"):
+    if policy not in ("fastest_safe", "largest_safe"):
+        raise ValueError("unknown capacity selection policy")
     eligible = [
         row
         for row in records
         if row.get("status") == "complete" and row.get("headroom_ok")
     ]
+    if policy == "largest_safe":
+        return max((row["microbatch_groups"] for row in eligible), default=None)
     return (
         min(eligible, key=lambda row: row["seconds_per_update"])["microbatch_groups"]
         if eligible
@@ -333,10 +384,11 @@ def run_trial(
     microbatch_groups=1,
     spatial_bf16=True,
     allow_cpu=False,
+    initial_checkpoint=None,
 ):
     context = validate_device(device, allow_cpu=allow_cpu)
-    if not allow_cpu and cfg.effective_source_groups != 8:
-        raise ValueError("production trial freezes eight effective source groups")
+    if not allow_cpu:
+        cfg.validate_production()
     if base_config.seed != cfg.seed:
         raise ValueError("base initialization seed differs from trial seed")
     if not allow_cpu and base_config.architecture != HybridConfig():
@@ -395,6 +447,17 @@ def run_trial(
         "optimization_at": optimization_at.isoformat(),
         "work_at": work_at.isoformat(),
     }
+    module = initialize(base_config, context.device, spatial_bf16=spatial_bf16)
+    optimizer = _optimizer(module, base_config)
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if initial_checkpoint is not None:
+        lock["initialization"] = initialize_from_checkpoint(
+            initial_checkpoint, module, optimizer, context, lock
+        )
+    else:
+        lock["initialization"] = {"kind": "fresh_seed", "segment_start_step": 0}
     _write_json(output / "run_lock.json", lock)
     logger = RunLogger(output, rank=0, config=lock, enabled=not allow_cpu)
     if logger.run is not None:
@@ -404,11 +467,6 @@ def run_trial(
     best_score, last_dev, best_metadata = float("inf"), None, None
     error = None
     try:
-        module = initialize(base_config, context.device, spatial_bf16=spatial_bf16)
-        optimizer = _optimizer(module, base_config)
-        random.seed(cfg.seed)
-        np.random.seed(cfg.seed)
-        torch.manual_seed(cfg.seed)
         latest_eval_seconds = latest_step_seconds = 0.0
 
         def evaluate(current_step, *, force_image=False):
