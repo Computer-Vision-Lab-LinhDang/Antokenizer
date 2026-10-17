@@ -1,23 +1,27 @@
 # MAVT C/D loss v3 — direction B
 
-Last updated: **2026-10-17**. Status: **accepted design; losses and training are not implemented or launched**.
+Last updated: **2026-10-17**. Status: **direction B objective, evaluator and single-GPU runner implemented; CPU correctness checked; no GPU launch or new scientific results yet**.
 
 [Ablation and evaluation](../benchmarks/mavt-cd-loss-v3-ablation.md) ·
 [Same-frame diagnostic](../cd_diagnostic.md#same-frame-d-path-diagnostic-v2) ·
-[Existing backbone](mavt-hybrid-v2-design.md)
+[Existing backbone](mavt-hybrid-v2-design.md) ·
+[Single-GPU trial runbook](../runbooks/hybrid-loss-v3-trial.md)
 
 ## Decision and scope
 
-Implement direction **B: new objectives with the existing decoder** first. Keep
+Direction **B: new objectives with the existing decoder** is implemented first. Keep
 Patchify, eight spatial Transformer blocks, two temporal attention/C/D scan
 stages, their feedback, state sizes, KV cache, and four-block tile decoder.
 No D-only RGB branch, extra persistent state, predictor/updater, or recurrent
-feedback change is part of B. This document does not authorize optimizer steps
-or a GPU launch. The separate same-frame diagnostic is read-only measurement.
+feedback change is part of B. The separate same-frame diagnostic remains
+read-only measurement. Capacity calibration and trial execution follow the
+separate bounded [runbook](../runbooks/hybrid-loss-v3-trial.md).
 
 The frozen v2 configuration, objective, checkpoints and historical measurements
-remain unchanged. V3 requires a new config/version and run lock when implemented;
-editing the v2 JSON in place is not an implementation of this plan.
+remain unchanged. V3 uses a separate
+[trial config](../../configs/mavt4d/hybrid_loss_v3_trial.json) and immutable run
+lock; it does not edit the v2 JSON in place. The implementation lives in
+[`hybrid_loss_v3`](../../src/mavt4d/hybrid_loss_v3/), with no old auxiliary heads.
 
 ## Representation contract
 
@@ -84,10 +88,11 @@ separately versioned evidence-equivalence policy. Masked self-reconstruction and
 future prediction still train on every mask family. Thus B does not force a
 confident event identity when all distinguishing observations were hidden.
 
-## Proposed initial objective
+## Implemented initial objective
 
-These coefficients and normalizations are design defaults, to be frozen with
-implementation tests before a future run. They are not measured improvements.
+These coefficients and normalizations are fixed in the separate
+[v3 objective](../../src/mavt4d/hybrid_loss_v3/objectives.py). They are not measured
+improvements; the original objective remains separately reproducible.
 
 \[
 L_{v3}=L_{obs}^{bal}+L_{miss}^{bal}+0.5L_{future}^{bal}
@@ -206,12 +211,16 @@ but does not rule out a constant C basis controlled almost entirely by D.
 
 ## Implementation gates and inference
 
-Before any v3 training, tests must cover: pair eligibility and empty-set handling;
+Before GPU training, correctness gates cover: pair eligibility and empty-set handling;
 equal-source reduction; exact suffix/reversal fixture assertions; no future
 dependency in prefix eligibility/state; correct reciprocal targets; gradients
 to the actual C/D banks; parameter/state contract unchanged; deterministic
-checkpoint/restart and step/chunk/scan parity. Loss tests may use backward;
-this task does not authorize optimizer steps.
+checkpoint/restart and step/chunk/scan parity. The separate
+[objective tests](../../tests/mavt4d/test_hybrid_loss_v3_objectives.py) and
+[runner tests](../../tests/mavt4d/test_hybrid_loss_v3_runner.py) include a tiny CPU
+optimizer update. Their 17 passing checks are technical evidence, not a learned
+factorization or GPU-performance result. Existing backbone contract/parity tests
+retain their own scope.
 
 Inference is unchanged: availability zeros hidden pixels before Patchify, only
 available observations update the causal state, and decoder queries read the
@@ -220,7 +229,7 @@ inference. Recovery from history, recovery from another view and never-observed
 content remain distinct evaluation conditions. The present synthetic fixture
 does not establish multi-view or real-occluder performance.
 
-The next implementation target is B, followed by its CPU correctness tests and
-same-frame diagnostic. A training budget, resource allocation, run lock and
-launch are separate work. The [2×2 protocol](../benchmarks/mavt-cd-loss-v3-ablation.md)
-defines the comparison before any later measurements.
+The [single-GPU trial](../runbooks/hybrid-loss-v3-trial.md) exercises B with a
+separate budget and run lock. At this documentation update no GPU trial has
+launched. The [2×2 protocol](../benchmarks/mavt-cd-loss-v3-ablation.md) remains the
+planned comparison; query-conditioned decoder arms C/D are not implemented.

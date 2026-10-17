@@ -1,17 +1,18 @@
 # MAVT loss v3 — 2×2 ablation and evaluation protocol
 
-Last updated: **2026-10-17**. Status: **planned; B selected first; no v3 training results**.
+Last updated: **2026-10-17**. Status: **2×2 comparison planned; B objective/evaluator/runner implemented and CPU checked; no GPU trial or new scientific results yet**.
 
 [Loss v3 design](../plans/mavt-cd-loss-v3.md) ·
 [Frozen hybrid benchmark](mavt-hybrid-v2-protocol.md) ·
-[Same-frame diagnostic](../cd_diagnostic.md#same-frame-d-path-diagnostic-v2)
+[Same-frame diagnostic](../cd_diagnostic.md#same-frame-d-path-diagnostic-v2) ·
+[Single-GPU B trial](../runbooks/hybrid-loss-v3-trial.md)
 
 ## Comparison and purpose
 
 | Arm | Representation objective | Decoder D control | Status / question |
 |---|---|---|---|
 | A | Frozen v2 six-component objective | Current shared 16-D modulation | Matched baseline for the new comparison |
-| **B** | **V3 event relation, full-C consistency, region balance and reciprocal swap** | **Current shared 16-D modulation** | **Selected first: is the objective sufficient?** |
+| **B** | **V3 event relation, full-C consistency, region balance and reciprocal swap** | **Current shared 16-D modulation** | **Implemented for the first trial: is the objective sufficient?** |
 | C | Frozen v2 six-component objective | Proposed query-conditioned D readout | Planned: does decoder access alone help? |
 | D | V3 objective | Proposed query-conditioned D readout | Planned: is the combination needed? |
 
@@ -43,8 +44,9 @@ time. Do not add such experiments after seeing held-out scores under this lock.
   Copy shared model weights by tensor name from one canonical initialization;
   seed equality alone is insufficient when different modules consume RNG.
 - Freeze optimizer, precision and schedule in a new run lock before launch.
-  Preserve the v2 optimizer defaults for the initial proposal. No run duration,
-  resource allocation or optimizer execution is authorized by this document.
+  The first [B trial](../runbooks/hybrid-loss-v3-trial.md) uses the v2 AdamW
+  defaults with its own budget and single-GPU runner; it is not the full 2×2
+  comparison. Resource allocation and bounded execution follow that runbook.
 - Compare equal data exposure and update budgets. Do **not** call this equal
   compute: v3 needs extra paired renders, and query-conditioned D can add cost.
   Report parameter counts (training heads separately), estimated/measured FLOPs,
@@ -54,11 +56,13 @@ time. Do not add such experiments after seeing held-out scores under this lock.
 Historical runs with other batches/exposures are context, not cells in this
 matched table. Preserve their original scores and selection criteria.
 
-## Common proposed checkpoint criterion
+## Common checkpoint criterion
 
 Training losses differ between arms and cannot select directly comparable
-checkpoints. Use the following **new common dev criterion for all A–D**, frozen
-before future optimization; it does not relabel old checkpoints or scores.
+checkpoints. The following **new common dev criterion for all A–D** is implemented
+in the [v3 evaluator](../../src/mavt4d/hybrid_loss_v3/evaluation.py) and used by
+the B trial runner. It does not relabel old checkpoints or scores; any later
+A/C/D comparison must use this same criterion.
 
 Evaluate the complete fixed dev source set at initialization, every **200**
 updates and the final completed update. Use deterministic clean inputs for the
@@ -97,7 +101,7 @@ Keep only atomically written `best.pt` for the new run, with optimizer/RNG/confi
 and restart metadata. The checkpoint step can precede the final step. Log curves
 and step-labeled inference images; identify images from current weights versus
 the selected checkpoint. No incomplete dev pass can replace best. This entire
-criterion is a design specification, not a claim that the current runner uses it.
+criterion is implemented for the B trial; no measured improvement is claimed.
 
 ## Required result tables
 
@@ -155,9 +159,11 @@ mismatched KV history.
 ## Optimization checks versus held-out claims
 
 A clean tiny source can test whether v3 gradients fit known paired examples;
-it cannot select a paper winner or establish generalization. Before any future
-training, verify loss normalization, pair gates, no-future dependency, decoder
-contract and state/restart parity on CPU. Read-only checkpoint diagnostics may
+it cannot select a paper winner or establish generalization. CPU checks cover
+loss normalization, pair gates, no-future dependency and a tiny optimizer step;
+the unchanged decoder/state contracts retain their existing correctness tests.
+The [trial runbook](../runbooks/hybrid-loss-v3-trial.md) lists the focused test
+command. Read-only checkpoint diagnostics may
 inspect old weights without replacing their heads, logs or checkpoints.
 
 The old jointly trained C-only RGB-history MSE is not a comparable v3 optimization

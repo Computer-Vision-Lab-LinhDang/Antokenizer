@@ -1,8 +1,8 @@
 # Diagnostic and natural-video training flows
 
 Last updated: **2026-10-17**. The first diagrams document the existing protocols.
-The loss v3 section is a planned objective change; no backbone change or v3
-training launch is included.
+The loss v3 section now describes implemented B objectives with the same backbone
+and decoder. CPU checks are complete; no GPU trial has launched at this update.
 
 These runs use the existing hybrid C/D + KV architecture in independent model instances. They do not alter the core state contract or overwrite the original pilot. The diagram describes training and selection, not a new backbone.
 
@@ -76,10 +76,11 @@ Target support never enters the model. A swap changes D only for decoding;
 it is not rolled forward with either source's KV. A final-state D distance cannot
 be combined with this early-frame path to claim where information was lost.
 
-## Planned loss v3: B first
+## Implemented loss v3: B first
 
-The [loss v3 plan](../plans/mavt-cd-loss-v3.md) keeps the existing backbone and
-decoder. It replaces the C-only spatial RGB-history and projected invariance
+The [loss v3 implementation](../../src/mavt4d/hybrid_loss_v3/objectives.py) follows
+the [plan](../plans/mavt-cd-loss-v3.md) and keeps the existing backbone and decoder.
+It replaces the C-only spatial RGB-history and projected invariance
 objectives with prefix-qualified event/order relations, consistency on actual C,
 and a collapse guard. Region-balanced self/future RGB and reciprocal same-event
 C/D cross-reconstruction retain rendering pressure. Pair metadata is additional
@@ -90,14 +91,15 @@ flowchart LR
     X["Same causal inputs and source splits"] --> B["Unchanged Patchify + Transformer<br/>+ two temporal C/D scan stages + KV"]
     B --> Z["Same decoder-facing C/D code"]
     Z --> R["Unchanged decoder<br/>Own C/D and decode-only paired C/D"]
-    R --> RGB["Planned region-balanced RGB<br/>Self / missing / future / paired target"]
-    Z --> C["Planned actual-C constraints<br/>Eligible event-order triplets<br/>Configuration consistency + variance floor"]
+    R --> RGB["Region-balanced RGB<br/>Self / missing / future / paired target"]
+    Z --> C["Actual-C constraints<br/>Eligible event-order triplets<br/>Configuration consistency + variance floor"]
     P["Loss-side source/core/config relations<br/>Observed-prefix eligibility only"] --> RGB
     P --> C
 ```
 
 The [2×2 ablation](../benchmarks/mavt-cd-loss-v3-ablation.md) compares old/new
-objectives and shared/query-conditioned D controls. B is the first selected
-implementation target; query-conditioned D is a later decoder candidate, not
-part of the architecture currently implemented. No new persistent memory is
-introduced by either proposed objective or decoder change.
+objectives and shared/query-conditioned D controls. B has a separate
+[single-GPU trial runner](../runbooks/hybrid-loss-v3-trial.md); query-conditioned
+D remains a later decoder candidate, not part of the implemented architecture.
+No new persistent memory is introduced by the B objective or proposed decoder
+change. The complete 2×2 study and its scientific results remain pending.

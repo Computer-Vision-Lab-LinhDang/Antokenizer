@@ -4,8 +4,9 @@ Last updated: **2026-10-17**.
 
 ## C/D loss v3 — selected next direction
 
-- [Loss v3 plan](plans/mavt-cd-loss-v3.md): direction B, new event/order and functional D objectives with the existing backbone and decoder. Design only; no v3 training has run.
+- [Loss v3 plan](plans/mavt-cd-loss-v3.md): implemented direction B objectives with the existing backbone and decoder; CPU correctness checks completed, no GPU trial results yet.
 - [2×2 ablation](benchmarks/mavt-cd-loss-v3-ablation.md): objective × decoder comparison, common dev selection, unchanged held-out probes, and supervision/compute accounting.
+- [Single-GPU loss v3 trial](runbooks/hybrid-loss-v3-trial.md): capacity calibration, fresh seed-17 training, common dev selection, best-only checkpoints and bounded stopping.
 - [Same-frame D-path diagnostic](cd_diagnostic.md#same-frame-d-path-diagnostic-v2): measure D, modulation, routing/gain and output at the same endpoint, alongside the preserved legacy metrics.
 
 ## Hybrid C/D state v2
@@ -19,7 +20,7 @@ Last updated: **2026-10-17**.
 - [Hybrid synthetic pilot v2](hybrid_synthetic_pilot_v2.md): separate training lock, DDP, W&B and checkpoint/recovery protocol.
 - [Training architecture](architecture/mavt-hybrid-training.md): batched observer, C/D losses, distributed updates and deadline handling.
 
-The hybrid began as a correctness reference. Technical tests establish contract and execution behavior within their tested scope; earlier experiment artifacts have their own protocols and results. The new loss v3 design is unimplemented and untrained. This index makes no learning or GPU-performance claim from technical tests.
+The hybrid began as a correctness reference. Technical tests establish contract and execution behavior within their tested scope; earlier experiment artifacts have their own protocols and results. Loss v3 now has a separate objective, evaluator and single-GPU runner. CPU checks include a tiny optimizer step; no GPU trial or scientific v3 results are reported here. This index makes no learning or GPU-performance claim from technical tests.
 
 ## Related contracts and baselines
 
