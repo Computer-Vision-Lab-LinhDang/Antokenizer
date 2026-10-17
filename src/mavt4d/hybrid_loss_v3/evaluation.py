@@ -12,7 +12,15 @@ from mavt4d.hybrid_diagnostic.experiment import _aligned_d_readout_metrics
 from mavt4d.hybrid_pilot.evaluation import fit_efficient_ridge_probe
 from mavt4d.hybrid_pilot.objectives import full_observation_states, render_group
 from mavt4d.pilot.evaluation import _evaluation_records
-from .objectives import pair_eligibility, region_balanced_l1, region_support
+from .objectives import (
+    pair_eligibility,
+    region_balanced_l1,
+    region_support,
+    variant_contrast,
+)
+
+BOOTSTRAP_SAMPLES = 1000
+BOOTSTRAP_SEED = 31415
 
 
 def labels_for_dataset(dataset):
@@ -66,13 +74,29 @@ def probe_metrics(train, dev, *, should_stop=None):
             classes=classes,
             ridge=1.0,
         )
+        # Closed-form training fit: a capacity control independent of SGD.
+        result[f"{name}_train"] = float(
+            (probe.predict(torch.cat(xs)) == torch.tensor(ys)).float().mean()
+        )
         correct = (
             (probe.predict(torch.cat(vs)) == torch.tensor(targets)).float().tolist()
         )
         by_source = defaultdict(list)
         for group, value in zip(groups, correct):
             by_source[group].append(value)
-        result[name] = sum(sum(v) / len(v) for v in by_source.values()) / len(by_source)
+        scores = torch.tensor(
+            [sum(v) / len(v) for v in by_source.values()], dtype=torch.float64
+        )
+        result[name] = float(scores.mean())
+        # 95% source-bootstrap interval, conditional on this one trained model.
+        draws = torch.randint(
+            len(scores),
+            (BOOTSTRAP_SAMPLES, len(scores)),
+            generator=torch.Generator().manual_seed(BOOTSTRAP_SEED),
+        )
+        means = scores[draws].mean(dim=1)
+        result[f"{name}_ci_low"] = float(means.quantile(0.025))
+        result[f"{name}_ci_high"] = float(means.quantile(0.975))
 
     for feature in ("c", "d"):
         fit_score(f"{feature}_core4", feature, 0, 4)
@@ -176,6 +200,10 @@ def development(module, dataset, labels, deadlines, device, progress=None):
         metrics.update(
             E_D=sum(swaps) / len(swaps), E_R=sum(reconstruction) / len(reconstruction)
         )
+        for feature in ("c", "d"):
+            metrics[f"{feature}_variant_contrast"] = sum(
+                float(variant_contrast(entry[feature])) for entry in tables["dev"]
+            ) / len(tables["dev"])
         metrics["S_dev"] = (
             metrics["E_C"] + metrics["E_D"] / 2 + metrics["E_R"] / 2
         ) / 3

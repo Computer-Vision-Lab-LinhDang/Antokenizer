@@ -5,6 +5,13 @@ import hashlib
 import json
 from pathlib import Path
 
+# Labelled upper bound (arm U): derived from the version so existing configs
+# keep their exact fields and hashes.
+UPPER_BOUND_VERSIONS = (
+    "hybrid-cd-loss-v3-upper-bound-v1",
+    "hybrid-cd-loss-v3-upper-bound-tiny-v1",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LossV3TrialConfig:
@@ -28,6 +35,7 @@ class LossV3TrialConfig:
                 "hybrid-cd-loss-v3-trial-v1",
                 "hybrid-cd-loss-v3-vram-trial-v1",
                 "hybrid-cd-loss-v3-vram-trial-v2",
+                *UPPER_BOUND_VERSIONS,
             )
             or self.selection != "loss-v3-common-dev-v1"
         ):
@@ -70,8 +78,24 @@ class LossV3TrialConfig:
             raise ValueError(
                 "VRAM profile freezes batch64, its versioned candidate grid and 10% headroom"
             )
+        if self.overfit and (
+            self.effective_source_groups != 1 or self.microbatch_candidates != (1,)
+        ):
+            raise ValueError("upper-bound tiny repeats exactly one source group")
         for candidate in self.microbatch_candidates:
             self.accumulation(candidate)
+
+    @property
+    def arm(self):
+        return "U" if self.version in UPPER_BOUND_VERSIONS else "B"
+
+    @property
+    def core_head_weight(self):
+        return 1.0 if self.arm == "U" else 0.0
+
+    @property
+    def overfit(self):
+        return self.version == "hybrid-cd-loss-v3-upper-bound-tiny-v1"
 
     @property
     def capacity_policy(self):
@@ -93,6 +117,8 @@ class LossV3TrialConfig:
         return self.version == "hybrid-cd-loss-v3-vram-trial-v2"
 
     def validate_production(self):
+        if self.overfit:
+            return
         required_groups = 64 if self.capacity_policy == "largest_safe" else 8
         if self.effective_source_groups != required_groups:
             raise ValueError(
