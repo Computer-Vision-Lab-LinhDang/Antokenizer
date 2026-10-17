@@ -26,6 +26,8 @@ class ObjectStateConfig:
     tubelet_size: int = 2
     mlp_ratio: int = 4
     samples_per_ray: int = 32
+    query_chunk_size: int = 128
+    decoder_checkpoint: bool = True
     birth_min_mass: float = 0.5
     birth_min_peak: float = 0.05
     observation_min_mass: float = 0.01
@@ -53,6 +55,7 @@ class ObjectStateConfig:
             "tubelet_size",
             "mlp_ratio",
             "samples_per_ray",
+            "query_chunk_size",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -64,6 +67,8 @@ class ObjectStateConfig:
             raise ValueError("attention widths must divide their head counts")
         if type(self.action_dim) is not int or self.action_dim < 0:
             raise ValueError("action_dim must be nonnegative")
+        if type(self.decoder_checkpoint) is not bool:
+            raise ValueError("decoder_checkpoint must be boolean")
         for name in (
             "birth_min_mass",
             "birth_min_peak",
