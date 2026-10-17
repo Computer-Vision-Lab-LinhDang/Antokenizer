@@ -52,6 +52,7 @@ def main(argv=None):
     parser.add_argument("--observed-views", type=int, default=1)
     parser.add_argument("--max-objects", type=int, default=3)
     parser.add_argument("--dt", type=float, default=.12)
+    parser.add_argument("--gauge", choices=("first_camera", "world"), default="first_camera")
     parser.add_argument("--progress-every", type=int, default=25)
     args = parser.parse_args(argv)
     if min(args.workers, args.torch_threads, args.progress_every) < 1:
@@ -63,7 +64,8 @@ def main(argv=None):
         os.nice(max(0, 10 - os.nice(0)))
     config = FactorialSceneConfig(frames=args.frames, prefix_frames=args.prefix_frames,
                                   height=args.height, width=args.width, views=args.views,
-                                  observed_views=args.observed_views, max_objects=args.max_objects, dt=args.dt)
+                                  observed_views=args.observed_views, max_objects=args.max_objects, dt=args.dt,
+                                  gauge=args.gauge)
     counts = {split: getattr(args, split + "_sources") for split in args.splits}
     if min(counts.values()) < 1:
         parser.error("each selected split needs a positive source count")

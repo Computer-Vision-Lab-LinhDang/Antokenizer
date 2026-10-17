@@ -37,6 +37,7 @@ class FactorialSceneConfig:
     fov_degrees: float = 65.0
     near: float = 0.1
     far: float = 30.0
+    gauge: str = "first_camera"
 
     def __post_init__(self):
         for name in ("frames", "prefix_frames", "views", "observed_views", "height", "width", "max_objects"):
@@ -48,6 +49,8 @@ class FactorialSceneConfig:
             raise ValueError("camera and time parameters must be finite")
         if self.dt <= 0 or not 10 < self.fov_degrees < 150 or not 0 < self.near < self.far:
             raise ValueError("invalid camera or time parameters")
+        if self.gauge not in ("first_camera", "world"):
+            raise ValueError("gauge must be first_camera or world")
 
 
 def _source_seed(split: str, base_seed: int, index: int) -> int:
@@ -143,6 +146,10 @@ def _render_source(cfg: FactorialSceneConfig, seed: int, split_code: int, source
     centres, sizes, yaw, base_velocity, base_yaw_rate, phase = _scene_parameters(cfg, seed)
     times = torch.arange(cfg.frames, dtype=torch.float64) * cfg.dt
     intrinsics, cameras = _camera_sequence(cfg, times, phase)
+    # Gauge is fixed by the first observed camera, never by a future frame or GT object.
+    world_to_gauge = (torch.linalg.inv(cameras[0, 0]) if cfg.gauge == "first_camera"
+                      else torch.eye(4, dtype=cameras.dtype))
+    output_cameras = world_to_gauge @ cameras
     variants = {}
     n = len(centres)
     for shape in range(2):
@@ -158,6 +165,8 @@ def _render_source(cfg: FactorialSceneConfig, seed: int, split_code: int, source
                 cfg, centres, shape_sizes, yaw, velocity, yaw_rate, times, intrinsics, cameras)
             padded_velocity = torch.zeros(cfg.frames, cfg.max_objects, 3)
             padded_velocity[:, :n] = velocity.float()
+            poses = world_to_gauge @ poses
+            padded_velocity = padded_velocity @ world_to_gauge[:3, :3].T
             # Existence, not visibility: an occluded object remains a valid GT object.
             object_valid = torch.arange(cfg.max_objects)[None].expand(cfg.frames, -1) < n
             for appearance in range(2):
@@ -170,7 +179,7 @@ def _render_source(cfg: FactorialSceneConfig, seed: int, split_code: int, source
                     "rgb": rgb[:cfg.prefix_frames, :cfg.observed_views].clone(),
                     "valid": torch.ones(cfg.prefix_frames, cfg.observed_views, 1, cfg.height, cfg.width, dtype=torch.bool),
                     "intrinsics": intrinsics[:cfg.prefix_frames, :cfg.observed_views].float().clone(),
-                    "camera_c2w": cameras[:cfg.prefix_frames, :cfg.observed_views].float().clone(),
+                    "camera_c2w": output_cameras[:cfg.prefix_frames, :cfg.observed_views].float().clone(),
                     "times": times[:cfg.prefix_frames].clone(),
                     "geometry_valid": torch.ones(cfg.prefix_frames, cfg.observed_views, dtype=torch.bool),
                 }
@@ -179,12 +188,13 @@ def _render_source(cfg: FactorialSceneConfig, seed: int, split_code: int, source
                     "instance": inst_image, "object_poses": poses.clone(),
                     "object_sizes": padded_sizes.clone(), "object_velocity": padded_velocity.clone(),
                     "object_valid": object_valid.clone(), "intrinsics": intrinsics.float().clone(),
-                    "camera_c2w": cameras.float().clone(), "times": times.clone(),
+                    "camera_c2w": output_cameras.float().clone(), "times": times.clone(),
                     "near": torch.tensor(cfg.near), "far": torch.tensor(cfg.far),
                 }
                 metadata = {"source_uid": seed, "source_index": source_index, "variant_index": variant,
                             "shape_factor": shape, "appearance_factor": appearance, "motion_factor": motion,
-                            "split_code": split_code, "cutoff_index": cfg.prefix_frames - 1}
+                            "split_code": split_code, "cutoff_index": cfg.prefix_frames - 1,
+                            "gauge_code": int(cfg.gauge == "first_camera")}
                 variants[variant] = {"observations": observations, "targets": targets,
                                      "metadata": {k: torch.tensor(v, dtype=torch.int64) for k, v in metadata.items()}}
     return default_collate([variants[i] for i in range(8)])
@@ -237,7 +247,7 @@ class CachedFactorialDataset(FactorialSceneDataset):
     worker cannot overwrite an existing source. Invalid existing files raise
     instead of being silently replaced. No global sample cache is retained.
     """
-    CACHE_SCHEMA = "mavt-object-factorial-fp32-v1"
+    CACHE_SCHEMA = "mavt-object-factorial-fp32-v2"
 
     def __init__(self, data_dir, n_sources: int, config: FactorialSceneConfig | None = None,
                  *, split: str = "train", base_seed: int = 17):

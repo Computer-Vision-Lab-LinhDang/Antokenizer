@@ -9,10 +9,35 @@ from mavt4d.object_state.data import (
 )
 
 
+def test_first_camera_gauge_preserves_images_and_metric_rays(tmp_path):
+    from dataclasses import replace
+    config = FactorialSceneConfig(frames=4, prefix_frames=2, height=12, width=16)
+    world_config = replace(config, gauge="world")
+    world = FactorialSceneDataset(1, world_config)[0]
+    local = FactorialSceneDataset(1, config)[0]
+    assert torch.allclose(local["observations"]["camera_c2w"][:, 0, 0],
+                          torch.eye(4).expand(8, -1, -1), atol=1e-6)
+    gauge = torch.linalg.inv(world["targets"]["camera_c2w"][0, 0, 0])
+    for name in ("rgb", "depth", "instance", "intrinsics", "object_sizes"):
+        assert torch.equal(world["targets"][name], local["targets"][name])
+    assert torch.allclose(local["targets"]["object_poses"], gauge @ world["targets"]["object_poses"], atol=1e-6)
+    expected_velocity = world["targets"]["object_velocity"] @ gauge[:3, :3].T
+    assert torch.allclose(local["targets"]["object_velocity"], expected_velocity, atol=1e-6)
+    world_rays = sample_ray_targets(world, 2, None)
+    local_rays = sample_ray_targets(local, 2, None)
+    wp = world_rays["query"].origins + world_rays["range"][..., None] * world_rays["query"].directions
+    lp = local_rays["query"].origins + local_rays["range"][..., None] * local_rays["query"].directions
+    assert torch.allclose(lp, wp @ gauge[:3, :3].T + gauge[:3, 3], atol=3e-6)
+    assert torch.allclose(world_rays["range"], local_rays["range"], atol=3e-6)
+    a = CachedFactorialDataset(tmp_path, 1, config)
+    b = CachedFactorialDataset(tmp_path, 1, world_config)
+    assert a.cache_path(0) != b.cache_path(0)
+
+
 @pytest.fixture(scope="module")
 def group():
     cfg = FactorialSceneConfig(frames=6, prefix_frames=4, views=2,
-                               height=24, width=32, max_objects=3)
+                               height=24, width=32, max_objects=3, gauge="world")
     return FactorialSceneDataset(2, cfg, split="train", base_seed=17)[0]
 
 
