@@ -339,6 +339,13 @@ chưa có bằng chứng để phân biệt.
 semantics không nhãn trên video tự nhiên. Natural-video trial cũ là một objective
 khác; không được gọi nó là loss v3 đã kiểm thành công trên natural video.
 
+**Biến thể U riêng:** commit `d4895ea` bổ sung một labelled upper-bound arm,
+với head tuyến tính `2048→4` đọc C cuối clip và thêm core-classification CE
+weight 1. Head này chỉ phục vụ training/diagnostic, không đổi backbone, decoder
+hoặc inference state. Direction B được giải thích trong tài liệu này vẫn không
+có head đó. Xem [plan upper-bound U](../plans/mavt-cd-upper-bound.md); kết quả
+U không được trình bày như kết quả của B hoặc học không nhãn.
+
 ## 9. Những phép đo nào kiểm đúng ý tưởng?
 
 | Câu hỏi | Phép kiểm phù hợp | Giới hạn cần giữ rõ |
