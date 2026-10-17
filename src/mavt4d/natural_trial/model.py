@@ -1,7 +1,7 @@
 """Natural RGB feasibility objective without C/D labels or invented geometry."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 
@@ -34,6 +34,11 @@ class TrialConfig:
     dev_every: int = 25
     log_every: int = 10
     image_every: int = 100
+
+    def __post_init__(self):
+        for name in ("steps", "global_clips", "dev_every", "log_every", "image_every"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
 
     def to_dict(self):
         return asdict(self)
@@ -91,6 +96,13 @@ class NaturalTrialModule(nn.Module):
 
     def render(self, state, times, frame):
         # Recording FPS differs; each query retains its own physical target time.
+        # At an endpoint every decoder query has relative time exactly zero.
+        # Translate only the temporary readout clock; recurrent C/D+KV clocks
+        # and the physical times used by transitions remain untouched.
+        if torch.equal(state.last_time, times[:, frame]):
+            code = replace(state.code(), last_time=torch.zeros_like(state.last_time))
+            return self.model.decoder.render(code, height=self.cfg.height,
+                                             width=self.cfg.width, time=0.)
         return torch.cat([self.model.decoder.render(slice_state(state, i, i + 1).code(),
                          height=self.cfg.height, width=self.cfg.width, time=float(times[i, frame]))
                           for i in range(len(times))])

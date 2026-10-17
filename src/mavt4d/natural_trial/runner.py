@@ -245,6 +245,8 @@ def run_trial(dataset_root, output, *, optimization_at, work_at, git_revision,
                     "progress/optimizer_step": step, "progress/phase": "natural_trial"}, step=step))
             if step % cfg.dev_every == 0 and not deadlines.should_stop(context, optimization=False):
                 evaluate_and_select()
+            elif step % cfg.image_every == 0 and not deadlines.should_stop(context, optimization=False):
+                rank_zero_call(context, lambda: _image_panel(module, dataset, logger, context, step, output))
         if step != last_eval_step and not deadlines.should_stop(context, optimization=False):
             evaluate_and_select()
         result = {"status": "complete" if step == cfg.steps else "stopped", "step": step,
