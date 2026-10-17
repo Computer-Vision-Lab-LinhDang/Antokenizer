@@ -302,7 +302,8 @@ class HybridObservationEncoder(nn.Module):
                     extra[index], cov_rows[index] = tokens[row], covs[row]
         if not return_patches:
             return torch.stack(output), available
-        views, _, _, height, width = observations[0].images.shape
+        shape_source = observations[next(iter(groups.values()))[0]] if groups else observations[0]
+        views, _, _, height, width = shape_source.images.shape
         grid = (views, -(-height // self.config.patch_size), -(-width // self.config.patch_size))
         device = observations[0].images.device
         zero_p = torch.zeros(*grid, self.config.spatial_width, device=device)

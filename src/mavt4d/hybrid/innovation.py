@@ -49,7 +49,8 @@ class InnovationPool(nn.Module):
         queries = self.queries.unsqueeze(0).expand(n, -1, -1)
         pooled = self.output(_attention(queries, self.keys(flat), self.values(flat),
                                         self.config.q_heads, valid.reshape(n, -1).float()))
-        rms_pool = pooled.square().mean(-1, keepdim=True).sqrt()
+        # tiny keeps sqrt's backward finite at an exactly-zero pool (forward stays 0)
+        rms_pool = (pooled.square().mean(-1, keepdim=True) + torch.finfo(pooled.dtype).tiny).sqrt()
         rms_e = evidence.detach().square().mean((1, 2), keepdim=True).sqrt()
         denom = (rms_pool + self.config.innovation_floor * rms_e).clamp_min(torch.finfo(pooled.dtype).tiny)
         return pooled / denom

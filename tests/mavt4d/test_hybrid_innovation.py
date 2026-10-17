@@ -87,9 +87,29 @@ def test_chunked_equals_full():
 def test_floor_bounds_small_changes():
     pool = make_pool()
     evidence = torch.randn(B, 2, 16)
-    delta = torch.randn(B, V, HP, WP, S) * 1e-9
-    out = pool(delta, torch.ones(B, V, HP, WP, dtype=torch.bool), evidence)
+    valid = torch.ones(B, V, HP, WP, dtype=torch.bool)
+    captured = []
+    pool.output.register_forward_hook(lambda m, i, o: captured.append(o.detach()))
+    unit = torch.randn(B, V, HP, WP, S)
+    pool(unit * 1e-9, valid, evidence)  # linear regime: pooled is proportional to delta
+    rms_e = evidence.square().mean((1, 2), keepdim=True).sqrt()
+    peak = captured[0].square().mean(-1).sqrt().amax((1,), keepdim=True)  # [B,1]
+    scale = (1e-6 * rms_e.flatten() / peak.flatten()).reshape(B, 1, 1, 1, 1) * 1e-9
+    out = pool(unit * scale, valid, evidence)
+    pooled_rms = captured[1].square().mean(-1).sqrt().amax(1)
+    torch.testing.assert_close(pooled_rms, 1e-6 * rms_e.flatten(), rtol=1e-3, atol=0)
     assert out.square().mean(-1).sqrt().max() <= 1e-3 + 1e-9
+
+
+def test_zero_pool_backward_is_finite():
+    for valid_all in (True, False):
+        pool = make_pool()
+        valid = torch.full((B, V, HP, WP), valid_all, dtype=torch.bool)
+        out = pool(torch.zeros(B, V, HP, WP, S), valid, torch.randn(B, 2, 16))
+        assert torch.count_nonzero(out) == 0
+        out.sum().backward()
+        for name, p in pool.named_parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), (valid_all, name)
 
 
 def test_missing_step_floor_is_zero():
@@ -178,3 +198,25 @@ def test_return_patches_all_missing_step_is_zero():
                                                         return_patches=True)
     assert not avail.any() and patches.shape == (1, 1, 3, 4, 24)
     assert torch.count_nonzero(patches) == 0 and torch.count_nonzero(cov) == 0
+
+
+def test_return_patches_evidence_bitwise_equal():
+    torch.manual_seed(8)
+    encoder = HybridObservationEncoder(cfg()).eval()
+    img, ok = scene(5)
+    for flag in (False, True):
+        encoder.spatial_autocast = flag
+        with torch.no_grad():
+            plain = encoder.forward_batch([obs(img, ok)], modality="camera")[0]
+            full = encoder.forward_batch([obs(img, ok)], modality="camera", return_patches=True)[0]
+        assert torch.equal(plain, full)
+
+
+def test_missing_row_zero_shape_comes_from_available_group():
+    encoder = HybridObservationEncoder(cfg()).eval()
+    img, ok = scene(0, h=8, w=8)
+    small_img, small_ok = scene(1)
+    with torch.no_grad():
+        out = encoder.forward_batch([obs(small_img, torch.zeros_like(small_ok)), obs(img, ok)],
+                                    modality="camera", return_patches=True)
+    assert out[2].shape == (2, 1, 4, 4, 24) and torch.count_nonzero(out[2][0]) == 0
