@@ -1,6 +1,6 @@
 # MAVT C/D loss v3 — direction B
 
-Last updated: **2026-10-17**. Status: **direction B objective, evaluator and single-GPU runner implemented; CPU correctness checked; no GPU launch or new scientific results yet**.
+Last updated: **2026-10-17**. Status: **direction B objective, evaluator and single-GPU runner implemented; this design document makes no learning-result claim**.
 
 [Ablation and evaluation](../benchmarks/mavt-cd-loss-v3-ablation.md) ·
 [Same-frame diagnostic](../cd_diagnostic.md#same-frame-d-path-diagnostic-v2) ·
@@ -230,6 +230,7 @@ content remain distinct evaluation conditions. The present synthetic fixture
 does not establish multi-view or real-occluder performance.
 
 The [single-GPU trial](../runbooks/hybrid-loss-v3-trial.md) exercises B with a
-separate budget and run lock. At this documentation update no GPU trial has
-launched. The [2×2 protocol](../benchmarks/mavt-cd-loss-v3-ablation.md) remains the
+separate budget and run lock. Its recovery contract distinguishes local-last
+continuation from selected-best artifacts without changing these objectives.
+The [2×2 protocol](../benchmarks/mavt-cd-loss-v3-ablation.md) remains the
 planned comparison; query-conditioned decoder arms C/D are not implemented.

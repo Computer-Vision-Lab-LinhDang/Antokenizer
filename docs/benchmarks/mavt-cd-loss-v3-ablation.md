@@ -1,6 +1,6 @@
 # MAVT loss v3 — 2×2 ablation and evaluation protocol
 
-Last updated: **2026-10-17**. Status: **2×2 comparison planned; B objective/evaluator/runner implemented and CPU checked; no GPU trial or new scientific results yet**.
+Last updated: **2026-10-17**. Status: **2×2 comparison planned; B objective/evaluator/runner implemented; this protocol does not report a completed matched learning comparison**.
 
 [Loss v3 design](../plans/mavt-cd-loss-v3.md) ·
 [Frozen hybrid benchmark](mavt-hybrid-v2-protocol.md) ·
@@ -97,11 +97,20 @@ S_dev; an aggregate win is not enough to claim both C and D improved. If an
 expected dev pair or component is invalid, mark that evaluation incomplete and
 do not select a checkpoint. Ties keep the earlier step.
 
-Keep only atomically written `best.pt` for the new run, with optimizer/RNG/config
-and restart metadata. The checkpoint step can precede the final step. Log curves
-and step-labeled inference images; identify images from current weights versus
-the selected checkpoint. No incomplete dev pass can replace best. This entire
-criterion is implemented for the B trial; no measured improvement is claimed.
+Keep atomic local `last.pt` for continuation at every complete optimizer boundary,
+and atomic local `best.pt` for this unchanged selection rule. Only the final
+selected best model is uploaded to W&B. The selected best step can precede the
+last completed step; resume uses last, never an implicit fallback to best.
+Preserve best score/identity, optimizer/RNG/config state, global step and actual
+cumulative exposure across resume. A batch-size change retains those counters
+but changes the training trajectory and must be reported; it does not create a
+matched-budget comparison automatically. See the
+[recovery contract](../runbooks/hybrid-loss-v3-trial.md#local-recovery-checkpoint-and-continuous-resume).
+
+Log curves and step-labeled inference images; identify current weights versus
+the selected checkpoint. No incomplete dev pass can replace best. Local-last
+recovery does not alter this criterion or rewrite historical best-only artifacts;
+no measured improvement is claimed here.
 
 ## Required result tables
 

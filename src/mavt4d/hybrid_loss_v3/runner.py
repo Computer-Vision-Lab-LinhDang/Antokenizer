@@ -1,5 +1,7 @@
-"""Fresh single-GPU B trial with full fixed-dev selection and best-only saving."""
+"""Single-GPU B trial with local boundary recovery and best-only W&B artifacts."""
 
+from contextlib import contextmanager
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 import gc
 import hashlib
@@ -8,7 +10,9 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import time
+from typing import Any
 import uuid
 
 import numpy as np
@@ -25,7 +29,10 @@ from mavt4d.hybrid_pilot.runner import (
     load_checkpoint,
     save_checkpoint,
     scheduled_step,
+    _rng_state,
+    _restore_rng,
 )
+
 from mavt4d.hybrid_diagnostic.telemetry import selected_gpu_metrics
 from .config import LossV3TrialConfig
 from .evaluation import aligned_panel, development, labels_for_dataset
@@ -40,6 +47,145 @@ from .objectives import (
     C_STD_FLOOR,
     ORDER_MARGIN,
 )
+
+
+RESUME_VERSION = "hybrid-loss-v3-last-v1"
+RESUME_KEYS = (
+    "schema",
+    "arm",
+    "base_config",
+    "base_config_sha256",
+    "objective",
+    "dataset_sha256",
+    "manifest_sha256",
+    "partition_sha256",
+    "world_size",
+    "spatial_bf16",
+    "recurrent_decoder_dtype",
+    "held_out_evaluated",
+    "trial_seed",
+    "selection_metric",
+    "schedule_schema",
+)
+
+
+@contextmanager
+def preserve_rng(context: DistributedContext) -> Iterator[None]:
+    """Evaluation, panels and SDK activity must not advance training RNG."""
+    state = _rng_state(context)
+    try:
+        yield
+    finally:
+        _restore_rng(state, context)
+
+
+def _replace_durable(candidate, destination):
+    os.replace(candidate, destination)
+    descriptor = os.open(Path(destination).parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_durable(source, destination):
+    candidate = Path(destination).with_name(f".copy-{uuid.uuid4().hex}.pt")
+    with Path(source).open("rb") as src, candidate.open("xb") as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    _replace_durable(candidate, destination)
+
+
+def save_last(
+    output: str | Path,
+    module: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    metadata: Mapping[str, Any],
+    context: DistributedContext,
+) -> None:
+    """Replace local recovery state only after the full snapshot is durable."""
+    candidate = Path(output) / f".last-{uuid.uuid4().hex}.pt"
+    save_checkpoint(
+        candidate,
+        module,
+        optimizer,
+        {**metadata, "checkpoint_kind": "last", "resume_version": RESUME_VERSION},
+        context,
+    )
+    _replace_durable(candidate, Path(output) / "last.pt")
+
+
+def prepare_resume(
+    path: str | Path,
+    lock: Mapping[str, Any],
+    *,
+    allow_batch_change: bool,
+) -> tuple[Path, str, dict[str, Any], Path | None, bool]:
+    """Validate last and its selected companion before mutating model or output."""
+    path = Path(path)
+    if path.is_dir() or not path.exists():
+        path = path / "last.pt" if path.suffix != ".pt" else path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"required local last checkpoint does not exist: {path}"
+        )
+    digest = file_sha256(path)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    metadata = payload.get("metadata", {})
+    if (
+        metadata.get("checkpoint_kind") != "last"
+        or metadata.get("resume_version") != RESUME_VERSION
+    ):
+        raise ValueError(
+            "resume requires a local last checkpoint; best is not a fallback"
+        )
+    for key in RESUME_KEYS:
+        if metadata.get(key) != lock[key]:
+            raise ValueError(f"checkpoint {key} mismatch")
+    step, cursor = metadata.get("step"), metadata.get("source_cursor")
+    if (
+        type(step) is not int
+        or step < 0
+        or metadata.get("next_step") != step + 1
+        or type(cursor) is not int
+        or cursor < 0
+        or metadata.get("source_presentations") != cursor
+        or metadata.get("clip_presentations") != cursor * 8
+    ):
+        raise ValueError("invalid last optimizer boundary or cumulative exposure")
+    changed = metadata["effective_source_groups"] != lock["effective_source_groups"]
+    if changed and not allow_batch_change:
+        raise ValueError("effective batch changed; require --allow-batch-change")
+    best = metadata.get("best_selection")
+    companion = None
+    if best is not None:
+        if (
+            type(best.get("step")) is not int
+            or not 0 <= best["step"] <= step
+            or not math.isfinite(best.get("score", float("nan")))
+        ):
+            raise ValueError("invalid historical best selection")
+        for name in ("best.pt", ".resume-best.pt"):
+            candidate = path.parent / name
+            if candidate.is_file() and file_sha256(candidate) == best.get("sha256"):
+                companion = candidate
+                break
+        if companion is None:
+            raise ValueError("historical best companion missing or hash mismatch")
+        best_payload = torch.load(companion, map_location="cpu", weights_only=True)
+        selected = best_payload["metadata"]
+        for key in RESUME_KEYS:
+            if selected.get(key) != lock[key]:
+                raise ValueError(f"best checkpoint {key} mismatch")
+        if (
+            selected.get("step") != best["step"]
+            or selected.get("selection_score") != best["score"]
+        ):
+            raise ValueError("historical best companion metadata mismatch")
+    if file_sha256(path) != digest:
+        raise ValueError("last checkpoint changed during resume validation")
+    return path, digest, metadata, companion, changed
 
 
 def validate_device(device, *, allow_cpu=False):
@@ -194,7 +340,11 @@ def save_selected(output, module, optimizer, scores, best_score, metadata, conte
         },
         context,
     )
-    os.replace(candidate, Path(output) / "best.pt")
+    best_path = Path(output) / "best.pt"
+    if best_path.exists():
+        # If a crash occurs before last refresh, its prior best remains recoverable.
+        _copy_durable(best_path, Path(output) / ".resume-best.pt")
+    _replace_durable(candidate, best_path)
     return score
 
 
@@ -385,7 +535,13 @@ def run_trial(
     spatial_bf16=True,
     allow_cpu=False,
     initial_checkpoint=None,
+    resume=None,
+    allow_batch_change=False,
 ):
+    if resume is not None and initial_checkpoint is not None:
+        raise ValueError("resume and initial_checkpoint are mutually exclusive")
+    if allow_batch_change and resume is None:
+        raise ValueError("allow_batch_change requires resume")
     context = validate_device(device, allow_cpu=allow_cpu)
     if not allow_cpu:
         cfg.validate_production()
@@ -415,6 +571,9 @@ def run_trial(
     lock = {
         "schema": "hybrid-cd-loss-v3-run-v1",
         "arm": "B",
+        "trial_seed": cfg.seed,
+        "selection_metric": cfg.selection,
+        "schedule_schema": "hybrid-pilot-step-source-mask-v1",
         "trial_config": cfg.to_dict(),
         "trial_config_sha256": cfg.sha256,
         "base_config": base_config.to_dict(),
@@ -447,6 +606,60 @@ def run_trial(
         "optimization_at": optimization_at.isoformat(),
         "work_at": work_at.isoformat(),
     }
+    recovery = None
+    resume_path = digest = None
+    step, source_cursor, best_step, last_dev_step = 0, 0, None, None
+    best_score, last_dev, best_metadata, best_selection = float("inf"), None, None, None
+    pending_dev = True
+    latest_eval_seconds = latest_step_seconds = 0.0
+    batch_transitions = []
+    if resume is not None:
+        recovery = prepare_resume(resume, lock, allow_batch_change=allow_batch_change)
+        resume_path, digest, prior, companion, changed = recovery
+        step, source_cursor = prior["step"], prior["source_cursor"]
+        if cfg.steps < step:
+            raise ValueError(
+                "target steps is an absolute global target below resumed step"
+            )
+        batch_transitions = list(prior.get("batch_transitions", []))
+        if changed or prior["microbatch_groups"] != microbatch_groups:
+            batch_transitions.append(
+                {
+                    "at_step": step,
+                    "source_cursor": source_cursor,
+                    "from_effective_source_groups": prior["effective_source_groups"],
+                    "to_effective_source_groups": cfg.effective_source_groups,
+                    "from_microbatch_groups": prior["microbatch_groups"],
+                    "to_microbatch_groups": microbatch_groups,
+                    "same_effective_batch": not changed,
+                }
+            )
+        lock["initialization"] = {
+            "kind": "resume_last",
+            "parent_checkpoint_sha256": digest,
+            "parent_step": step,
+            "segment_start_step": step,
+            "parent_wandb_run_id": prior.get("wandb_run_id"),
+            "exact_resume": not changed
+            and prior["microbatch_groups"] == microbatch_groups,
+            "same_effective_batch": not changed,
+            "trajectory": (
+                "compatible_continuation" if changed else "same_effective_batch"
+            ),
+        }
+        best_selection = prior["best_selection"]
+        state = prior["development_state"]
+        last_dev, last_dev_step = state["last_dev"], state["last_dev_step"]
+        pending_dev = state["pending"]
+        latest_eval_seconds = state["latest_eval_seconds"]
+        if best_selection is not None:
+            best_score, best_step = best_selection["score"], best_selection["step"]
+            _copy_durable(companion, output / "best.pt")
+            if file_sha256(output / "best.pt") != best_selection["sha256"]:
+                raise ValueError("best companion changed during resume copy")
+            best_metadata = torch.load(
+                output / "best.pt", map_location="cpu", weights_only=True
+            )["metadata"]
     module = initialize(base_config, context.device, spatial_bf16=spatial_bf16)
     optimizer = _optimizer(module, base_config)
     random.seed(cfg.seed)
@@ -456,21 +669,56 @@ def run_trial(
         lock["initialization"] = initialize_from_checkpoint(
             initial_checkpoint, module, optimizer, context, lock
         )
-    else:
+    elif resume is None:
         lock["initialization"] = {"kind": "fresh_seed", "segment_start_step": 0}
+    lock["batch_transitions"] = batch_transitions
     _write_json(output / "run_lock.json", lock)
-    logger = RunLogger(output, rank=0, config=lock, enabled=not allow_cpu)
-    if logger.run is not None:
-        logger.run.tags = ("loss-v3", "B", "single-gpu", "synthetic")
+    # A fresh W&B run preserves the parent history; global/logical step continues.
+    with preserve_rng(context):
+        logger = RunLogger(output, rank=0, config=lock, enabled=not allow_cpu)
+        if logger.run is not None:
+            logger.run.tags = ("loss-v3", "B", "single-gpu", "synthetic")
     deadlines.install()
-    step, best_step, last_dev_step = 0, None, None
-    best_score, last_dev, best_metadata = float("inf"), None, None
     error = None
     try:
-        latest_eval_seconds = latest_step_seconds = 0.0
+        if recovery is not None:
+            load_checkpoint(
+                resume_path,
+                module,
+                optimizer,
+                context,
+                expected={key: lock[key] for key in RESUME_KEYS},
+            )
+            if file_sha256(resume_path) != digest:
+                raise ValueError("last checkpoint changed during restore")
+
+        def boundary_metadata():
+            return {
+                **lock,
+                "phase": "loss-v3-B",
+                "step": step,
+                "next_step": step + 1,
+                "source_cursor": source_cursor,
+                "source_presentations": source_cursor,
+                "clip_presentations": source_cursor * 8,
+                "wandb_run_id": logger.run_id,
+                "best_selection": best_selection,
+                "development_state": {
+                    "last_dev_step": last_dev_step,
+                    "last_dev": last_dev,
+                    "pending": pending_dev,
+                    "latest_eval_seconds": latest_eval_seconds,
+                },
+            }
+
+        def persist_last():
+            save_last(output, module, optimizer, boundary_metadata(), context)
+
+        # Initialization or validated restore is recoverable before any evaluation.
+        persist_last()
 
         def evaluate(current_step, *, force_image=False):
-            nonlocal best_score, best_step, last_dev_step, last_dev, best_metadata, latest_eval_seconds
+            nonlocal best_score, best_step, last_dev_step, last_dev, best_metadata, latest_eval_seconds, best_selection, pending_dev
             optimizer.zero_grad(set_to_none=True)
             started = time.monotonic()
             scores = development(
@@ -503,14 +751,7 @@ def run_trial(
                 },
                 step=current_step,
             )
-            metadata = {
-                **lock,
-                "phase": "loss-v3-B",
-                "step": current_step,
-                "next_step": current_step + 1,
-                "source_cursor": current_step * cfg.effective_source_groups,
-                "wandb_run_id": logger.run_id,
-            }
+            metadata = boundary_metadata()
             previous = best_score
             best_score = save_selected(
                 output, module, optimizer, scores, best_score, metadata, context
@@ -520,6 +761,13 @@ def run_trial(
                     **metadata,
                     "selection_score": best_score,
                 }
+            if best_score < previous:
+                best_selection = {
+                    "step": best_step,
+                    "score": best_score,
+                    "sha256": file_sha256(output / "best.pt"),
+                }
+            pending_dev = False
             _write_json(
                 output / "dev-latest.json",
                 {
@@ -548,7 +796,18 @@ def run_trial(
                     _write_panel(logger, panel, current_step)
             return True
 
-        if not evaluate(0):
+        def evaluate_preserved(current_step, *, force_image=False):
+            nonlocal pending_dev
+            if not pending_dev:
+                pending_dev = True
+                persist_last()
+            with preserve_rng(context):
+                completed = evaluate(current_step, force_image=force_image)
+            if completed:
+                persist_last()
+            return completed
+
+        if pending_dev and not evaluate_preserved(step):
             raise RuntimeError("initial full dev incomplete; training was not started")
         module.train()
         last_metrics = {}
@@ -577,9 +836,21 @@ def run_trial(
             )
             _synchronize(context.device)
             if metrics is None:
+                # Partial accumulation may consume RNG/buffers but is not a boundary.
+                load_checkpoint(
+                    output / "last.pt",
+                    module,
+                    optimizer,
+                    context,
+                    expected={key: lock[key] for key in RESUME_KEYS},
+                )
                 break
             latest_step_seconds = time.monotonic() - started
             step += 1
+            source_cursor += len(schedule)
+            pending_dev = step % cfg.dev_every == 0 or step == cfg.steps
+            # Do this before telemetry, evaluation or any network side effect.
+            persist_last()
             last_metrics = metrics
             if step == 1 or step % cfg.log_every == 0 or step == cfg.steps:
                 values = {f"train/{key}": value for key, value in metrics.items()}
@@ -591,11 +862,8 @@ def run_trial(
                         "performance/clips_per_second": cfg.effective_source_groups
                         * 8
                         / latest_step_seconds,
-                        "progress/source_presentations": step
-                        * cfg.effective_source_groups,
-                        "progress/clip_presentations": step
-                        * cfg.effective_source_groups
-                        * 8,
+                        "progress/source_presentations": source_cursor,
+                        "progress/clip_presentations": source_cursor * 8,
                     }
                 )
                 if context.device.type == "cuda":
@@ -612,7 +880,8 @@ def run_trial(
                             / 2**30,
                         }
                     )
-                logger.log(values, step=step)
+                with preserve_rng(context):
+                    logger.log(values, step=step)
                 print(
                     json.dumps(
                         {
@@ -623,12 +892,12 @@ def run_trial(
                     ),
                     flush=True,
                 )
-            if step % cfg.dev_every == 0 and not evaluate(step):
+            if step % cfg.dev_every == 0 and not evaluate_preserved(step):
                 break
         if last_dev_step != step and not deadlines.should_stop(
             context, optimization=False
         ):
-            evaluate(step, force_image=True)
+            evaluate_preserved(step, force_image=True)
         result = {
             "status": "complete" if step == cfg.steps else "stopped",
             "step": step,
@@ -639,6 +908,9 @@ def run_trial(
             "best_score": best_score if math.isfinite(best_score) else None,
             "last_training_metrics": last_metrics,
             "checkpoint": "best.pt" if best_metadata else None,
+            "last_checkpoint": "last.pt",
+            "source_presentations": source_cursor,
+            "clip_presentations": source_cursor * 8,
             "held_out_evaluated": False,
             "wandb_run_id": logger.run_id,
         }

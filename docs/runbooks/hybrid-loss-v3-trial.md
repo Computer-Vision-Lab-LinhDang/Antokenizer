@@ -1,5 +1,7 @@
 # Direction B: single-GPU loss v3 trial
 
+Last updated: **2026-10-17**.
+
 The implementation uses the existing hybrid backbone/decoder and a separate
 `hybrid_loss_v3` objective/runner. The v2 configuration and previous results are
 unchanged. This is a seed-17 optimization check, not the four-arm paper result.
@@ -29,21 +31,23 @@ output directory before the actual run. Supply `--base-config`, `--config`,
 `--stop-work-at`. Both deadlines must include an explicit timezone; the work
 cutoff must be later. The caller must enforce the allocated job's hard cutoff.
 
-For the original profile, capacity uses disposable independently initialized models, one clean warmup
-update and two timed complete effective main-mask updates per candidate. The
+For the original profile, capacity uses disposable independently initialized
+models, one clean warmup update and two timed complete effective main-mask
+updates per candidate. The
 clean warmup exercises all eligible pair renders, conservatively covering their
-memory cost; timing uses the same fixed step-1 source/mask schedule for all candidates. Capacity
-writes `capacity.json` locally, creates no W&B run and saves no model checkpoint.
+memory cost; timing uses the same fixed step-1 source/mask schedule for all
+candidates. Capacity writes `capacity.json` locally, creates no W&B run and
+saves no model checkpoint.
 Among complete candidates it chooses the fastest measured update retaining at
 least 10% VRAM headroom. Incomplete and OOM candidates cannot win. Stop without
 training if no candidate completes. A different main-training mask mix can
 change measured throughput; report actual training throughput separately.
 
 Launch the actual trial in another fresh output directory with
-`--microbatch-groups` set to the selected value. Without `--initial-checkpoint`,
-it starts from the canonical seed-17 initialization. Capacity weights are never
-used for training. W&B project is
-`semantic-router`, display name **semantic router**, with a fresh run ID. Secrets
+`--microbatch-groups` set to the selected value. Without `--resume` or
+`--initial-checkpoint`, it starts from the canonical seed-17 initialization.
+Capacity weights are never used for training. W&B project is `semantic-router`,
+display name **semantic router**, with a fresh run ID. Secrets
 come only through the existing SDK environment/credential mechanism, never the
 scientific config or committed command examples.
 
@@ -92,21 +96,95 @@ group count divided by 64. Never average a short tail equally with the large
 microbatch. Source/mask scheduling still uses the complete effective batch and
 one optimizer step follows its complete accumulation.
 
-For a new batch segment, pass `--initial-checkpoint` only to the actual trial,
-in a fresh output directory. The runner validates compatibility and restores
-module weights, AdamW state and rank RNG from that checkpoint. The new run lock
-records `parent_checkpoint_sha256`, `parent_step`, `segment_start_step=0` and
-`exact_resume=false`. The new segment's optimizer counter and step-indexed input
-schedule start at zero. This is **not an exact resume** of the old training
-trajectory. A best-only parent checkpoint can precede the parent's final step;
-report its actual step instead of claiming those later updates were retained.
-
-Keep the same W&B display name with a **new run ID** and retain the parent run.
+For an ordinary restart, including a batch-profile change, use **`--resume` from
+the latest local recovery checkpoint** as specified below. The global optimizer
+counter continues; changing batch size is not a reason to reset it to zero.
+An effective-batch change additionally requires **`--allow-batch-change`**;
+changing only microbatch packing does not require that flag.
 The scientific loss, backbone, decoder and dev-selection rule do not change.
-The larger effective batch and input exposure do change the optimization
-schedule: this segment is not a matched-budget cell of the planned 2×2 study.
-Log segment-local and parent checkpoint provenance separately. Calibration and
-restart do not reset or extend the original allocation deadline.
+A larger effective batch does change the optimization trajectory and exposure
+per update, so it is not a matched-budget cell of the planned 2×2 study.
+Calibration and restart do not reset or extend the allocation deadline.
+
+`--initial-checkpoint` remains an explicit **warm-start** option for a deliberately
+new optimization segment. It restores module weights, AdamW state and rank RNG,
+but resets the segment counter and step-indexed input schedule to zero, with
+`exact_resume=false` and parent checkpoint SHA/step recorded. This is not the
+normal restart or batch-change path. A parent best checkpoint may precede the
+parent's final step; report its actual step and do not claim unsaved later updates
+were recovered. Historical best-only runs and warm-start segments remain as
+recorded; the new recovery policy does not retroactively create their missing
+last checkpoints.
+
+## Local recovery checkpoint and continuous resume
+
+Local recovery and model selection serve separate purposes:
+
+| File / destination | Purpose | Write policy |
+|---|---|---|
+| Local `last.pt` | Latest complete optimizer boundary for continuation | Atomic write at initialization and after every complete optimizer update, before logging or dev evaluation |
+| Local `best.pt` | Model selected by complete fixed-dev score | Atomic replacement only when the existing common dev criterion improves |
+| W&B model artifact | Selected model for review/evaluation | Upload only the final selected best; no per-step `last.pt` uploads |
+
+`last.pt` uses recovery version `hybrid-loss-v3-last-v1`. It retains module weights,
+AdamW state, rank RNG, config/data/objective hashes and these metadata:
+
+| Metadata | Meaning |
+|---|---|
+| `step`, `next_step` | Completed global optimizer boundary N and next update N+1 |
+| `source_cursor`, `source_presentations`, `clip_presentations` | Cumulative actual source/clip presentations; the first two fields agree |
+| `best_selection` | Selected global step, score and companion checkpoint SHA-256, or unset before any complete dev |
+| `development_state` | Last complete dev and its step, pending-dev flag and measured evaluation time |
+| `batch_transitions` | Global boundary/source cursor and old/new effective and microbatch group counts |
+
+An interrupted partial accumulation is not a completed step and is not
+checkpointed as one. Saving before optional
+logging/evaluation prevents those operations from discarding already completed
+updates. Every save replaces the bounded local last file; this is not an
+unbounded sequence of per-step snapshots.
+
+Pass `--resume` either a recovery checkpoint file or a prior output directory.
+A directory resolves to `last.pt` only. An explicit file must also carry the
+recovery kind/version; passing best or a legacy best-only snapshot is rejected.
+Missing or incompatible recovery data fails explicitly; never fall back to best
+or restart at zero. `--resume` and `--initial-checkpoint` are mutually exclusive,
+and neither is accepted by disposable capacity probes. Use a fresh
+output directory and a fresh W&B run ID, preserving the parent run ID and
+checkpoint hash/step as lineage in `initialization`. Display name can stay the
+same. Both local progress and W&B retain the continued **global** step: checkpoint N resumes
+with the next optimizer update **N+1**, even when batch packing changes.
+The configured `steps` is an **absolute global target**, not an extra budget
+added at restart; a target below the resumed completed step is rejected.
+
+Resume compatibility checks cover schema/arm, base config/hash, objective,
+dataset/manifest/partition hashes, world size, spatial BF16 and recurrent/decoder
+dtype, held-out policy, trial seed, selection metric and schedule schema. It
+does not silently reinterpret a different scientific experiment as continuation.
+
+Source and mask draws remain keyed by that global step using the existing
+schedule. Cumulative exposure increments by the actual groups/clips in each
+completed update; it must not be reconstructed as `global_step × new_batch_size`.
+Report resumed-run lineage, batch changes and exposure totals alongside curves.
+
+With the same effective batch, unchanged inputs/configuration and restored RNG,
+resume reproduces the continuation within the tested numerical tolerances;
+different kernels/precision or microbatch reduction order need not be bitwise
+identical. `exact_resume` is false when either the effective batch or microbatch
+packing changes; `same_effective_batch` separately records that distinction.
+Changing the effective batch explicitly changes the trajectory while
+preserving global counters and provenance. It does not reset scientific metrics
+or select a different best checkpoint merely because a new process started.
+
+When a best has already been selected, last's `best_selection` reference must
+resolve to matching selected weights beside the last checkpoint. A bounded hidden
+`.resume-best.pt` rollback copy protects the window between replacing best and
+committing its reference in last; it is internal recovery bookkeeping, not
+another W&B artifact or an alternative training start.
+Recovery resolves the committed SHA-256 against `best.pt` or that backup and
+copies the matching selected weights into the new output's `best.pt`. Missing or
+mismatched companions fail explicitly. This does not treat a best file as the
+latest training state. An initial last snapshot with no selected best can instead
+carry the pending first dev evaluation.
 
 ## Selection, evidence and stopping
 
@@ -114,8 +192,10 @@ The immutable run lock records both configurations, objective constants, source
 partition/hash, manifest hash, code revision, precision, packing and deadlines.
 Canonical held-out sources are not evaluated or used for tuning.
 
-The complete fixed-dev partition is evaluated at initialization, every 200
-updates and the final completed update. Probe means/std and ridge parameters
+The complete fixed-dev partition is evaluated at fresh initialization, every 200
+global updates and the final completed update. Resume restores its pending/last
+complete evaluation state rather than resetting this schedule. Dev, inference
+panels and SDK work preserve the training RNG. Probe means/std and ridge parameters
 are refit solely on that checkpoint's optimization-train features. The frozen
 selection score is exactly [the 2×2 protocol](../benchmarks/mavt-cd-loss-v3-ablation.md):
 
@@ -129,9 +209,11 @@ step. Selection reads clean inputs; it does not substitute a training head's
 RGB-history error. The broader anisotropic-mask, controls and held-out paper
 suite remains a separate evaluation task.
 
-Only `best.pt` is retained atomically, with optimizer, RNG and exact restart
-metadata. Best may be step zero if no later full dev improves. One selected
-artifact is sent to W&B at completion; earlier runs/artifacts are preserved.
+Local `last.pt` preserves the latest complete update independently of selection;
+local `best.pt` may still be step zero if no later full dev improves. Best score
+and selected checkpoint identity carry across resume. Only the final selected
+best artifact is sent to W&B; earlier runs/artifacts are preserved. The loss,
+dev score and tie policy do not change with the local recovery mechanism.
 Training curves log objective terms, eligibility counts, source/clip exposure,
 throughput and available assigned-GPU counters. Same-frame diagnostic curves
 track D → modulation → routing/gain → RGB without auxiliary heads.
@@ -148,7 +230,7 @@ SIGTERM cooperatively, and also requires an external hard job deadline.
 
 ## Local correctness
 
-`PYTHONPATH=src python -m pytest tests/mavt4d/test_hybrid_loss_v3_objectives.py tests/mavt4d/test_hybrid_loss_v3_runner.py -q`
+`PYTHONPATH=src python -m pytest tests/mavt4d/test_hybrid_loss_v3_objectives.py tests/mavt4d/test_hybrid_loss_v3_runner.py tests/mavt4d/test_hybrid_loss_v3_resume.py -q`
 
 CPU mode is restricted to explicit `--allow-cpu` correctness runs. Tests include
 one tiny real optimizer update; no CPU fallback is permitted in production.

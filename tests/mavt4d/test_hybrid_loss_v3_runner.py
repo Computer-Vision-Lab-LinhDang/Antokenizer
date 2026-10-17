@@ -1,4 +1,4 @@
-"""One-device v3 trial, frozen selection, and best-only restart evidence."""
+"""One-device v3 trial, selected-best and local-last recovery evidence."""
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -365,7 +365,10 @@ def test_one_update_real_tiny_trial_complete_dev_and_images(tmp_path, monkeypatc
     )
     assert result["step"] == 1 and result["last_dev_step"] == 1
     assert result["held_out_evaluated"] is False
-    assert {p.name for p in output.glob("*.pt")} == {"best.pt"}
+    assert {p.name for p in output.glob("*.pt") if not p.name.startswith(".")} == {
+        "best.pt",
+        "last.pt",
+    }
     lock = json.loads((output / "run_lock.json").read_text())
     assert lock["world_size"] == 1 and len(lock["dev_source_groups"]) > 2
     assert set(lock["train_source_groups"]).isdisjoint(lock["dev_source_groups"])
