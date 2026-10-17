@@ -24,7 +24,11 @@ class LossV3TrialConfig:
     def __post_init__(self):
         if (
             self.version
-            not in ("hybrid-cd-loss-v3-trial-v1", "hybrid-cd-loss-v3-vram-trial-v1")
+            not in (
+                "hybrid-cd-loss-v3-trial-v1",
+                "hybrid-cd-loss-v3-vram-trial-v1",
+                "hybrid-cd-loss-v3-vram-trial-v2",
+            )
             or self.selection != "loss-v3-common-dev-v1"
         ):
             raise ValueError("unsupported loss v3 trial version")
@@ -53,13 +57,18 @@ class LossV3TrialConfig:
             )
         if self.capacity_policy == "largest_safe" and (
             self.effective_source_groups != 64
-            or self.microbatch_candidates != (8, 16, 32, 64)
+            or self.microbatch_candidates
+            != (
+                (8, 16, 32, 60, 63)
+                if self.allows_partial_microbatch
+                else (8, 16, 32, 64)
+            )
             or self.capacity_warmup != 1
             or self.capacity_repeats != 1
             or self.memory_headroom != 0.1
         ):
             raise ValueError(
-                "VRAM profile freezes batch64, candidates8/16/32/64 and 10% headroom"
+                "VRAM profile freezes batch64, its versioned candidate grid and 10% headroom"
             )
         for candidate in self.microbatch_candidates:
             self.accumulation(candidate)
@@ -68,7 +77,8 @@ class LossV3TrialConfig:
     def capacity_policy(self):
         return (
             "largest_safe"
-            if self.version == "hybrid-cd-loss-v3-vram-trial-v1"
+            if self.version
+            in ("hybrid-cd-loss-v3-vram-trial-v1", "hybrid-cd-loss-v3-vram-trial-v2")
             else "fastest_safe"
         )
 
@@ -77,6 +87,10 @@ class LossV3TrialConfig:
         if self.capacity_policy == "largest_safe":
             return tuple(reversed(self.microbatch_candidates))
         return self.microbatch_candidates
+
+    @property
+    def allows_partial_microbatch(self):
+        return self.version == "hybrid-cd-loss-v3-vram-trial-v2"
 
     def validate_production(self):
         required_groups = 64 if self.capacity_policy == "largest_safe" else 8
@@ -89,10 +103,16 @@ class LossV3TrialConfig:
         if (
             type(microbatch_groups) is not int
             or microbatch_groups <= 0
-            or self.effective_source_groups % microbatch_groups
+            or microbatch_groups > self.effective_source_groups
+            or (
+                not self.allows_partial_microbatch
+                and self.effective_source_groups % microbatch_groups
+            )
         ):
             raise ValueError("microbatch must divide effective source groups")
-        return self.effective_source_groups // microbatch_groups
+        return (
+            self.effective_source_groups + microbatch_groups - 1
+        ) // microbatch_groups
 
     def to_dict(self):
         return json.loads(json.dumps(asdict(self), allow_nan=False))

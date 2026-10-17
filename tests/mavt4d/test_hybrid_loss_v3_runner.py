@@ -75,6 +75,65 @@ def test_largest_capacity_chooses_memory_safe_not_fastest():
     assert choose_capacity(rows) == 8
 
 
+def test_vram_v2_refines_grid_without_weakening_headroom_or_old_profiles():
+    root = Path(__file__).resolve().parents[2] / "configs/mavt4d"
+    old = LossV3TrialConfig.load(root / "hybrid_loss_v3_vram_trial.json")
+    cfg = LossV3TrialConfig.load(root / "hybrid_loss_v3_vram_trial_v2.json")
+    assert cfg.version == "hybrid-cd-loss-v3-vram-trial-v2"
+    assert cfg.effective_source_groups == old.effective_source_groups == 64
+    assert cfg.memory_headroom == old.memory_headroom == 0.1
+    assert cfg.microbatch_candidates == (8, 16, 32, 60, 63)
+    assert cfg.capacity_order == (63, 60, 32, 16, 8)
+    assert cfg.accumulation(63) == cfg.accumulation(60) == 2
+    assert cfg.accumulation(64) == 1
+    assert cfg.log_every == 1 and cfg.dev_every == old.dev_every == 200
+    with pytest.raises(ValueError):
+        old.accumulation(63)
+    with pytest.raises(ValueError):
+        cfg.accumulation(65)
+    with pytest.raises(ValueError, match="VRAM profile"):
+        replace(cfg, microbatch_candidates=(8, 16, 32, 64))
+    with pytest.raises(ValueError, match="VRAM profile"):
+        replace(cfg, memory_headroom=0.05)
+
+
+def test_unequal_63_plus_1_accumulation_matches_full_64_update():
+    from types import SimpleNamespace
+    from mavt4d.hybrid_loss_v3.runner import optimization_step
+
+    class Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.25, dtype=torch.float64))
+            self.cfg = SimpleNamespace(grad_clip=1e6)
+
+        def forward(self, batches, seeds, labels, phase):
+            values = torch.tensor(batches, dtype=torch.float64)
+            loss = (self.weight * values).square().mean()
+            return loss, {"objective": loss.detach()}
+
+    class Data:
+        def load_group(self, name, device):
+            return 1.0 if int(name) < 63 else 1000.0
+
+    context = DistributedContext(0, 1, 0, torch.device("cpu"))
+    schedule = [(str(index), index) for index in range(64)]
+    labels = {name: [] for name, _ in schedule}
+    outputs = []
+    for microbatch in (64, 63):
+        module = Module()
+        optimizer = torch.optim.SGD(module.parameters(), lr=1e-5)
+        metrics = optimization_step(
+            module, optimizer, Data(), labels, schedule, microbatch, context
+        )
+        outputs.append(
+            (module.weight.detach().clone(), module.weight.grad.clone(), metrics)
+        )
+    assert torch.allclose(outputs[0][0], outputs[1][0], rtol=0, atol=1e-12)
+    assert torch.allclose(outputs[0][1], outputs[1][1], rtol=0, atol=1e-12)
+    assert outputs[0][2]["loss"] == pytest.approx(outputs[1][2]["loss"], rel=1e-12)
+
+
 def test_vram_capacity_attempts_descending_and_stops_first_safe(tmp_path, monkeypatch):
     from test_hybrid_pilot_objectives import tiny_config
     from mavt4d.hybrid_loss_v3 import runner

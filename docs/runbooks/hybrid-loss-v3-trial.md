@@ -77,6 +77,21 @@ deadlines; no completed safe candidate means no training launch. This is a
 largest-safe search within the declared candidate list, not a measured hardware
 maximum or a guarantee of higher throughput.
 
+The separate refinement
+[`hybrid_loss_v3_vram_trial_v2.json`](../../configs/mavt4d/hybrid_loss_v3_vram_trial_v2.json)
+uses version `hybrid-cd-loss-v3-vram-trial-v2` and tests **63 → 60 → 32 → 16 → 8**
+groups. Effective batch remains **64 groups / 512 clips**, with the same largest-safe
+policy, clean warmup/timing count and fixed 10% headroom. The earlier configs
+remain unchanged. This changes only the memory-calibration grid, not the loss
+or scientific selection metric.
+
+Candidates need not divide 64 in this refinement: microbatch 63 uses a **63+1**
+group update, and 60 uses **60+4**. Accumulation count is the ceiling of
+`64 / microbatch_groups`; each microbatch loss is weighted by its actual source
+group count divided by 64. Never average a short tail equally with the large
+microbatch. Source/mask scheduling still uses the complete effective batch and
+one optimizer step follows its complete accumulation.
+
 For a new batch segment, pass `--initial-checkpoint` only to the actual trial,
 in a fresh output directory. The runner validates compatibility and restores
 module weights, AdamW state and rank RNG from that checkpoint. The new run lock
