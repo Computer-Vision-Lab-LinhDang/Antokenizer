@@ -352,3 +352,21 @@ def test_candidate_budget_explicitly_enables_soft_all_evidence_warmup():
     assert torch.equal(warm["candidate_indices"][0, 0], torch.arange(8))
     with pytest.raises(ValueError, match="candidate_budget"):
         model.correct(state, evidence(), candidate_budget=-1)
+
+
+def test_unallocated_proposals_get_loss_only_gradients_without_forcing_births():
+    model = network()
+    # Disallow lifecycle allocation without changing the differentiable proposal path.
+    model.resampler.config = replace(model.config, birth_min_mass=1e6)
+    state = model.predict(model.initial_state(2), torch.ones(2))
+    result, details = model.correct(state, evidence(), return_diagnostics=True)
+    assert not result.allocated.any()
+    assert torch.equal(result.d, state.d)
+    assert details["proposal_d"].shape == state.d.shape
+    assert details["proposal_controls"].shape == (2, 3, 4, 4)
+    loss = (details["proposal_controls"][..., :3, 3] - 2.0).square().mean()
+    loss.backward()
+    gradients = model.resampler.birth_descriptor.grad
+    assert gradients is not None and torch.isfinite(gradients).all()
+    assert (gradients.abs().sum(-1) > 0).all()
+    assert not result.allocated.any()

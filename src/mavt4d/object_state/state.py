@@ -1,7 +1,7 @@
 """Complete stream state and transient observation evidence; no hidden cache."""
 
 from dataclasses import dataclass, fields, replace
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from torch import Tensor
@@ -20,7 +20,7 @@ class Evidence:
     point_valid: Tensor | None = None
     geometry_valid: Tensor | None = None
 
-    def validate(self, config: ObjectStateConfig):
+    def validate(self, config: ObjectStateConfig) -> None:
         if self.tokens.ndim != 3 or self.tokens.shape[-1] != config.evidence_width:
             raise ValueError("evidence tokens must be [B,N,evidence_width]")
         b, n, _ = self.tokens.shape
@@ -74,7 +74,7 @@ class Evidence:
         ):
             raise ValueError("valid input points must be finite")
 
-    def select(self, indices: Tensor):
+    def select(self, indices: Tensor) -> "Evidence":
         return replace(
             self,
             **{
@@ -135,53 +135,53 @@ class ObjectState:
         return result
 
     @property
-    def native_d(self):
+    def native_d(self) -> Tensor:
         return self.d.transpose(-1, -2)
 
     @property
-    def allocated(self):
+    def allocated(self) -> Tensor:
         return self.slot_status > 0
 
     @property
-    def learned_nbytes(self):
+    def learned_nbytes(self) -> int:
         return sum(x.numel() * x.element_size() for x in (self.c, self.d, self.c_bg))
 
     @property
-    def total_nbytes(self):
+    def total_nbytes(self) -> int:
         return sum(x.numel() * x.element_size() for x in self.tensor_dict().values())
 
     @property
-    def retained_storage_nbytes(self):
+    def retained_storage_nbytes(self) -> int:
         storages = {
             x.untyped_storage().data_ptr(): x.untyped_storage().nbytes()
             for x in self.tensor_dict().values()
         }
         return sum(storages.values())
 
-    def flat_tokens(self):
+    def flat_tokens(self) -> Tensor:
         objects = torch.cat((self.c, self.d), dim=-2).flatten(1, 2)
         return torch.cat((objects, self.c_bg), dim=1)
 
-    def tensor_dict(self):
+    def tensor_dict(self) -> dict[str, Tensor]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
-    def clone(self):
+    def clone(self) -> "ObjectState":
         return replace(
             self, **{name: value.clone() for name, value in self.tensor_dict().items()}
         )
 
-    def detach(self):
+    def detach(self) -> "ObjectState":
         return replace(
             self, **{name: value.detach() for name, value in self.tensor_dict().items()}
         )
 
-    def to(self, device):
+    def to(self, device: torch.device | str) -> "ObjectState":
         return replace(
             self,
             **{name: value.to(device) for name, value in self.tensor_dict().items()},
         )
 
-    def select(self, indices: Tensor):
+    def select(self, indices: Tensor) -> "ObjectState":
         return replace(
             self,
             **{
@@ -190,7 +190,7 @@ class ObjectState:
             },
         )
 
-    def to_payload(self):
+    def to_payload(self) -> dict[str, Any]:
         # Compact copies prevent a state snapshot from retaining observation/history storage.
         return {
             "schema_version": self.SCHEMA_VERSION,
@@ -201,7 +201,9 @@ class ObjectState:
         }
 
     @classmethod
-    def from_payload(cls, payload, config: ObjectStateConfig):
+    def from_payload(
+        cls, payload: dict[str, Any], config: ObjectStateConfig
+    ) -> "ObjectState":
         expected = {f.name for f in fields(cls)} | {"schema_version"}
         if set(payload) != expected:
             raise ValueError("serialized state fields do not match whitelist")
@@ -211,7 +213,7 @@ class ObjectState:
         result.validate(config)
         return result.clone()
 
-    def validate(self, config: ObjectStateConfig):
+    def validate(self, config: ObjectStateConfig) -> None:
         if not isinstance(self.c, Tensor) or self.c.ndim != 4:
             raise ValueError("c must be [B,K,NC,Z]")
         b = self.c.shape[0]

@@ -1,6 +1,7 @@
 """Competitive slot binding, evidence correction, and canonical content writes."""
 
 from dataclasses import replace
+from collections.abc import Callable
 import math
 
 import torch
@@ -18,7 +19,7 @@ def _masked_softmax(logits: Tensor, valid: Tensor):
 
 
 class ObjectResampler(nn.Module):
-    def __init__(self, config: ObjectStateConfig):
+    def __init__(self, config: ObjectStateConfig) -> None:
         super().__init__()
         self.config = config
         z, e = config.width, config.evidence_width
@@ -73,8 +74,13 @@ class ObjectResampler(nn.Module):
         return descriptors
 
     def ownership(
-        self, state: ObjectState, evidence: Evidence, controls, *, proposals=False
-    ):
+        self,
+        state: ObjectState,
+        evidence: Evidence,
+        controls: Callable[[Tensor], Tensor],
+        *,
+        proposals: bool = False,
+    ) -> Tensor:
         tokens = torch.where(
             evidence.valid[..., None],
             evidence.tokens.float(),
@@ -243,11 +249,11 @@ class ObjectResampler(nn.Module):
         self,
         state: ObjectState,
         evidence: Evidence,
-        controls,
+        controls: Callable[[Tensor], Tensor],
         relations: Tensor,
         *,
-        candidate_budget=None,
-    ):
+        candidate_budget: int | None = None,
+    ) -> tuple[ObjectState, dict[str, Tensor]]:
         """Caller selects observed batch rows; no all-missing attention is executed."""
         b, k = state.slot_status.shape
         proposals = self.ownership(state, evidence, controls, proposals=True)
@@ -274,6 +280,8 @@ class ObjectResampler(nn.Module):
         born_d = self.birth_d[None] + self.birth_evidence(proposal_values).reshape(
             b, k, self.config.dynamic_tokens, self.config.width
         )
+        proposal_d = torch.where(state.allocated[..., None, None], state.d, born_d)
+        proposal_controls = controls(proposal_d)
         initialized = replace(
             state,
             c=torch.where(births[..., None, None], torch.zeros_like(state.c), state.c),
@@ -430,6 +438,9 @@ class ObjectResampler(nn.Module):
         details = {
             "ownership": ownership,
             "birth_proposals": proposals,
+            "proposal_d": proposal_d,
+            "proposal_controls": proposal_controls,
+            "proposal_valid": evidence.valid.any(-1)[:, None].expand(b, k),
             "candidate_uid": updated.slot_uid.clone(),
             "candidate_indices": indices,
             "support": support,

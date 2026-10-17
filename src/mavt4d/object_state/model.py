@@ -13,8 +13,12 @@ from .state import Evidence, ObjectState
 
 class ObjectStateModel(nn.Module):
     def __init__(
-        self, config: ObjectStateConfig | None = None, *, observer=None, decoder=None
-    ):
+        self,
+        config: ObjectStateConfig | None = None,
+        *,
+        observer: nn.Module | None = None,
+        decoder: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.config = config or ObjectStateConfig()
         if observer is None:
@@ -30,21 +34,28 @@ class ObjectStateModel(nn.Module):
         self.dynamics = SelectiveDynamics(self.config)
         self.resampler = ObjectResampler(self.config)
 
-    def initial_state(self, batch_size: int, *, device=None, time=0.0, frame_id=0):
+    def initial_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str | None = None,
+        time: Tensor | float = 0.0,
+        frame_id: Tensor | int = 0,
+    ) -> ObjectState:
         if device is None:
             device = next(self.parameters()).device
         return ObjectState.initial(
             self.config, batch_size, device=device, time=time, frame_id=frame_id
         )
 
-    def encode_observation(self, observation):
+    def encode_observation(self, observation: object) -> Evidence:
         evidence = self.observer(observation)
         evidence.validate(self.config)
         return evidence
 
     def predict(
         self, state: ObjectState, dt: Tensor | float, action: Tensor | None = None
-    ):
+    ) -> ObjectState:
         with torch.autocast(device_type=state.c.device.type, enabled=False):
             return self.dynamics(state, dt, action)
 
@@ -53,9 +64,9 @@ class ObjectStateModel(nn.Module):
         state: ObjectState,
         evidence: Evidence,
         *,
-        return_diagnostics=False,
-        candidate_budget=None,
-    ):
+        return_diagnostics: bool = False,
+        candidate_budget: int | None = None,
+    ) -> ObjectState | tuple[ObjectState, dict[str, Tensor]]:
         state.validate(self.config)
         evidence.validate(self.config)
         budget = (
@@ -80,6 +91,9 @@ class ObjectStateModel(nn.Module):
             details = {
                 "ownership": state.c.new_zeros(b, n, k + 1),
                 "birth_proposals": state.c.new_zeros(b, n, k + 1),
+                "proposal_d": state.d,
+                "proposal_controls": self.decoder.controls(state.d),
+                "proposal_valid": torch.zeros_like(state.allocated),
                 "candidate_uid": state.slot_uid.clone(),
                 "candidate_indices": torch.zeros(
                     b,
@@ -119,11 +133,13 @@ class ObjectStateModel(nn.Module):
             full_details[name] = default.index_copy(0, indices, value)
         return (result, full_details) if return_diagnostics else result
 
-    def read(self, state: ObjectState, query):
+    def read(self, state: ObjectState, query: object) -> dict[str, Tensor]:
         state.validate(self.config)
         return self.decoder(state, query)
 
-    def rollout(self, state: ObjectState, dts: Tensor, actions: Tensor | None = None):
+    def rollout(
+        self, state: ObjectState, dts: Tensor, actions: Tensor | None = None
+    ) -> tuple[ObjectState, ...]:
         elapsed = torch.as_tensor(dts, device=state.c.device)
         if elapsed.ndim != 2 or elapsed.shape[1] != state.c.shape[0]:
             raise ValueError("rollout dts must be [H,B]")
@@ -144,12 +160,12 @@ class ObjectStateModel(nn.Module):
     def forward(
         self,
         state: ObjectState,
-        observation,
+        observation: object,
         action: Tensor | None = None,
         *,
-        return_diagnostics=False,
-        candidate_budget=None,
-    ):
+        return_diagnostics: bool = False,
+        candidate_budget: int | None = None,
+    ) -> ObjectState | tuple[ObjectState, dict[str, Tensor]]:
         evidence = self.encode_observation(observation)
         prior = self.predict(state, evidence.time.double() - state.t, action)
         return self.correct(

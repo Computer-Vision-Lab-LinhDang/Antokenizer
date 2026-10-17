@@ -12,7 +12,7 @@ from .state import ObjectState
 
 
 class SelectiveDynamics(nn.Module):
-    def __init__(self, config: ObjectStateConfig):
+    def __init__(self, config: ObjectStateConfig) -> None:
         super().__init__()
         self.config = config
         z, nd = config.width, config.dynamic_tokens
@@ -27,7 +27,7 @@ class SelectiveDynamics(nn.Module):
         self.forcing_b = nn.Linear(z, config.write_rank * nd)
         nn.init.constant_(self.rates.bias, -2.0)
 
-    def relations(self, state: ObjectState):
+    def relations(self, state: ObjectState) -> tuple[Tensor, Tensor]:
         x = self.summary(torch.cat((state.c.flatten(-2), state.d.flatten(-2)), dim=-1))
         q, k, v = self.interaction_qkv(x).chunk(3, -1)
         logits = q @ k.transpose(-1, -2) / math.sqrt(self.config.width)
@@ -43,7 +43,7 @@ class SelectiveDynamics(nn.Module):
 
     def forward(
         self, state: ObjectState, dt: Tensor | float, action: Tensor | None = None
-    ):
+    ) -> ObjectState:
         state.validate(self.config)
         b, k = state.d.shape[:2]
         delta = torch.as_tensor(dt, device=state.d.device, dtype=torch.float64)
