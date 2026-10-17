@@ -221,7 +221,8 @@ class HybridCDModel(nn.Module):
         A missing zero-time entry is not an accepted step and changes no state.
         Returned tensors own compact storage; gradients remain connected until
         callers explicitly detach the complete C/D+KV state. ``diagnostics``
-        receives per-stage cell diagnostics under "stage1" and "stage2".
+        receives per-stage cell diagnostics under "stage1" and "stage2", and
+        under innovation the detached FP32 ``[T,B]`` rms of δ̂ as "innovation_rms".
         """
         self._validate_state(state)
         if method not in ("sequential", "associative"):
@@ -252,6 +253,9 @@ class HybridCDModel(nn.Module):
         counts = state.step_count[None] + accepted.to(torch.int64).cumsum(dim=0)
         step_ids = torch.where(accepted, counts - 1, torch.full_like(counts, -1))
         innovation, extras = self._v3_inputs(state, clean, observed, patches, coverage)
+        if innovation is not None and diagnostics is not None:
+            # rms of δ̂ over (P, W) per step and stream, [T,B].
+            diagnostics["innovation_rms"] = innovation.detach().float().square().mean((-2, -1)).sqrt()
         stage1, stage2 = ((None, None) if diagnostics is None else
                           (diagnostics.setdefault("stage1", {}), diagnostics.setdefault("stage2", {})))
 

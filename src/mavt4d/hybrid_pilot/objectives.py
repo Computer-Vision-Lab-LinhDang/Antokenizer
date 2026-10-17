@@ -33,11 +33,14 @@ def slice_state(state: HybridCDKVState, start: int, stop: int) -> HybridCDKVStat
 def full_observation_states(model: HybridCDModel, groups: Sequence[TrainingBatch],
                             availability: Sequence[Tensor] | None = None, *,
                             start_frame: int = 0, stop_frame: int | None = None,
-                            method: str = "associative") -> tuple[HybridCDKVState, ...]:
+                            method: str = "associative", initial: HybridCDKVState | None = None,
+                            diagnostics: dict | None = None) -> tuple[HybridCDKVState, ...]:
     """Batch physical steps across groups with compact causal masked inputs.
 
 The helper also supports smaller variant batches for frozen evaluation. The
-training forward below enforces all eight variants for every source.
+training forward below enforces all eight variants for every source. ``initial``
+continues from a given state instead of a fresh one; ``diagnostics`` is passed
+to ``forward_sequence``.
 """
     if not isinstance(groups, Sequence) or not groups or not all(isinstance(g, TrainingBatch) for g in groups):
         raise ValueError("groups must be a nonempty sequence of TrainingBatch")
@@ -53,8 +56,9 @@ training forward below enforces all eight variants for every source.
             raise ValueError("all groups must share image shape/device")
         if mask.dtype != torch.bool or mask.shape != group.observed.shape or mask.device != group.images.device:
             raise ValueError("availability must match group observation shape/device")
-    initial_times = torch.cat([g.frame_times[:, :, start_frame].min(dim=1).values for g in groups])
-    initial = model.initial_state(sum(len(g.images) for g in groups), last_time=initial_times)
+    if initial is None:
+        initial_times = torch.cat([g.frame_times[:, :, start_frame].min(dim=1).values for g in groups])
+        initial = model.initial_state(sum(len(g.images) for g in groups), last_time=initial_times)
     steps = []
     for start in range(start_frame, stop, model.config.frames_per_step):
         end = min(start + model.config.frames_per_step, stop)
@@ -71,7 +75,7 @@ training forward below enforces all eight variants for every source.
                     cam_to_world=group.cam_to_world[index, :, start:end].contiguous().clone(),
                 ))
         steps.append(tuple(observations))
-    return model.forward_sequence(initial, tuple(steps), method=method)
+    return model.forward_sequence(initial, tuple(steps), method=method, diagnostics=diagnostics)
 
 
 def render_group(model: HybridCDModel, state: HybridCDKVState,

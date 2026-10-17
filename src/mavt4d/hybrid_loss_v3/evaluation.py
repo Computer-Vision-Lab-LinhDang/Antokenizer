@@ -8,6 +8,7 @@ import math
 import torch
 
 from mavt4d.data.event_synthetic import EVENT_CORES, EVENT_CONFIGURATIONS
+from mavt4d.hybrid.config import is_v3
 from mavt4d.hybrid_diagnostic.experiment import _aligned_d_readout_metrics
 from mavt4d.hybrid_pilot.evaluation import fit_efficient_ridge_probe
 from mavt4d.hybrid_pilot.objectives import full_observation_states, render_group
@@ -21,6 +22,20 @@ from .objectives import (
 
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_SEED = 31415
+# Memory controls (v3 arms): core-4 probes on these features when present.
+CONTROL_PROBES = (("c_core4_lastwrite", "c_lastwrite"), ("a_core4", "a"))
+
+
+def last_write_only_states(model, batch):
+    """Final state when C/D are zeroed before the last step.
+
+    KV, previous tokens and the appearance bank are kept, so a core probe on
+    this C measures history re-derived at the last write rather than carried.
+    """
+    last = batch.images.shape[2] - model.config.frames_per_step
+    prefix = full_observation_states(model, [batch], stop_frame=last)[-1]
+    zeroed = replace(prefix, c=torch.zeros_like(prefix.c), d=torch.zeros_like(prefix.d))
+    return full_observation_states(model, [batch], start_frame=last, initial=zeroed)[-1]
 
 
 def labels_for_dataset(dataset):
@@ -107,12 +122,36 @@ def probe_metrics(train, dev, *, should_stop=None):
             result[f"{feature}_direction_family0"]
             + result[f"{feature}_direction_family1"]
         ) / 2
+    for name, feature in CONTROL_PROBES:
+        if feature in train[0]:
+            fit_score(name, feature, 0, 4)
     result["E_C"] = ((1 - result["c_direction"]) + (1 - result["c_core4"])) / 2
     return result
 
 
 def _stopped(deadlines):
     return deadlines.requested or datetime.now(timezone.utc) >= deadlines.work_at
+
+
+def _expected_reconstruction(model, states, batch, support, *, zero_c=False):
+    """Mean region-balanced endpoint error, or None if any region is invalid."""
+    errors = []
+    for index_state, state in enumerate(states):
+        frame = (index_state + 1) * 2 - 1
+        if zero_c:
+            state = replace(state, c=torch.zeros_like(state.c))
+        rgb = render_group(model, state, batch, frame)
+        target = batch.images[:, 0, frame]
+        values, valid, _ = region_balanced_l1(
+            rgb,
+            target,
+            torch.ones_like(batch.observed[:, 0, frame]),
+            support,
+        )
+        if not bool(valid.all()):
+            return None
+        errors.append(float(values.mean()))
+    return sum(errors) / len(errors)
 
 
 @torch.no_grad()
@@ -122,6 +161,10 @@ def development(module, dataset, labels, deadlines, device, progress=None):
     module.eval()
     tables = {"train": [], "dev": []}
     reconstruction, swaps = [], []
+    # Memory controls exist only for v3 arms; B and U outputs are unchanged.
+    v3 = is_v3(module.model.config)
+    appearance = v3 and module.model.config.appearance_tokens > 0
+    appearance_only, feedback = [], []
     try:
         for split, groups in (
             ("train", dataset.train_groups),
@@ -131,35 +174,53 @@ def development(module, dataset, labels, deadlines, device, progress=None):
                 if _stopped(deadlines):
                     return {"complete": False, "reason": "deadline during development"}
                 batch = dataset.load_group(group, device)
-                states = full_observation_states(module.model, [batch])
-                tables[split].append(
-                    {
-                        "source": group,
-                        "labels": labels[group],
-                        "c": states[-1].c.flatten(1).cpu(),
-                        "d": states[-1].d.flatten(1).cpu(),
-                    }
+                diagnostics = {} if v3 and split == "dev" else None
+                states = full_observation_states(
+                    module.model, [batch], diagnostics=diagnostics
                 )
+                entry = {
+                    "source": group,
+                    "labels": labels[group],
+                    "c": states[-1].c.flatten(1).cpu(),
+                    "d": states[-1].d.flatten(1).cpu(),
+                }
+                if v3:
+                    last_write = last_write_only_states(module.model, batch)
+                    entry["c_lastwrite"] = last_write.c.flatten(1).cpu()
+                if appearance:
+                    entry["a"] = states[-1].appearance.flatten(1).cpu()
+                tables[split].append(entry)
                 if split == "dev":
-                    support = region_support(batch, labels[group])
-                    errors = []
-                    for index_state, state in enumerate(states):
-                        frame = (index_state + 1) * 2 - 1
-                        rgb = render_group(module.model, state, batch, frame)
-                        target = batch.images[:, 0, frame]
-                        values, valid, _ = region_balanced_l1(
-                            rgb,
-                            target,
-                            torch.ones_like(batch.observed[:, 0, frame]),
-                            support,
-                        )
-                        if not bool(valid.all()):
+                    if diagnostics is not None:
+                        try:
+                            feedback.append(
+                                [
+                                    float(diagnostics[stage]["dc_feedback_ratio"])
+                                    for stage in ("stage1", "stage2")
+                                ]
+                            )
+                        except KeyError:
                             return {
                                 "complete": False,
-                                "reason": "invalid expected reconstruction",
+                                "reason": "missing feedback diagnostics",
                             }
-                        errors.append(float(values.mean()))
-                    reconstruction.append(sum(errors) / len(errors))
+                    support = region_support(batch, labels[group])
+                    error = _expected_reconstruction(
+                        module.model, states, batch, support
+                    )
+                    if error is None:
+                        return {
+                            "complete": False,
+                            "reason": "invalid expected reconstruction",
+                        }
+                    reconstruction.append(error)
+                    if appearance:
+                        # Same regions as E_R; validity depends only on masks.
+                        appearance_only.append(
+                            _expected_reconstruction(
+                                module.model, states, batch, support, zero_c=True
+                            )
+                        )
                     pair = pair_eligibility(batch, batch.observed, labels[group], 3)
                     if not bool(pair.swap_valid.all()):
                         return {
@@ -200,6 +261,12 @@ def development(module, dataset, labels, deadlines, device, progress=None):
         metrics.update(
             E_D=sum(swaps) / len(swaps), E_R=sum(reconstruction) / len(reconstruction)
         )
+        if appearance:
+            # A-only render error (C zeroed); reported, never part of S_dev.
+            metrics["E_R_aonly"] = sum(appearance_only) / len(appearance_only)
+        if v3:
+            for stage, values in zip(("stage1", "stage2"), zip(*feedback)):
+                metrics[f"dc_feedback_ratio_{stage}"] = sum(values) / len(values)
         for feature in ("c", "d"):
             metrics[f"{feature}_variant_contrast"] = sum(
                 float(variant_contrast(entry[feature])) for entry in tables["dev"]

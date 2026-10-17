@@ -11,6 +11,24 @@ UPPER_BOUND_VERSIONS = (
     "hybrid-cd-loss-v3-upper-bound-v1",
     "hybrid-cd-loss-v3-upper-bound-tiny-v1",
 )
+# Architecture arms, also derived from the version: version -> (arm, variant).
+# The variant is resolved against the base architecture by LossV3Module.
+ARCH_VERSIONS = {
+    f"hybrid-cd-arch-{name}{size}-v1": (
+        arm,
+        {"innovation": "I" in arm, "appearance": "A" in arm},
+    )
+    for name, arm in (
+        ("innovation", "I"),
+        ("appearance", "A"),
+        ("innovation-appearance", "IA"),
+    )
+    for size in ("", "-tiny")
+}
+OVERFIT_VERSIONS = (
+    "hybrid-cd-loss-v3-upper-bound-tiny-v1",
+    *(version for version in ARCH_VERSIONS if version.endswith("-tiny-v1")),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +54,7 @@ class LossV3TrialConfig:
                 "hybrid-cd-loss-v3-vram-trial-v1",
                 "hybrid-cd-loss-v3-vram-trial-v2",
                 *UPPER_BOUND_VERSIONS,
+                *ARCH_VERSIONS,
             )
             or self.selection != "loss-v3-common-dev-v1"
         ):
@@ -81,13 +100,21 @@ class LossV3TrialConfig:
         if self.overfit and (
             self.effective_source_groups != 1 or self.microbatch_candidates != (1,)
         ):
-            raise ValueError("upper-bound tiny repeats exactly one source group")
+            raise ValueError("tiny profiles repeat exactly one source group")
         for candidate in self.microbatch_candidates:
             self.accumulation(candidate)
 
     @property
     def arm(self):
-        return "U" if self.version in UPPER_BOUND_VERSIONS else "B"
+        if self.version in UPPER_BOUND_VERSIONS:
+            return "U"
+        return ARCH_VERSIONS.get(self.version, ("B", None))[0]
+
+    @property
+    def architecture_variant(self):
+        """{"innovation", "appearance"} flags for arms I/A/IA; None for B and U."""
+        variant = ARCH_VERSIONS.get(self.version, (None, None))[1]
+        return None if variant is None else dict(variant)
 
     @property
     def core_head_weight(self):
@@ -95,7 +122,7 @@ class LossV3TrialConfig:
 
     @property
     def overfit(self):
-        return self.version == "hybrid-cd-loss-v3-upper-bound-tiny-v1"
+        return self.version in OVERFIT_VERSIONS
 
     @property
     def capacity_policy(self):

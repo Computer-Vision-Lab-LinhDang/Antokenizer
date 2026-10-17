@@ -1,0 +1,19 @@
+{
+  "version": "hybrid-cd-arch-appearance-v1",
+  "seed": 17,
+  "steps": 1000,
+  "effective_source_groups": 8,
+  "microbatch_candidates": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "dev_every": 200,
+  "image_every": 200,
+  "log_every": 1,
+  "memory_headroom": 0.1,
+  "capacity_warmup": 1,
+  "capacity_repeats": 2,
+  "selection": "loss-v3-common-dev-v1"
+}

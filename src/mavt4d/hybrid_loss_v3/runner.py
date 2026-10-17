@@ -39,6 +39,7 @@ from .evaluation import aligned_panel, development, labels_for_dataset
 from .objectives import (
     LossV3Module,
     LOSS_WEIGHTS,
+    resolve_architecture_variant,
     split_core_accuracy,
     ENDPOINTS,
     PIXEL_THRESHOLD,
@@ -213,10 +214,16 @@ def validate_device(device, *, allow_cpu=False):
     return DistributedContext(0, 1, 0, device)
 
 
-def initialize(base, device, *, spatial_bf16, core_head_weight=0.0):
+def initialize(
+    base, device, *, spatial_bf16, core_head_weight=0.0, architecture_variant=None
+):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(base.seed)
-        module = LossV3Module(base, core_head_weight=core_head_weight)
+        module = LossV3Module(
+            base,
+            core_head_weight=core_head_weight,
+            architecture_variant=architecture_variant,
+        )
     module.to(device=device, dtype=torch.float32)
     if spatial_bf16:
         if device.type != "cuda":
@@ -254,7 +261,11 @@ def initialize_from_checkpoint(path, module, optimizer, context, lock):
         )
     }
     expected.update(
-        phase="loss-v3-U" if lock["arm"] == "U" else "loss-v3-B",
+        phase=(
+            f"loss-v3-{lock['arm']}"
+            if lock["arm"] in ("U", "I", "A", "IA")
+            else "loss-v3-B"
+        ),
         selection_metric="loss-v3-common-dev-v1",
     )
     digest = file_sha256(path)
@@ -424,6 +435,7 @@ def capacity_probe(
                     context.device,
                     spatial_bf16=spatial_bf16,
                     core_head_weight=cfg.core_head_weight,
+                    architecture_variant=cfg.architecture_variant,
                 )
                 optimizer = _optimizer(module, base)
                 if context.device.type == "cuda":
@@ -624,6 +636,10 @@ def run_trial(
             "features": "final_c_flat",
             "overfit": cfg.overfit,
         }
+    variant = resolve_architecture_variant(base_config, cfg.architecture_variant)
+    if variant is not None:
+        # Only arms I/A/IA record it, so B and U locks stay byte-identical.
+        lock["objective"]["architecture_variant"] = variant
     recovery = None
     resume_path = digest = None
     step, source_cursor, best_step, last_dev_step = 0, 0, None, None
@@ -683,6 +699,7 @@ def run_trial(
         context.device,
         spatial_bf16=spatial_bf16,
         core_head_weight=cfg.core_head_weight,
+        architecture_variant=cfg.architecture_variant,
     )
     optimizer = _optimizer(module, base_config)
     random.seed(cfg.seed)

@@ -1,6 +1,7 @@
 """Structured synthetic loss v3; targets/labels never enter model inputs.
 
-The model and its persistent state are exactly the existing hybrid. This module
+The model and its persistent state are exactly the existing hybrid, or its v3
+variant (innovation write / appearance bank) for arms I/A/IA. This module
 adds no training-only heads. Pair interventions decode once and never resume a
 swapped state. Every objective is reduced within a source before averaging
 sources, including zero contributions from sources with no eligible pair.
@@ -9,12 +10,14 @@ sources, including zero contributions from sources with no eligible pair.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import re
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from mavt4d.hybrid.config import HybridV3Config
 from mavt4d.hybrid.model import HybridCDModel
 from mavt4d.hybrid_pilot.config import HybridPilotConfig
 from mavt4d.hybrid_pilot.data import TrainingBatch
@@ -43,6 +46,10 @@ MIN_WITNESS_FRAMES = 2
 C_PAIR_SCALE = 0.1
 C_STD_FLOOR = 0.1
 ORDER_MARGIN = 0.2
+# Parameters that exist only in a v3 model; every other weight is shared with B.
+V3_ONLY_KEYS = re.compile(
+    r"(innovation_pool\.|appearance_writer\.|cells\.\d+\.innovation_|decoder\.appearance_keys$)"
+)
 
 
 def validate_labels(
@@ -290,14 +297,54 @@ def variant_contrast(x: Tensor) -> Tensor:
     return (x - x.mean(dim=0, keepdim=True)).norm() / x.norm().clamp_min(1e-30)
 
 
+def resolve_architecture_variant(
+    cfg: HybridPilotConfig, variant: dict | None
+) -> dict | None:
+    """Trial flags {innovation, appearance} -> {innovation, appearance_tokens}."""
+    if variant is None:
+        return None
+    if set(variant) != {"innovation", "appearance"} or any(
+        type(flag) is not bool for flag in variant.values()
+    ):
+        raise ValueError("architecture_variant needs boolean innovation/appearance")
+    tokens = cfg.architecture.state_tokens if variant["appearance"] else 0
+    return {"innovation": variant["innovation"], "appearance_tokens": tokens}
+
+
+def _variant_model(cfg: HybridPilotConfig, resolved: dict) -> HybridCDModel:
+    """v3 model whose shared weights and post-init RNG state equal arm B's."""
+    shared = HybridCDModel(cfg.architecture)  # consumes the RNG exactly as B
+    after_b = torch.get_rng_state()
+    patch = cfg.architecture.patch_size
+    model = HybridCDModel(
+        HybridV3Config(
+            **asdict(cfg.architecture),
+            **resolved,
+            innovation_grid=(cfg.H // patch, cfg.W // patch),
+        )
+    )
+    missing, unexpected = model.load_state_dict(shared.state_dict(), strict=False)
+    if unexpected or not all(V3_ONLY_KEYS.match(key) for key in missing):
+        raise RuntimeError("v3 variant must share every arm-B weight")
+    torch.set_rng_state(after_b)
+    return model
+
+
 class LossV3Module(nn.Module):
     """Unchanged hybrid plus frozen direction-B loss-side operations only.
 
     ``core_head_weight > 0`` selects the labelled upper bound (arm U): one
     training-only linear head reads final C; labels enter only its loss.
+    ``architecture_variant`` (arms I/A/IA) builds the v3 hybrid with every
+    shared weight equal to arm B's at the same seed.
     """
 
-    def __init__(self, cfg: HybridPilotConfig, core_head_weight: float = 0.0) -> None:
+    def __init__(
+        self,
+        cfg: HybridPilotConfig,
+        core_head_weight: float = 0.0,
+        architecture_variant: dict | None = None,
+    ) -> None:
         super().__init__()
         if not isinstance(cfg, HybridPilotConfig):
             raise TypeError("cfg must be HybridPilotConfig")
@@ -312,7 +359,12 @@ class LossV3Module(nn.Module):
                 "loss v3 freezes 12 frames, prefix through 5 and rollout targets 7/9"
             )
         self.cfg = cfg
-        self.model = HybridCDModel(cfg.architecture)
+        resolved = resolve_architecture_variant(cfg, architecture_variant)
+        self.model = (
+            HybridCDModel(cfg.architecture)
+            if resolved is None
+            else _variant_model(cfg, resolved)
+        )
         self.core_head_weight = float(core_head_weight)
         if self.core_head_weight:
             # Created after the model so the model's initialization is unchanged.
