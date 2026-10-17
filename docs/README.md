@@ -8,6 +8,7 @@ Last updated: **2026-10-17**.
 - [2×2 ablation](benchmarks/mavt-cd-loss-v3-ablation.md): objective × decoder comparison, common dev selection, unchanged held-out probes, and supervision/compute accounting.
 - [Single-GPU loss v3 trial](runbooks/hybrid-loss-v3-trial.md): capacity calibration, common dev selection, local-last recovery, selected-best W&B artifacts and bounded stopping.
 - [Labelled upper bound for C](plans/mavt-cd-upper-bound.md): training-only linear core head on final C (arm U), tiny overfit gate, matched v3 arm and pre-registered decision rules; no learning result yet.
+- [Innovation write and appearance bank](plans/mavt-cd-innovation-appearance.md): architecture fix for C collapse (C writes changes, a write-once appearance bank carries the background), six TDD tasks and pre-registered staged experiments; not implemented yet.
 - [Same-frame D-path diagnostic](cd_diagnostic.md#same-frame-d-path-diagnostic-v2): measure D, modulation, routing/gain and output at the same endpoint, alongside the preserved legacy metrics.
 
 ## Hybrid C/D state v2
