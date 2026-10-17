@@ -119,7 +119,9 @@ def prepare_input(
             mode="bilinear",
             align_corners=False,
             antialias=True,
-        )[0]
+        )[0].clamp(
+            0, 1
+        )  # FP32 antialias weights can overshoot by a few ulps.
         k[:, 0] *= width / old_w
         k[:, 1] *= height / old_h
     poses = torch.linalg.inv(poses[0]) @ poses

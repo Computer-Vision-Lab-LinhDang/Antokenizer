@@ -49,6 +49,13 @@ def test_prepare_uses_only_first_camera_gauge_and_scales_intrinsics():
     assert torch.equal(actual.first_frame, other.first_frame)
 
 
+def test_resizing_saturated_input_preserves_valid_rgb_range():
+    raw = replace(example(), first_frame=torch.ones(3, 1080, 1920))
+    resized = prepare_input(raw, output_hw=(128, 192))
+    assert resized.first_frame.min() >= 0
+    assert resized.first_frame.max() <= 1
+
+
 def test_rejects_future_rgb_noncausal_time_and_metric_assumption():
     with pytest.raises(ValueError, match="first_frame"):
         prepare_input(replace(example(), first_frame=torch.rand(3, 3, 8, 12)))
