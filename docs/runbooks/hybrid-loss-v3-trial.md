@@ -46,6 +46,16 @@ seed-17 initialization, never from capacity/old trial weights. W&B project is
 come only through the existing SDK environment/credential mechanism, never the
 scientific config or committed command examples.
 
+For ROCm deployments, compute visibility environment variables alone can leave
+DRM handles open on other devices. A strict one-GPU scope requires the allocated
+render node and KFD in the container/device allowlist. Before training, verify
+the physical PCI/UUID mapping, Torch device count of one, an actual backward
+pass, host file descriptors and scheduler claims. The visible device ordinal
+may be renumbered inside the container; it is not a physical-device identity.
+Run child timeouts **inside** the container and bound PID1 by the original
+absolute hard deadline. A timeout on the Docker client alone does not ensure
+the workload stops, and restarting must not extend the allocation window.
+
 ## Selection, evidence and stopping
 
 The immutable run lock records both configurations, objective constants, source
