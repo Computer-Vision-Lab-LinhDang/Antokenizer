@@ -17,9 +17,9 @@ from torch.nn import functional as F
 
 from mavt4d.contracts import DecoderQuery
 
-from .config import HybridConfig
+from .config import HybridConfig, is_v3
 from .observation import _attention
-from .state import CDCode
+from .state import CDACode, CDCode
 
 
 def _positive_int(name: str, value: int) -> None:
@@ -120,6 +120,10 @@ class HybridQueryDecoder(nn.Module):
         self.slot_keys = nn.Parameter(torch.empty(config.state_tokens, config.width))
         nn.init.normal_(self.stage_keys, std=1 / math.sqrt(config.width))
         nn.init.normal_(self.slot_keys, std=1 / math.sqrt(config.width))
+        self.appearance_tokens = getattr(config, "appearance_tokens", 0)
+        if self.appearance_tokens:
+            self.appearance_keys = nn.Parameter(torch.empty(self.appearance_tokens, config.width))
+            nn.init.normal_(self.appearance_keys, std=1 / math.sqrt(config.width))
         self.d_bottleneck = nn.Sequential(
             nn.Linear(config.stage_count * config.state_tokens * config.state_dim, 128),
             nn.GELU(), nn.Linear(128, config.modulation_dim), nn.Tanh(),
@@ -132,6 +136,8 @@ class HybridQueryDecoder(nn.Module):
     def _validate(self, code: CDCode, query: DecoderQuery) -> None:
         if not isinstance(code, CDCode) or not isinstance(query, DecoderQuery):
             raise TypeError("decoder requires CDCode and DecoderQuery; KV state is not a decoder input")
+        if is_v3(self.config) and not isinstance(code, CDACode):
+            raise TypeError("a v3 decoder requires CDACode")
         code.validate()
         query.validate()
         if code.config != self.config:
@@ -185,6 +191,9 @@ class HybridQueryDecoder(nn.Module):
         modulation = self.d_bottleneck(code.d.flatten(start_dim=1))
         identity = (self.stage_keys[:, None] + self.slot_keys[None]).reshape(-1, self.config.width)
         c = code.c.flatten(1, 2)
+        if self.appearance_tokens:
+            c = torch.cat((c, code.appearance), dim=1)
+            identity = torch.cat((identity, self.appearance_keys), dim=0)
         content = None
         for block in self.blocks:
             queries, content = block(queries, c, identity, modulation)
