@@ -11,6 +11,11 @@ from .config import HybridV3Config
 from .observation import _attention
 
 
+def observed_patches(coverage: Tensor) -> Tensor:
+    """A patch is observed only when its whole tubelet is (coverage 1)."""
+    return coverage >= 1 - 1e-6
+
+
 def patch_innovation(patches: Tensor, coverage: Tensor, prev_tokens: Tensor, prev_seen: Tensor,
                      first_observed: Tensor, *, appearance_on: bool) -> tuple[Tensor, Tensor, Tensor]:
     """delta [T,B,V,hp,wp,S] from per-step tokens; mask changes are never change.
@@ -21,7 +26,7 @@ def patch_innovation(patches: Tensor, coverage: Tensor, prev_tokens: Tensor, pre
     """
     deltas = []
     for t in range(patches.shape[0]):
-        x, obs = patches[t], (coverage[t] >= 1 - 1e-6).unsqueeze(-1)
+        x, obs = patches[t], observed_patches(coverage[t]).unsqueeze(-1)
         seen = prev_seen.unsqueeze(-1)
         new = torch.where(first_observed[t][:, None, None, None, None], torch.zeros_like(x), x) \
             if appearance_on else x
