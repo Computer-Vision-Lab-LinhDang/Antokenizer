@@ -39,6 +39,7 @@ from .evaluation import aligned_panel, development, labels_for_dataset
 from .objectives import (
     LossV3Module,
     LOSS_WEIGHTS,
+    split_core_accuracy,
     ENDPOINTS,
     PIXEL_THRESHOLD,
     MIN_WITNESS_PIXELS,
@@ -212,10 +213,10 @@ def validate_device(device, *, allow_cpu=False):
     return DistributedContext(0, 1, 0, device)
 
 
-def initialize(base, device, *, spatial_bf16):
+def initialize(base, device, *, spatial_bf16, core_head_weight=0.0):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(base.seed)
-        module = LossV3Module(base)
+        module = LossV3Module(base, core_head_weight=core_head_weight)
     module.to(device=device, dtype=torch.float32)
     if spatial_bf16:
         if device.type != "cuda":
@@ -252,7 +253,10 @@ def initialize_from_checkpoint(path, module, optimizer, context, lock):
             "held_out_evaluated",
         )
     }
-    expected.update(phase="loss-v3-B", selection_metric="loss-v3-common-dev-v1")
+    expected.update(
+        phase="loss-v3-U" if lock["arm"] == "U" else "loss-v3-B",
+        selection_metric="loss-v3-common-dev-v1",
+    )
     digest = file_sha256(path)
     metadata = load_checkpoint(path, module, optimizer, context, expected=expected)
     if type(metadata.get("step")) is not int or metadata["step"] < 0:
@@ -313,6 +317,7 @@ def optimization_step(
         module.parameters(), module.cfg.grad_clip, error_if_nonfinite=True
     )
     optimizer.step()
+    totals = split_core_accuracy(totals)
     totals["gradient_norm"] = float(norm)
     if not all(math.isfinite(value) for value in totals.values()):
         raise FloatingPointError("nonfinite optimizer metric")
@@ -414,7 +419,12 @@ def capacity_probe(
                 "mask_policy": "clean_memory_admission_then_main_timing",
             }
             try:
-                module = initialize(base, context.device, spatial_bf16=spatial_bf16)
+                module = initialize(
+                    base,
+                    context.device,
+                    spatial_bf16=spatial_bf16,
+                    core_head_weight=cfg.core_head_weight,
+                )
                 optimizer = _optimizer(module, base)
                 if context.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(context.device)
@@ -570,7 +580,7 @@ def run_trial(
     }
     lock = {
         "schema": "hybrid-cd-loss-v3-run-v1",
-        "arm": "B",
+        "arm": cfg.arm,
         "trial_seed": cfg.seed,
         "selection_metric": cfg.selection,
         "schedule_schema": "hybrid-pilot-step-source-mask-v1",
@@ -606,6 +616,14 @@ def run_trial(
         "optimization_at": optimization_at.isoformat(),
         "work_at": work_at.isoformat(),
     }
+    if cfg.core_head_weight:
+        # Only arm U records the head, so existing B locks stay byte-identical.
+        lock["objective"]["core_head"] = {
+            "weight": cfg.core_head_weight,
+            "classes": 4,
+            "features": "final_c_flat",
+            "overfit": cfg.overfit,
+        }
     recovery = None
     resume_path = digest = None
     step, source_cursor, best_step, last_dev_step = 0, 0, None, None
@@ -660,7 +678,12 @@ def run_trial(
             best_metadata = torch.load(
                 output / "best.pt", map_location="cpu", weights_only=True
             )["metadata"]
-    module = initialize(base_config, context.device, spatial_bf16=spatial_bf16)
+    module = initialize(
+        base_config,
+        context.device,
+        spatial_bf16=spatial_bf16,
+        core_head_weight=cfg.core_head_weight,
+    )
     optimizer = _optimizer(module, base_config)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -677,7 +700,7 @@ def run_trial(
     with preserve_rng(context):
         logger = RunLogger(output, rank=0, config=lock, enabled=not allow_cpu)
         if logger.run is not None:
-            logger.run.tags = ("loss-v3", "B", "single-gpu", "synthetic")
+            logger.run.tags = ("loss-v3", cfg.arm, "single-gpu", "synthetic")
     deadlines.install()
     error = None
     try:
@@ -695,7 +718,7 @@ def run_trial(
         def boundary_metadata():
             return {
                 **lock,
-                "phase": "loss-v3-B",
+                "phase": f"loss-v3-{cfg.arm}",
                 "step": step,
                 "next_step": step + 1,
                 "source_cursor": source_cursor,
@@ -821,6 +844,7 @@ def run_trial(
                 seed=cfg.seed,
                 step=step + 1,
                 global_groups=cfg.effective_source_groups,
+                overfit_group=dataset.overfit_group if cfg.overfit else None,
             )
             _synchronize(context.device)
             started = time.monotonic()
@@ -833,6 +857,7 @@ def run_trial(
                 microbatch_groups,
                 context,
                 deadlines,
+                phase="tiny" if cfg.overfit else "main",
             )
             _synchronize(context.device)
             if metrics is None:

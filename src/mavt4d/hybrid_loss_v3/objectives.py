@@ -264,13 +264,45 @@ def c_objectives(
     }
 
 
-class LossV3Module(nn.Module):
-    """Unchanged hybrid plus frozen direction-B loss-side operations only."""
+def core_head_cross_entropy(head: nn.Linear, c: Tensor, cores: Tensor) -> Tensor:
+    """Per-clip CE of the labelled upper-bound head on flattened final C.
 
-    def __init__(self, cfg: HybridPilotConfig) -> None:
+    Unlike the relative C objectives, its gradient W^T(p - y) stays nonzero and
+    differs between variants even when every C row is identical.
+    """
+    return F.cross_entropy(head(c.float().flatten(start_dim=1)), cores, reduction="none")
+
+
+def split_core_accuracy(totals: dict) -> dict:
+    """Add clean/masked core accuracy to update-level totals, 0 when absent."""
+    ratios = {}
+    for name in ("clean", "masked"):
+        key = f"core_accuracy_{name}_sum"
+        if key in totals:
+            fraction = totals[f"active_source_fraction/core_{name}"]
+            ratios[f"core_accuracy_{name}"] = totals[key] / fraction if fraction > 0 else 0.0
+    return {**totals, **ratios}
+
+
+def variant_contrast(x: Tensor) -> Tensor:
+    """||X - mean over variants|| / ||X|| for one source's variants on dim 0."""
+    x = x.detach().double().flatten(start_dim=1)
+    return (x - x.mean(dim=0, keepdim=True)).norm() / x.norm().clamp_min(1e-30)
+
+
+class LossV3Module(nn.Module):
+    """Unchanged hybrid plus frozen direction-B loss-side operations only.
+
+    ``core_head_weight > 0`` selects the labelled upper bound (arm U): one
+    training-only linear head reads final C; labels enter only its loss.
+    """
+
+    def __init__(self, cfg: HybridPilotConfig, core_head_weight: float = 0.0) -> None:
         super().__init__()
         if not isinstance(cfg, HybridPilotConfig):
             raise TypeError("cfg must be HybridPilotConfig")
+        if not core_head_weight >= 0:
+            raise ValueError("core_head_weight must be nonnegative")
         if (
             cfg.T != 12
             or cfg.future_prefix_frames != 6
@@ -281,6 +313,12 @@ class LossV3Module(nn.Module):
             )
         self.cfg = cfg
         self.model = HybridCDModel(cfg.architecture)
+        self.core_head_weight = float(core_head_weight)
+        if self.core_head_weight:
+            # Created after the model so the model's initialization is unchanged.
+            arch = cfg.architecture
+            features = arch.stage_count * arch.state_tokens * arch.state_dim
+            self.core_head = nn.Linear(features, 4)
 
     def forward(
         self,
@@ -332,7 +370,7 @@ class LossV3Module(nn.Module):
             ]
         )
         future_states = self.model.rollout(prefix, future_times, method="associative")
-        sources = []
+        sources, clean_sources = [], []
         for group_index, (group, mask, source_labels) in enumerate(
             zip(groups, availability, labels)
         ):
@@ -432,6 +470,18 @@ class LossV3Module(nn.Module):
             for region in ("whole", "support", "background"):
                 source.setdefault(f"swap/{region}_l1", reference.sum() * 0)
             source["support_fraction"] = support.float().mean()
+            final_c = slice_state(states[-1], start, stop).c
+            source["c_variant_contrast"] = variant_contrast(final_c).float()
+            if self.core_head_weight:
+                cores = torch.tensor(
+                    [core for core, _ in source_labels], device=final_c.device
+                )
+                source["core_ce"] = core_head_cross_entropy(
+                    self.core_head, final_c, cores
+                ).mean()
+                logits = self.core_head(final_c.detach().float().flatten(start_dim=1))
+                source["core_accuracy"] = (logits.argmax(dim=1) == cores).float().mean()
+                clean_sources.append(mask.all())
             sources.append(source)
         components = {
             name: torch.stack([source[name] for source in sources]).mean()
@@ -441,6 +491,15 @@ class LossV3Module(nn.Module):
             f"weighted/{name}": weight * components[name]
             for name, weight in LOSS_WEIGHTS.items()
         }
+        if self.core_head_weight:
+            weighted["weighted/core_ce"] = self.core_head_weight * components["core_ce"]
+            accuracy = torch.stack([source["core_accuracy"] for source in sources])
+            clean = torch.stack(clean_sources)
+            # Source-mean sums aggregate exactly under microbatch weighting; the
+            # ratio is formed only after a whole update (split_core_accuracy).
+            for name, selected in (("clean", clean), ("masked", ~clean)):
+                components[f"core_accuracy_{name}_sum"] = (accuracy * selected).mean()
+                components[f"active_source_fraction/core_{name}"] = selected.float().mean()
         total = sum(weighted.values())
         metrics = {**components, **weighted, "loss": total}
         return total, {name: value.detach() for name, value in metrics.items()}
