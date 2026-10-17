@@ -38,7 +38,7 @@ class HybridConfig:
     feedback: bool = True
 
     def __post_init__(self) -> None:
-        for entry in fields(self):
+        for entry in fields(HybridConfig):
             value = getattr(self, entry.name)
             if entry.name == "feedback":
                 if type(value) is not bool:
@@ -88,3 +88,50 @@ class HybridConfig:
         )
         values.update(overrides)
         return cls(**values)
+
+
+@dataclass(frozen=True, slots=True)
+class HybridV3Config(HybridConfig):
+    """v2 geometry plus an innovation write and/or a write-once appearance bank."""
+
+    innovation: bool = False
+    appearance_tokens: int = 0
+    innovation_floor: float = 1e-3
+    innovation_grid: tuple[int, int] = (8, 12)
+
+    def __post_init__(self) -> None:
+        HybridConfig.__post_init__(self)
+        if type(self.innovation) is not bool:
+            raise ValueError("innovation: expected a boolean")
+        if type(self.appearance_tokens) is not int or self.appearance_tokens not in (0, self.state_tokens):
+            raise ValueError("appearance_tokens: expected 0 or state_tokens")
+        if type(self.innovation_floor) is not float or not self.innovation_floor > 0:
+            raise ValueError("innovation_floor: expected a positive float")
+        grid = self.innovation_grid
+        if (type(grid) is not tuple or len(grid) != 2
+                or not all(type(g) is int and g > 0 for g in grid)):
+            raise ValueError("innovation_grid: expected two positive integers")
+        if not (self.innovation or self.appearance_tokens):
+            raise ValueError("v3 requires innovation or appearance_tokens")
+
+    def fingerprint(self) -> str:
+        encoded = json.dumps(
+            {"schema": "mavt-hybrid-cd2-kv-v3", "config": asdict(self)},
+            sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def tiny(cls, **overrides) -> HybridV3Config:
+        v3 = {k: overrides.pop(k) for k in tuple(overrides) if k in _V3_FIELDS}
+        values = asdict(HybridConfig.tiny(**overrides))
+        values.update(innovation_grid=(4, 6))
+        values.update(v3)
+        return cls(**values)
+
+
+_V3_FIELDS = ("innovation", "appearance_tokens", "innovation_floor", "innovation_grid")
+
+
+def is_v3(config: HybridConfig) -> bool:
+    return isinstance(config, HybridV3Config)

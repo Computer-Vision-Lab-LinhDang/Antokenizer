@@ -17,7 +17,7 @@ from typing import ClassVar
 import torch
 from torch import Tensor
 
-from .config import HybridConfig
+from .config import HybridConfig, HybridV3Config, is_v3
 
 
 _STATE_FIELDS = (
@@ -162,6 +162,7 @@ class HybridCDKVState:
     SCHEMA_VERSION: ClassVar[int] = 2
     SCHEMA: ClassVar[str] = "mavt-hybrid-cd2-kv-v2"
     HEADER_NBYTES: ClassVar[int] = 68
+    STATE_FIELDS: ClassVar[tuple[str, ...]] = _STATE_FIELDS
 
     def __post_init__(self) -> None:
         self.validate()
@@ -256,7 +257,7 @@ class HybridCDKVState:
 
     @property
     def metadata_nbytes(self) -> int:
-        return _logical_nbytes(getattr(self, name) for name in _STATE_FIELDS[4:])
+        return _logical_nbytes(getattr(self, name) for name in type(self).STATE_FIELDS[4:])
 
     @property
     def total_nbytes(self) -> int:
@@ -268,7 +269,7 @@ class HybridCDKVState:
 
     @property
     def retained_storage_nbytes(self) -> int:
-        return _storage_nbytes(getattr(self, name) for name in _STATE_FIELDS)
+        return _storage_nbytes(getattr(self, name) for name in type(self).STATE_FIELDS)
 
     def code(self) -> CDCode:
         """Expose the exact C/D tensors as a readout-only view, without a cache."""
@@ -279,7 +280,7 @@ class HybridCDKVState:
         """Copy every tensor into compact storage; preserve gradients by default."""
         self.validate()
         values = {}
-        for name in _STATE_FIELDS:
+        for name in type(self).STATE_FIELDS:
             value = getattr(self, name)
             values[name] = (value.detach() if detach else value).clone(memory_format=torch.contiguous_format)
         return type(self)(**values, config=self.config)
@@ -287,7 +288,7 @@ class HybridCDKVState:
     def detach(self) -> HybridCDKVState:
         """Truncate all C/D and KV gradient paths without changing their values."""
         self.validate()
-        return type(self)(**{name: getattr(self, name).detach() for name in _STATE_FIELDS}, config=self.config)
+        return type(self)(**{name: getattr(self, name).detach() for name in type(self).STATE_FIELDS}, config=self.config)
 
     def snapshot(self) -> HybridCDKVState:
         return self.clone(detach=True)
@@ -301,7 +302,7 @@ class HybridCDKVState:
         """
         digest = _hash_bytes(weights_hash, "weights_hash")
         snapshot = self.snapshot()
-        payload = {name: getattr(snapshot, name) for name in _STATE_FIELDS}
+        payload = {name: getattr(snapshot, name) for name in type(self).STATE_FIELDS}
         payload.update(
             schema_version=torch.tensor(self.SCHEMA_VERSION, dtype=torch.int32),
             config_sha256=torch.tensor(list(_hash_bytes(self.config.fingerprint(), "config_hash")), dtype=torch.uint8),
@@ -313,7 +314,7 @@ class HybridCDKVState:
     def from_payload(cls, payload: dict[str, Tensor], *, config: HybridConfig,
                      weights_hash: str) -> HybridCDKVState:
         """Restore only the declared schema with the exact supplied identities."""
-        expected = set(_STATE_FIELDS) | set(_HEADER_FIELDS)
+        expected = set(cls.STATE_FIELDS) | set(_HEADER_FIELDS)
         if not isinstance(payload, dict) or set(payload) != expected:
             raise ValueError(f"payload: expected exactly these keys: {sorted(expected)}")
         if not isinstance(config, HybridConfig):
@@ -329,5 +330,72 @@ class HybridCDKVState:
             _tensor(name, payload[name], (32,), torch.uint8)
             if bytes(payload[name].detach().cpu().tolist()) != expected_digest:
                 raise ValueError(f"{name}: mismatch with the requested model")
-        state = cls(**{name: payload[name] for name in _STATE_FIELDS}, config=config)
+        state = cls(**{name: payload[name] for name in cls.STATE_FIELDS}, config=config)
         return state.snapshot()
+
+
+def _appearance_shapes(config: HybridConfig, batch: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    if not is_v3(config):
+        raise TypeError("config: expected HybridV3Config")
+    hp, wp = config.innovation_grid if config.innovation else (0, 0)
+    return {
+        "appearance": ((batch, config.appearance_tokens, config.state_dim), torch.float32),
+        "appearance_valid": ((batch,), torch.bool),
+        "prev_tokens": ((batch, config.reference_views, hp, wp, config.spatial_width), torch.float32),
+        "prev_seen": ((batch, config.reference_views, hp, wp), torch.bool),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class CDACode(CDCode):
+    """C/D readout code plus the write-once appearance bank."""
+
+    appearance: Tensor
+
+    def validate(self) -> None:
+        CDCode.validate(self)
+        shape, dtype = _appearance_shapes(self.config, self.c.shape[0])["appearance"]
+        _tensor("appearance", self.appearance, shape, dtype, self.c.device)
+
+    @property
+    def total_nbytes(self) -> int:
+        return _logical_nbytes((self.c, self.d, self.last_time, self.appearance))
+
+    @property
+    def retained_storage_nbytes(self) -> int:
+        return _storage_nbytes((self.c, self.d, self.last_time, self.appearance))
+
+
+@dataclass(frozen=True, slots=True)
+class HybridCDAKVState(HybridCDKVState):
+    """Version 3 restart payload: v2 state plus appearance bank and previous tokens."""
+
+    appearance: Tensor
+    appearance_valid: Tensor
+    prev_tokens: Tensor
+    prev_seen: Tensor
+
+    SCHEMA_VERSION: ClassVar[int] = 3
+    SCHEMA: ClassVar[str] = "mavt-hybrid-cd2-kv-v3"
+    STATE_FIELDS: ClassVar[tuple[str, ...]] = _STATE_FIELDS + (
+        "appearance", "appearance_valid", "prev_tokens", "prev_seen",
+    )
+
+    @classmethod
+    def initial(cls, config: HybridConfig, *, batch_size: int,
+                device: torch.device | str, last_time: float | Tensor) -> HybridCDAKVState:
+        base = HybridCDKVState.initial(config, batch_size=batch_size, device=device, last_time=last_time)
+        extra = {
+            name: torch.zeros(shape, dtype=dtype, device=base.c.device)
+            for name, (shape, dtype) in _appearance_shapes(config, batch_size).items()
+        }
+        return cls(**{name: getattr(base, name) for name in _STATE_FIELDS}, **extra, config=config)
+
+    def validate(self) -> None:
+        HybridCDKVState.validate(self)
+        for name, (shape, dtype) in _appearance_shapes(self.config, self.c.shape[0]).items():
+            _tensor(name, getattr(self, name), shape, dtype, self.c.device)
+
+    def code(self) -> CDACode:
+        self.validate()
+        return CDACode(self.c, self.d, self.last_time, self.appearance, config=self.config)
