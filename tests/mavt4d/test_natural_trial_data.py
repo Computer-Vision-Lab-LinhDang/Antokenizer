@@ -8,10 +8,18 @@ from pathlib import Path
 import tarfile
 import tempfile
 
-from mavt4d.natural_trial.prepare import recording_key, split_for_source, select_frame_indices, prepare
+from mavt4d.natural_trial.prepare import recording_key, split_for_source, select_frame_indices, prepare, metadata_grid_indices, _export_archive
 
 
 class NaturalDataTests(unittest.TestCase):
+    def test_metadata_grid_preserves_duration_and_rejects_infeasible_rate(self):
+        indices = metadata_grid_indices(29.97, seconds=2, count=12)
+        self.assertEqual(len(set(indices)), 12)
+        self.assertEqual(indices[0], 0)
+        self.assertEqual(indices[-1], 59)
+        self.assertLessEqual(indices[-1] / 29.97, 2)
+        with self.assertRaises(ValueError):
+            metadata_grid_indices(2, seconds=2, count=12)
     def test_segments_of_one_recording_share_partition(self):
         a = recording_key("epic_kitchen/P01/P01_01/video2/rgb")
         b = recording_key("P01/P01_01/video9/rgb/00000.png")
@@ -69,6 +77,43 @@ class NaturalDataTests(unittest.TestCase):
                     self.assertEqual(data["images"].shape, (12, 3, 4, 6))
             with self.assertRaises(FileExistsError):
                 prepare(metadata, root, output, sources=2)
+            parallel = root / "parallel"
+            parallel_summary = prepare(metadata, root, parallel, sources=2, height=4, width=6,
+                                       workers=2, max_archives=1, frame_selection="metadata_grid")
+            self.assertEqual(parallel_summary["counts"], summary["counts"])
+            self.assertEqual(parallel_summary["frame_selection"], "metadata_grid")
+            self.assertEqual(parallel_summary["workers"], 2)
+            self.assertEqual((parallel / "manifest.jsonl").read_bytes(), (output / "manifest.jsonl").read_bytes())
+
+    def test_metadata_grid_missing_frame_and_deadline_are_explicit(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "clips").mkdir()
+            archive = root / "archive.tar.gz"
+            wanted = {f"P01/P01_{i:03d}/video1/rgb": {"fps": 25., "source": f"P01/P01_{i:03d}"}
+                      for i in (1, 2)}
+            with tarfile.open(archive, "w:gz") as stream:
+                for frame in range(51):
+                    for index, clip in enumerate(wanted):
+                        if index == 0 and frame == 50:
+                            continue
+                        buffer = io.BytesIO()
+                        Image.new("RGB", (6, 4), (frame, 0, 0)).save(buffer, format="PNG")
+                        payload = buffer.getvalue()
+                        member = tarfile.TarInfo(f"{clip}/{frame:05d}.png")
+                        member.size = len(payload)
+                        stream.addfile(member, io.BytesIO(payload))
+            args = (str(archive), wanted, str(root), 12, 4, 6, 2., "metadata_grid")
+            rows, failures, record = _export_archive((*args, None))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]["reason"], "missing_metadata_grid_frames")
+            self.assertEqual(record["read_status"], "archive_eof")
+            rows, failures, record = _export_archive((*args, 0.))
+            self.assertEqual(rows, [])
+            self.assertEqual(len(failures), 2)
+            self.assertEqual(record["read_status"], "deadline")
 
 
 if __name__ == "__main__":

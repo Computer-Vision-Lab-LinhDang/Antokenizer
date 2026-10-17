@@ -37,3 +37,13 @@ The final result reports either completion of all 600 updates or a visible bound
 ## Checks before GPU launch
 
 Tests cover recording-disjoint splits, exclusion of canonical validation, invalid FPS, interleaved archive ordering, timestamps from exported pixels, immutable exports, missing-pixel causality, order-sensitive history targets with identical final frames, finite backward, mixed-mask microbatch loss/gradient parity, atomic best replacement, and a CPU fresh-run/resume round trip. Existing hybrid restart, causality, and step/chunk/scan parity tests remain unchanged.
+
+## Optional larger bounded export
+
+A separate dataset version can use `prepare_natural_trial.py --sources 100000 --clips-per-source 100000 --workers 8 --max-archives 32 --frame-selection metadata_grid --stop-at <explicit-timezone-cutoff>`. Existing exports remain untouched. Canonical validation exclusion, recording groups, the fixed development split, numeric FPS checks, resolution, and physical timestamps are preserved.
+
+With an archive budget, selection ranks eligible archives by compressed bytes per eligible clip, then filename. This favors economical archive reads and is not a representative full-dataset benchmark. Eight CPU worker processes stream separate archives; deployment runs them at reduced scheduling priority. No archive is extracted to arbitrary filesystem paths, and full-archive hashes are not claimed.
+
+`metadata_grid` requests exactly 12 distinct integer frame indices approximately uniformly from zero through `floor(2 × FPS)`. Only these PNGs are decoded. A clip missing any requested frame is excluded with a recorded reason; the exporter never substitutes a different frame or fabricates a timestamp. An archive can end early only after all requested indices for every selected clip have been read, regardless of member order. Workers check the export cutoff while streaming, return complete clips already obtained, and mark unfinished archives and skipped clips explicitly. The final manifest records actual successful counts; an intended thousand-clip budget is not a claim that a thousand clips were exported.
+
+The summary includes frame-selection policy, worker count, archive budget/selection policy, clips excluded by that budget, cutoff, and per-archive requested/exported counts and read status. Its hash distinguishes this dataset from the original small export. The default single-worker `available_grid` export remains available for the original protocol. A larger-dataset training run must use a separate runtime/configuration identity and its own locked data hash.
