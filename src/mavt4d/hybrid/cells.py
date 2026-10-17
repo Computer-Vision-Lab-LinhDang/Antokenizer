@@ -8,7 +8,13 @@ from torch import Tensor, nn
 
 from mavt4d.reference.cells import affine_prefix_scan
 
-from .config import HybridConfig
+from .config import HybridConfig, is_v3
+
+
+def dc_feedback_ratio(a: Tensor, previous: Tensor, b: Tensor) -> Tensor:
+    """rms of the in-cell D->C term a01*d_prev over rms of the C write."""
+    rms = lambda x: x.square().mean().sqrt()
+    return rms(a[..., 0, 1] * previous[..., 1]) / rms(b[..., 0]).clamp_min(torch.finfo(b.dtype).tiny)
 
 
 class HybridCoupledCell(nn.Module):
@@ -28,6 +34,11 @@ class HybridCoupledCell(nn.Module):
                                         nn.Linear(config.width, config.state_dim * 7))
         with torch.no_grad():
             self.write_head[-1].bias.reshape(config.state_dim, 7)[:, 6] = math.log(0.01 / 0.99)
+        self.use_innovation = is_v3(config) and config.innovation
+        if self.use_innovation:
+            self.innovation_attention = nn.MultiheadAttention(config.width, config.q_heads, bias=False,
+                                                              batch_first=True, dropout=0)
+            self.innovation_head = nn.Linear(config.width, config.state_dim, bias=False)
         self.missing_rotation = nn.Parameter(torch.full((config.state_tokens, config.state_dim), 0.03))
         self.missing_damping = nn.Parameter(0.05 * torch.eye(2).expand(config.state_tokens, config.state_dim, 2, 2).clone())
 
@@ -37,8 +48,13 @@ class HybridCoupledCell(nn.Module):
                               torch.linalg.matrix_norm(cut, ord=2)).clamp_min(1)
         return (raw if self.feedback else cut) / scale[..., None, None]
 
-    def coefficients(self, evidence: Tensor, observed: Tensor, delta_time: Tensor) -> tuple[Tensor, Tensor]:
+    def coefficients(self, evidence: Tensor, observed: Tensor, delta_time: Tensor,
+                     innovation: Tensor | None = None) -> tuple[Tensor, Tensor]:
         cfg = self.config
+        if innovation is not None and not self.use_innovation:
+            raise ValueError("cell innovation: given but config.innovation is off")
+        if innovation is None and self.use_innovation:
+            raise ValueError("cell innovation: required when config.innovation is on")
         if evidence.ndim != 3 or evidence.shape[1:] != (cfg.summary_tokens, cfg.width):
             raise ValueError("cell evidence: expected [B,P,width]")
         batch = evidence.shape[0]
@@ -53,6 +69,13 @@ class HybridCoupledCell(nn.Module):
             raise ValueError("hybrid cell reference requires FP32 inputs/parameters")
         if any(t.device != parameter.device for t in (evidence, observed, delta_time)):
             raise ValueError("cell inputs and parameters must share device")
+        if innovation is not None:
+            if innovation.shape != evidence.shape or innovation.dtype != torch.float32:
+                raise ValueError("cell innovation: expected FP32 tensor shaped like evidence")
+            if innovation.device != parameter.device:
+                raise ValueError("cell inputs and parameters must share device")
+            if not bool(torch.isfinite(innovation[observed]).all()):
+                raise ValueError("cell observed innovation must be finite")
         clean = torch.where(observed[:, None, None], evidence, torch.zeros_like(evidence))
         if not bool(torch.isfinite(clean).all()):
             raise ValueError("cell observed evidence must be finite")
@@ -92,10 +115,17 @@ class HybridCoupledCell(nn.Module):
         alpha = torch.sigmoid(raw[..., 6:7])
         observed_a = (1 - alpha[..., None]) * identity + alpha[..., None] * self._normalize(matrix)
         observed_b = alpha * torch.tanh(raw[..., 4:6])
+        if innovation is not None:
+            # C write reads only the change signal; the gate, matrix and D write keep reading evidence.
+            change = innovation.index_select(0, indices)
+            change_context, _ = self.innovation_attention(queries, change, change, need_weights=False)
+            c_write = alpha * torch.tanh(self.innovation_head(change_context))[..., None]
+            observed_b = torch.cat((c_write, observed_b[..., 1:]), dim=-1)
         return missing_a.index_copy(0, indices, observed_a), missing_b.index_copy(0, indices, observed_b)
 
     def scan(self, initial_c: Tensor, initial_d: Tensor, evidence: Tensor,
-             observed: Tensor, delta_time: Tensor, method: str = "sequential") -> tuple[Tensor, Tensor]:
+             observed: Tensor, delta_time: Tensor, innovation: Tensor | None = None,
+             method: str = "sequential", diagnostics: dict | None = None) -> tuple[Tensor, Tensor]:
         """Scan a completed layer's input sequence, not a network step loop."""
         if method not in ("sequential", "associative"):
             raise ValueError("method: expected sequential or associative")
@@ -108,7 +138,8 @@ class HybridCoupledCell(nn.Module):
             raise ValueError("cell carry must be FP32")
         if length == 0:
             return initial_c[None][:0].clone(), initial_d[None][:0].clone()
-        a, b = self.coefficients(evidence.flatten(0, 1), observed.flatten(), delta_time.flatten())
+        flat_innovation = None if innovation is None else innovation.flatten(0, 1)
+        a, b = self.coefficients(evidence.flatten(0, 1), observed.flatten(), delta_time.flatten(), flat_innovation)
         a = a.reshape(length, batch, *a.shape[1:])
         b = b.reshape(length, batch, *b.shape[1:])
         initial = torch.stack((initial_c, initial_d), dim=-1)
@@ -122,6 +153,10 @@ class HybridCoupledCell(nn.Module):
                 previous = (a[index] @ previous[..., None]).squeeze(-1) + b[index]
                 values_list.append(previous)
             values = torch.stack(values_list)
+        if diagnostics is not None and bool(observed.any()):
+            before = torch.cat((initial[None], values[:-1]))
+            rows = observed
+            diagnostics["dc_feedback_ratio"] = dc_feedback_ratio(a[rows], before[rows], b[rows]).detach()
         return values[..., 0], values[..., 1]
 
 
