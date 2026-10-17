@@ -303,8 +303,9 @@ All arms use seed 17, the loss-v3 objective and `event-cd-v1` at 128×192: 94 tr
   - the same `--microbatch-groups` for every arm;
   - `steps = 1000` as a ceiling;
   - optimizer, work and hard deadlines inside the hour;
-  - online tracker.
-- Primary measure: dev `c_core4` with its 95% source-bootstrap interval at the last complete dev pass.
+  - online tracker;
+  - pre-run GPU check: on one clean source, log `innovation_rms` at steps 1–5 through the main path and through `last_write_only_states`. Static patches must give δ̂ ≈ 0; flag the run if the last-write path exceeds 1e-2 where the main path is ~0.
+- Primary measure: dev `c_core4` with its 95% source-bootstrap interval at the last dev step that both B and the arm completed (`dev_every = 200` gives common boundaries); the arms spend more per dev pass and may stop earlier than B.
 - An arm improves on B only if all three hold:
   - its `c_core4` interval low exceeds B's interval high;
   - its `c_core4` interval low exceeds its own `c_core4_lastwrite` interval high, so the win is history carried in C;

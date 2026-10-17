@@ -153,7 +153,9 @@ class HybridCoupledCell(nn.Module):
                 previous = (a[index] @ previous[..., None]).squeeze(-1) + b[index]
                 values_list.append(previous)
             values = torch.stack(values_list)
-        if diagnostics is not None and bool(observed.any()):
+        # No ratio when the C write is exactly zero on every observed row.
+        if (diagnostics is not None and bool(observed.any())
+                and bool(b[observed][..., 0].any())):
             before = torch.cat((initial[None], values[:-1]))
             rows = observed
             diagnostics["dc_feedback_ratio"] = dc_feedback_ratio(a[rows], before[rows], b[rows]).detach()

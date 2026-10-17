@@ -394,3 +394,102 @@ def test_probe_script_runs_on_tiny_config(tmp_path):
     assert len(arms["IA"]["innovation_rms"]) == 6
     # Shared weights: the stateless observer gives identical evidence in every arm.
     assert len({values["evidence_final"] for values in arms.values()}) == 1
+
+
+def test_tiny_b_baseline_version_and_config():
+    tiny_b = LossV3TrialConfig.load(CONFIGS / "hybrid_loss_v3_tiny.json")
+    source = LossV3TrialConfig.load(CONFIGS / "hybrid_loss_v3_upper_bound_tiny.json")
+    assert tiny_b.version == "hybrid-cd-loss-v3-tiny-v1"
+    assert (tiny_b.arm, tiny_b.overfit, tiny_b.architecture_variant, tiny_b.core_head_weight) == (
+        "B", True, None, 0.0)
+    assert {**tiny_b.to_dict(), "version": None} == {**source.to_dict(), "version": None}
+    tiny_b.validate_production()
+    with pytest.raises(ValueError):
+        replace(tiny_b, effective_source_groups=8)
+
+
+def test_tiny_b_lock_has_no_variant_and_no_core_head(event_suite, tmp_path, monkeypatch):
+    from mavt4d.hybrid_loss_v3 import runner
+
+    torch.set_num_threads(1)
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    base, data = event_suite
+    cfg = replace(LossV3TrialConfig.load(CONFIGS / "hybrid_loss_v3_tiny.json"), steps=1)
+    now = datetime.now(timezone.utc)
+    runner.run_trial(base, cfg, data, tmp_path / "b", optimization_at=now + timedelta(hours=1),
+                     work_at=now + timedelta(hours=2), git_revision="f" * 40,
+                     device="cpu", allow_cpu=True, spatial_bf16=False)
+    lock = json.loads((tmp_path / "b" / "run_lock.json").read_text())
+    assert lock["arm"] == "B"
+    assert "architecture_variant" not in lock["objective"] and "core_head" not in lock["objective"]
+    checkpoint = torch.load(tmp_path / "b" / "best.pt", weights_only=True)
+    assert checkpoint["metadata"]["phase"] == "loss-v3-B"
+
+
+def test_last_write_reuses_main_forward_states():
+    from mavt4d.hybrid_loss_v3 import evaluation
+
+    torch.manual_seed(5)
+    model = LossV3Module(config(), architecture_variant=VARIANTS["innovation_appearance"][1]).model.eval()
+    group = batch()
+    with torch.no_grad():
+        states = full_observation_states(model, [group])
+        reference = evaluation.last_write_only_states(model, group)
+        calls = []
+        original = evaluation.full_observation_states
+
+        def record(*args, **kwargs):
+            calls.append(kwargs)
+            return original(*args, **kwargs)
+
+        evaluation.full_observation_states = record
+        try:
+            reused = evaluation.last_write_only_states(model, group, states)
+        finally:
+            evaluation.full_observation_states = original
+    assert len(calls) == 1 and calls[0]["start_frame"] == group.images.shape[2] - model.config.frames_per_step
+    assert not calls[0]["initial"].c.any() and not calls[0]["initial"].d.any()
+    for name in reused.STATE_FIELDS:
+        assert torch.equal(getattr(reused, name), getattr(reference, name)), name
+
+
+def _dev_with(monkeypatch, event_suite, variant, patch):
+    from mavt4d.hybrid_loss_v3 import evaluation
+    from mavt4d.hybrid_pilot.data import HybridPilotDataset
+
+    torch.set_num_threads(1)
+    base, data = event_suite
+    dataset = HybridPilotDataset(data, base)
+    labels = evaluation.labels_for_dataset(dataset)
+    torch.manual_seed(17)
+    module = LossV3Module(base, architecture_variant=variant)
+    patch(evaluation, monkeypatch)
+    return evaluation.development(module, dataset, labels, _deadlines(), torch.device("cpu"))
+
+
+def test_dev_survives_missing_feedback_ratio(event_suite, monkeypatch):
+    def patch(evaluation, mp):
+        original = evaluation.full_observation_states
+
+        def strip(*args, **kwargs):
+            out = original(*args, **kwargs)
+            for stage in (kwargs.get("diagnostics") or {}).values():
+                if isinstance(stage, dict):
+                    stage.pop("dc_feedback_ratio", None)
+            return out
+
+        mp.setattr(evaluation, "full_observation_states", strip)
+
+    scores = _dev_with(monkeypatch, event_suite, VARIANTS["innovation_appearance"][1], patch)
+    assert scores["complete"]
+    assert not [key for key in scores if "dc_feedback_ratio" in key]
+
+
+def test_dev_incomplete_when_aonly_render_invalid(event_suite, monkeypatch):
+    def patch(evaluation, mp):
+        original = evaluation._expected_reconstruction
+        mp.setattr(evaluation, "_expected_reconstruction",
+                   lambda *a, zero_c=False, **k: None if zero_c else original(*a, zero_c=zero_c, **k))
+
+    scores = _dev_with(monkeypatch, event_suite, VARIANTS["appearance"][1], patch)
+    assert scores == {"complete": False, "reason": "invalid expected A-only reconstruction"}

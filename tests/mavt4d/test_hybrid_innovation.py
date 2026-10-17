@@ -220,3 +220,28 @@ def test_missing_row_zero_shape_comes_from_available_group():
         out = encoder.forward_batch([obs(small_img, torch.zeros_like(small_ok)), obs(img, ok)],
                                     modality="camera", return_patches=True)
     assert out[2].shape == (2, 1, 4, 4, 24) and torch.count_nonzero(out[2][0]) == 0
+
+
+def test_returned_patch_recompute_disables_tf32_and_restores(monkeypatch):
+    torch.manual_seed(9)
+    encoder = HybridObservationEncoder(cfg()).eval()
+    img, ok = scene(6)
+    seen, flag_calls = [], []
+    real_flags = torch.backends.cudnn.flags
+
+    def spy_flags(**kwargs):
+        flag_calls.append(kwargs)
+        return real_flags(**kwargs)
+
+    monkeypatch.setattr(torch.backends.cudnn, "flags", spy_flags)
+    encoder.metadata_projection.register_forward_hook(
+        lambda *_: seen.append(torch.backends.cuda.matmul.allow_tf32))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True, raising=False)
+    with torch.no_grad():
+        encoder.forward_batch([obs(img, ok)], modality="camera")
+        plain_calls = list(flag_calls)
+        encoder.forward_batch([obs(img, ok)], modality="camera", return_patches=True)
+    assert plain_calls == []  # evidence path untouched
+    assert [c["allow_tf32"] for c in flag_calls] == [False]
+    assert seen == [True, True, False]  # evidence, evidence, FP32 recompute
+    assert torch.backends.cuda.matmul.allow_tf32 is True

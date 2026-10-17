@@ -257,8 +257,20 @@ class HybridObservationEncoder(nn.Module):
             return evidence
         # Innovation tokens: pre-block (own pixels + metadata only), FP32, so a
         # mask elsewhere in a window never changes an observed patch's token.
-        with torch.autocast(device_type=images.device.type, enabled=False):
-            tokens = self._patch_tokens(masked, metadata, modality, batch, views, hp, wp)
+        # TF32 off (conv and the metadata Linear): static patches must give
+        # identical tokens across calls with different batch sizes.
+        matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            with torch.autocast(device_type=images.device.type, enabled=False), \
+                    torch.backends.cudnn.flags(
+                        enabled=torch.backends.cudnn.enabled,
+                        benchmark=torch.backends.cudnn.benchmark,
+                        deterministic=torch.backends.cudnn.deterministic,
+                        allow_tf32=False):
+                tokens = self._patch_tokens(masked, metadata, modality, batch, views, hp, wp)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
         return evidence, tokens, coverage
 
     def forward(self, observation: ObservationStep, *, modality: str = "camera") -> tuple[Tensor, Tensor]:

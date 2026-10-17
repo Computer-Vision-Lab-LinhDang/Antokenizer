@@ -180,3 +180,12 @@ def test_scan_diagnostics_dc_feedback_ratio():
     diag = {}
     cell.scan(c0, d0, ev, torch.zeros_like(obs), dt, innovation=inn, diagnostics=diag)
     assert "dc_feedback_ratio" not in diag
+
+
+def test_scan_stores_no_feedback_ratio_when_c_write_is_exactly_zero():
+    cell, cfg = make()
+    ev, inn, obs, dt, c0, d0 = inputs(cfg)
+    for method in ("sequential", "associative"):
+        diag = {}
+        cell.scan(c0, d0, ev, obs, dt, innovation=torch.zeros_like(inn), method=method, diagnostics=diag)
+        assert "dc_feedback_ratio" not in diag

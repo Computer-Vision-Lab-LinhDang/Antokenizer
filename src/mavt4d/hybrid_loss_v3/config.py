@@ -11,6 +11,8 @@ UPPER_BOUND_VERSIONS = (
     "hybrid-cd-loss-v3-upper-bound-v1",
     "hybrid-cd-loss-v3-upper-bound-tiny-v1",
 )
+# Tiny B baseline on the same overfit profile as the tiny arms and arm U.
+TINY_B_VERSION = "hybrid-cd-loss-v3-tiny-v1"
 # Architecture arms, also derived from the version: version -> (arm, variant).
 # The variant is resolved against the base architecture by LossV3Module.
 ARCH_VERSIONS = {
@@ -27,6 +29,7 @@ ARCH_VERSIONS = {
 }
 OVERFIT_VERSIONS = (
     "hybrid-cd-loss-v3-upper-bound-tiny-v1",
+    TINY_B_VERSION,
     *(version for version in ARCH_VERSIONS if version.endswith("-tiny-v1")),
 )
 
@@ -54,6 +57,7 @@ class LossV3TrialConfig:
                 "hybrid-cd-loss-v3-vram-trial-v1",
                 "hybrid-cd-loss-v3-vram-trial-v2",
                 *UPPER_BOUND_VERSIONS,
+                TINY_B_VERSION,
                 *ARCH_VERSIONS,
             )
             or self.selection != "loss-v3-common-dev-v1"

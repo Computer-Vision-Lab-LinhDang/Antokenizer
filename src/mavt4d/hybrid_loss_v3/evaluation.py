@@ -26,14 +26,18 @@ BOOTSTRAP_SEED = 31415
 CONTROL_PROBES = (("c_core4_lastwrite", "c_lastwrite"), ("a_core4", "a"))
 
 
-def last_write_only_states(model, batch):
+def last_write_only_states(model, batch, states=None):
     """Final state when C/D are zeroed before the last step.
 
     KV, previous tokens and the appearance bank are kept, so a core probe on
     this C measures history re-derived at the last write rather than carried.
+    ``states`` (full-observation states of this batch) skips the prefix rerun.
     """
     last = batch.images.shape[2] - model.config.frames_per_step
-    prefix = full_observation_states(model, [batch], stop_frame=last)[-1]
+    if states is None:
+        prefix = full_observation_states(model, [batch], stop_frame=last)[-1]
+    else:
+        prefix = states[-2]
     zeroed = replace(prefix, c=torch.zeros_like(prefix.c), d=torch.zeros_like(prefix.d))
     return full_observation_states(model, [batch], start_frame=last, initial=zeroed)[-1]
 
@@ -164,7 +168,8 @@ def development(module, dataset, labels, deadlines, device, progress=None):
     # Memory controls exist only for v3 arms; B and U outputs are unchanged.
     v3 = is_v3(module.model.config)
     appearance = v3 and module.model.config.appearance_tokens > 0
-    appearance_only, feedback = [], []
+    appearance_only = []
+    feedback = {"stage1": [], "stage2": []}
     try:
         for split, groups in (
             ("train", dataset.train_groups),
@@ -185,25 +190,17 @@ def development(module, dataset, labels, deadlines, device, progress=None):
                     "d": states[-1].d.flatten(1).cpu(),
                 }
                 if v3:
-                    last_write = last_write_only_states(module.model, batch)
+                    last_write = last_write_only_states(module.model, batch, states)
                     entry["c_lastwrite"] = last_write.c.flatten(1).cpu()
                 if appearance:
                     entry["a"] = states[-1].appearance.flatten(1).cpu()
                 tables[split].append(entry)
                 if split == "dev":
                     if diagnostics is not None:
-                        try:
-                            feedback.append(
-                                [
-                                    float(diagnostics[stage]["dc_feedback_ratio"])
-                                    for stage in ("stage1", "stage2")
-                                ]
-                            )
-                        except KeyError:
-                            return {
-                                "complete": False,
-                                "reason": "missing feedback diagnostics",
-                            }
+                        for name in ("stage1", "stage2"):
+                            ratio = diagnostics[name].get("dc_feedback_ratio")
+                            if ratio is not None:
+                                feedback[name].append(float(ratio))
                     support = region_support(batch, labels[group])
                     error = _expected_reconstruction(
                         module.model, states, batch, support
@@ -216,11 +213,15 @@ def development(module, dataset, labels, deadlines, device, progress=None):
                     reconstruction.append(error)
                     if appearance:
                         # Same regions as E_R; validity depends only on masks.
-                        appearance_only.append(
-                            _expected_reconstruction(
-                                module.model, states, batch, support, zero_c=True
-                            )
+                        aonly = _expected_reconstruction(
+                            module.model, states, batch, support, zero_c=True
                         )
+                        if aonly is None:
+                            return {
+                                "complete": False,
+                                "reason": "invalid expected A-only reconstruction",
+                            }
+                        appearance_only.append(aonly)
                     pair = pair_eligibility(batch, batch.observed, labels[group], 3)
                     if not bool(pair.swap_valid.all()):
                         return {
@@ -265,8 +266,9 @@ def development(module, dataset, labels, deadlines, device, progress=None):
             # A-only render error (C zeroed); reported, never part of S_dev.
             metrics["E_R_aonly"] = sum(appearance_only) / len(appearance_only)
         if v3:
-            for stage, values in zip(("stage1", "stage2"), zip(*feedback)):
-                metrics[f"dc_feedback_ratio_{stage}"] = sum(values) / len(values)
+            for stage, values in feedback.items():
+                if values:
+                    metrics[f"dc_feedback_ratio_{stage}"] = sum(values) / len(values)
         for feature in ("c", "d"):
             metrics[f"{feature}_variant_contrast"] = sum(
                 float(variant_contrast(entry[feature])) for entry in tables["dev"]
