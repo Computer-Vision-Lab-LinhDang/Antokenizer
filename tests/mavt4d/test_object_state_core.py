@@ -305,3 +305,50 @@ def test_invalid_available_geometry_and_fractional_configuration_are_rejected():
     item = replace(evidence(), ray_directions=torch.zeros(2, 8, 3))
     with pytest.raises(ValueError, match="nonzero"):
         item.validate(config())
+
+
+def test_birth_proposals_receive_gradient_through_initialized_dynamic_state():
+    model = network()
+    state = model.predict(model.initial_state(2), torch.ones(2))
+    result, details = model.correct(state, evidence(), return_diagnostics=True)
+    assert details["births"].any()
+    model.predict(result, 0.1).d.square().sum().backward()
+    gradient = model.resampler.birth_descriptor.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+
+
+def test_background_dominant_tails_do_not_correct_occluded_allocated_objects(
+    monkeypatch,
+):
+    model = network()
+    state = model.predict(allocated(model), torch.ones(2))
+    item = evidence(count=128)
+
+    def background_ownership(state, evidence, controls, *, proposals=False):
+        probabilities = evidence.tokens.new_full((2, 128, 4), 0.001)
+        probabilities[..., -1] = 0.997
+        return probabilities
+
+    monkeypatch.setattr(model.resampler, "ownership", background_ownership)
+    result, details = model.correct(state, item, return_diagnostics=True)
+    assert not details["observed"].any()
+    for name in ("c", "d", "slot_status", "slot_uid", "last_seen", "p_exist"):
+        assert torch.equal(getattr(result, name), getattr(state, name)), name
+    assert details["support"].count_nonzero() == 0
+
+
+def test_candidate_budget_explicitly_enables_soft_all_evidence_warmup():
+    model = network()
+    state = model.predict(model.initial_state(2), torch.ones(2))
+    _, warm = model.correct(
+        state, evidence(), candidate_budget=0, return_diagnostics=True
+    )
+    _, sparse = model.correct(
+        state, evidence(), candidate_budget=3, return_diagnostics=True
+    )
+    assert warm["candidate_indices"].shape == (2, 3, 8)
+    assert sparse["candidate_indices"].shape == (2, 3, 3)
+    assert torch.equal(warm["candidate_indices"][0, 0], torch.arange(8))
+    with pytest.raises(ValueError, match="candidate_budget"):
+        model.correct(state, evidence(), candidate_budget=-1)

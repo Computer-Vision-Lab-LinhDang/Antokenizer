@@ -31,6 +31,7 @@ class ObjectResampler(nn.Module):
         self.birth_d = nn.Parameter(
             torch.randn(config.slots, config.dynamic_tokens, z) * 0.02
         )
+        self.birth_evidence = nn.Linear(e, config.dynamic_tokens * z, bias=False)
         self.background_descriptor = nn.Parameter(torch.randn(z) / math.sqrt(z))
         self.ownership_key = nn.Linear(e, z)
         self.dynamic_query = nn.Linear(z, z)
@@ -137,13 +138,25 @@ class ObjectResampler(nn.Module):
         attention = _masked_softmax(logits, valid[:, :, None, None, :])
         return (attention @ vs).transpose(-3, -2).reshape(b, k, q, z)
 
-    def _candidates(self, evidence: Evidence, ownership: Tensor):
+    def _candidates(self, evidence: Evidence, ownership: Tensor, candidate_budget=None):
         b, n, _ = evidence.tokens.shape
         k = self.config.slots
-        count = min(self.config.candidates, n)
-        weights, indices = (
-            ownership[..., :k].transpose(1, 2).topk(count, dim=-1, sorted=True)
+        budget = (
+            self.config.candidates if candidate_budget is None else candidate_budget
         )
+        if type(budget) is not int or budget < 0:
+            raise ValueError("candidate_budget must be a nonnegative integer or None")
+        count = n if budget == 0 else min(budget, n)
+        if budget == 0:
+            # Warm-up retains all soft ownership weights, without a top-k gate.
+            weights = ownership[..., :k].transpose(1, 2)
+            indices = torch.arange(n, device=ownership.device)[None, None].expand(
+                b, k, -1
+            )
+        else:
+            weights, indices = (
+                ownership[..., :k].transpose(1, 2).topk(count, dim=-1, sorted=True)
+            )
 
         def gather(value):
             # [B,N,...] -> [B,K,M,...], indices are always current-generation.
@@ -227,7 +240,13 @@ class ObjectResampler(nn.Module):
         return keys + self.canonical_geometry(geometry)
 
     def forward(
-        self, state: ObjectState, evidence: Evidence, controls, relations: Tensor
+        self,
+        state: ObjectState,
+        evidence: Evidence,
+        controls,
+        relations: Tensor,
+        *,
+        candidate_budget=None,
     ):
         """Caller selects observed batch rows; no all-missing attention is executed."""
         b, k = state.slot_status.shape
@@ -243,7 +262,18 @@ class ObjectResampler(nn.Module):
             & (proposal_peak >= self.config.birth_min_peak)
             & winners.any(1)
         )
-        born_d = self.birth_d[None].expand(b, -1, -1, -1)
+        # The discrete lifecycle decision is not differentiable. The selected
+        # proposal's evidence summary is, so birth descriptors receive task loss.
+        safe_tokens = torch.where(
+            evidence.valid[..., None],
+            evidence.tokens.float(),
+            torch.zeros_like(evidence.tokens, dtype=torch.float32),
+        )
+        proposal_values = torch.einsum("bnk,bne->bke", proposals[..., :k], safe_tokens)
+        proposal_values = proposal_values / proposal_mass.clamp_min(1e-12)[..., None]
+        born_d = self.birth_d[None] + self.birth_evidence(proposal_values).reshape(
+            b, k, self.config.dynamic_tokens, self.config.width
+        )
         initialized = replace(
             state,
             c=torch.where(births[..., None, None], torch.zeros_like(state.c), state.c),
@@ -257,7 +287,14 @@ class ObjectResampler(nn.Module):
         )
         # Mandatory second association: candidate indices bind only to initialized generations.
         ownership = self.ownership(initialized, evidence, controls, proposals=False)
-        support = ownership[..., :k].sum(1)
+        # Soft tails over a large image are not positive evidence for a slot.
+        # Require it to win local object competition and beat background.
+        objects = ownership[..., :k]
+        winning = F.one_hot(ownership.argmax(-1), k + 1)[..., :k].bool()
+        confident = (
+            winning & (objects > ownership[..., -1:]) & evidence.valid[..., None]
+        )
+        support = (objects * confident).sum(1)
         observed = initialized.allocated & (support >= self.config.observation_min_mass)
         (
             tokens,
@@ -269,7 +306,7 @@ class ObjectResampler(nn.Module):
             points,
             point_valid,
             indices,
-        ) = self._candidates(evidence, ownership)
+        ) = self._candidates(evidence, ownership, candidate_budget)
         keys = self.evidence_key(tokens)
         values = self.evidence_value(tokens)
         queries = (
@@ -301,7 +338,7 @@ class ObjectResampler(nn.Module):
         )
         entropy = -(ownership[..., :k].clamp_min(1e-12).log() * ownership[..., :k]).sum(
             1
-        ) / support.clamp_min(1e-12)
+        ) / ownership[..., :k].sum(1).clamp_min(1e-12)
         reliability = torch.stack(
             (torch.log1p(support), entropy, can_valid.float().mean(-1)), dim=-1
         )

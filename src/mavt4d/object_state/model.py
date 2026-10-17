@@ -49,10 +49,20 @@ class ObjectStateModel(nn.Module):
             return self.dynamics(state, dt, action)
 
     def correct(
-        self, state: ObjectState, evidence: Evidence, *, return_diagnostics=False
+        self,
+        state: ObjectState,
+        evidence: Evidence,
+        *,
+        return_diagnostics=False,
+        candidate_budget=None,
     ):
         state.validate(self.config)
         evidence.validate(self.config)
+        budget = (
+            self.config.candidates if candidate_budget is None else candidate_budget
+        )
+        if type(budget) is not int or budget < 0:
+            raise ValueError("candidate_budget must be a nonnegative integer or None")
         if (
             evidence.tokens.shape[0] != state.c.shape[0]
             or evidence.tokens.device != state.c.device
@@ -74,7 +84,7 @@ class ObjectStateModel(nn.Module):
                 "candidate_indices": torch.zeros(
                     b,
                     k,
-                    min(n, self.config.candidates),
+                    n if budget == 0 else min(n, budget),
                     device=state.c.device,
                     dtype=torch.int64,
                 ),
@@ -89,7 +99,11 @@ class ObjectStateModel(nn.Module):
         with torch.autocast(device_type=state.c.device.type, enabled=False):
             _, relations = self.dynamics.relations(selected)
             updated, details = self.resampler(
-                selected, selected_evidence, self.decoder.controls, relations
+                selected,
+                selected_evidence,
+                self.decoder.controls,
+                relations,
+                candidate_budget=candidate_budget,
             )
         values = {
             name: value.index_copy(0, indices, updated.tensor_dict()[name])
@@ -134,7 +148,13 @@ class ObjectStateModel(nn.Module):
         action: Tensor | None = None,
         *,
         return_diagnostics=False,
+        candidate_budget=None,
     ):
         evidence = self.encode_observation(observation)
         prior = self.predict(state, evidence.time.double() - state.t, action)
-        return self.correct(prior, evidence, return_diagnostics=return_diagnostics)
+        return self.correct(
+            prior,
+            evidence,
+            return_diagnostics=return_diagnostics,
+            candidate_budget=candidate_budget,
+        )
