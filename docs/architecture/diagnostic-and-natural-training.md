@@ -1,5 +1,9 @@
 # Diagnostic and natural-video training flows
 
+Last updated: **2026-10-17**. The first diagrams document the existing protocols.
+The loss v3 section is a planned objective change; no backbone change or v3
+training launch is included.
+
 These runs use the existing hybrid C/D + KV architecture in independent model instances. They do not alter the core state contract or overwrite the original pilot. The diagram describes training and selection, not a new backbone.
 
 ```mermaid
@@ -46,3 +50,54 @@ KV participates in temporal updates and restart; the image decoder reads only C/
 Neither objective guarantees C/D disentanglement. Improved history fitting, a larger D-swap prediction change, or lower natural-video reconstruction error does not alone demonstrate event semantics in C or configuration uniquely stored in D. The natural history target is an RGB-order surrogate, and no synthetic C/D labels are invented for natural clips. These runs do not use held-out results for tuning.
 
 Detailed frozen protocols: [C/D diagnostics and subsequent two-GPU run](../cd_diagnostic.md), [natural-video trial](../natural_video_trial.md). See also the [hybrid training architecture](mavt-hybrid-training.md) for the original pilot flow.
+
+## Same-frame read-only diagnostic
+
+This diagram traces existing decoder operations at one endpoint. It adds
+instrumentation, not another architecture or state transition. Legacy final-state
+metrics remain separate from the new `aligned_d/frame_003/` measurements.
+
+```mermaid
+flowchart LR
+    P["Observed prefix through frame 3<br/>Same source/core, two configurations"] --> S["Existing backbone<br/>C_a,D_a and C_b,D_b at frame 3"]
+    S --> D["D_a versus D_b<br/>Raw paired RMS"]
+    D --> M["Existing shared 16-D modulation<br/>Paired RMS"]
+    M --> R["Per-block routing controls<br/>Paired RMS"]
+    M --> G["Final gain controls<br/>Paired RMS / deviation from one"]
+    S --> C["Fixed receiver C_a<br/>Same frame-3 queries and camera"]
+    C --> O["Existing decoder<br/>Base, D swap, D zero"]
+    R --> O
+    G --> O
+    O --> E["Output change and target errors<br/>Signed paired-target gain<br/>Full image + moving region / validity"]
+    T["Frame-3 target pair<br/>Legacy target-only moving support"] --> E
+```
+
+Target support never enters the model. A swap changes D only for decoding;
+it is not rolled forward with either source's KV. A final-state D distance cannot
+be combined with this early-frame path to claim where information was lost.
+
+## Planned loss v3: B first
+
+The [loss v3 plan](../plans/mavt-cd-loss-v3.md) keeps the existing backbone and
+decoder. It replaces the C-only spatial RGB-history and projected invariance
+objectives with prefix-qualified event/order relations, consistency on actual C,
+and a collapse guard. Region-balanced self/future RGB and reciprocal same-event
+C/D cross-reconstruction retain rendering pressure. Pair metadata is additional
+synthetic supervision and stays outside model inputs.
+
+```mermaid
+flowchart LR
+    X["Same causal inputs and source splits"] --> B["Unchanged Patchify + Transformer<br/>+ two temporal C/D scan stages + KV"]
+    B --> Z["Same decoder-facing C/D code"]
+    Z --> R["Unchanged decoder<br/>Own C/D and decode-only paired C/D"]
+    R --> RGB["Planned region-balanced RGB<br/>Self / missing / future / paired target"]
+    Z --> C["Planned actual-C constraints<br/>Eligible event-order triplets<br/>Configuration consistency + variance floor"]
+    P["Loss-side source/core/config relations<br/>Observed-prefix eligibility only"] --> RGB
+    P --> C
+```
+
+The [2×2 ablation](../benchmarks/mavt-cd-loss-v3-ablation.md) compares old/new
+objectives and shared/query-conditioned D controls. B is the first selected
+implementation target; query-conditioned D is a later decoder candidate, not
+part of the architecture currently implemented. No new persistent memory is
+introduced by either proposed objective or decoder change.

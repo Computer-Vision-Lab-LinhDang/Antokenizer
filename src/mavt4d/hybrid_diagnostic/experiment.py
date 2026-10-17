@@ -120,6 +120,59 @@ def _region_l1(value, mask):
     return float(torch.where(expanded, value.abs(), 0.).sum() / expanded.sum().clamp_min(1))
 
 
+@torch.no_grad()
+def _aligned_d_readout_metrics(
+    decoder, early, config_swap, base_rgb, altered_images, target_rgb, moving, *, frame
+):
+    """Read-only D-to-image chain at one endpoint, with a versioned namespace.
+
+    Pair donors have the same source/core/phase and opposite configuration.
+    ``moving`` is the legacy full-clip target-only motion support; it never
+    enters the encoder or decoder. Empty support produces finite zeros plus
+    an explicit validity flag. Controls below include the decoder's tanh and
+    strength, rather than measuring only an unbounded linear projection.
+    """
+    prefix = f"aligned_d/frame_{frame:03d}"
+    modulation = decoder.d_bottleneck(early.d.flatten(1))
+    strength = 1.0 if isinstance(decoder, StrongerDDecoder) else 0.1
+    gain_deviation = strength * decoder.d_gain(modulation).tanh()
+    metrics = {
+        "state/d_configuration_rms": _rms(early.d - early.d[config_swap]),
+        "modulation/configuration_rms": _rms(modulation - modulation[config_swap]),
+        "gain/configuration_rms": _rms(gain_deviation - gain_deviation[config_swap]),
+        "gain/deviation_rms": _rms(gain_deviation),
+        "moving_pixel_fraction": float(moving.float().mean()),
+        "moving_pixel_count": float(moving.sum()),
+        "moving_valid": float(bool(moving.any())),
+    }
+    for index, block in enumerate(decoder.blocks):
+        routing = strength * block.d_routing(modulation).tanh()
+        metrics[f"routing/block_{index}/configuration_rms"] = _rms(
+            routing - routing[config_swap]
+        )
+    targets = {"original": target_rgb, "paired": target_rgb[config_swap]}
+    for name, rgb in {"base": base_rgb, **altered_images}.items():
+        for target_name, target in targets.items():
+            error = rgb - target
+            metrics[f"{name}/{target_name}_target_l1"] = float(error.abs().mean())
+            metrics[f"{name}/moving_{target_name}_target_l1"] = _region_l1(
+                error, moving
+            )
+        if name != "base":
+            metrics[f"{name}/output_l1"] = float((rgb - base_rgb).abs().mean())
+            metrics[f"{name}/moving_output_l1"] = _region_l1(rgb - base_rgb, moving)
+            # Signed improvement toward the same paired target; no clamping.
+            for region in ("", "moving_"):
+                metrics[f"{name}/{region}paired_target_gain"] = (
+                    metrics[f"base/{region}paired_target_l1"]
+                    - metrics[f"{name}/{region}paired_target_l1"]
+                )
+    return {
+        "aligned_d/protocol_version": 2.0,
+        **{f"{prefix}/{name}": value for name, value in metrics.items()},
+    }
+
+
 def _parameter_group(name):
     if name.startswith("history_head"):
         return "history_head"
@@ -166,6 +219,9 @@ def measure(module, batch, labels, *, gradients=False, images=True):
     Gradient losses are history MSE and all-endpoint clean reconstruction L1.
     They are diagnostic components, not the complete six-component objective.
     autograd.grad never populates or alters parameter .grad buffers.
+    Legacy state/modulation keys retain their final-endpoint semantics. The
+    aligned_d/frame_003 namespace measures D, bounded controls, and readout
+    interventions at frame 3; swaps are decoder-only, with receiver C/KV/time.
     """
     cfg = module.cfg
     device = batch.images.device
@@ -233,6 +289,18 @@ def measure(module, batch, labels, *, gradients=False, images=True):
                 result[f"intervention/{name}/paired_target_gain"] = (
                     _region_l1(base_rgb-target_rgb[config_swap], moving)
                     - _region_l1(rgb-target_rgb[config_swap], moving))
+            result.update(
+                _aligned_d_readout_metrics(
+                    module.model.decoder,
+                    early,
+                    config_swap,
+                    base_rgb,
+                    altered_images,
+                    target_rgb,
+                    moving,
+                    frame=frame,
+                )
+            )
             c_zero = render_group(module.model, replace(early, c=torch.zeros_like(early.c)), batch, frame)
             if torch.count_nonzero(c_zero):
                 raise AssertionError("diagnostic decoder violated exact C-zero contract")

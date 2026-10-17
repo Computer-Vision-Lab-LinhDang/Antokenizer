@@ -1,5 +1,8 @@
 # Bounded C/D optimization diagnostics
 
+Last updated: **2026-10-17**. The original experiment below remains frozen.
+The same-frame v2 measurements are a read-only addition, not new training.
+
 This protocol is separate from the frozen `hybrid-synthetic-pilot-v2` experiment.
 It does not overwrite its runs, snapshots, results, configuration, losses, or
 held-out measurements. The short experiments diagnose optimization mechanisms;
@@ -9,7 +12,7 @@ they are not a new generalization benchmark.
 
 The pilot's tiny phase improved image reconstruction but did not pass its ordered
 history target gate. Its D-swap evaluation changed reconstruction errors only
-slightly. Three mechanisms need distinguishing before extending training:
+slightly. Four mechanisms need distinguishing before extending training:
 
 1. The recurrent write probability starts near 0.01. There are only six physical
    steps per clip, so C/D magnitudes and order-sensitive writes can initially be
@@ -136,3 +139,57 @@ optimizer/work/external hard deadlines apply. A partial result records its actua
 step and most recent complete dev evaluation. Board utilization/power counters
 are filtered to the explicitly assigned physical GPU IDs and are snapshots,
 not integrated energy measurements; unavailable counters are not zero-filled.
+
+## Same-frame D-path diagnostic v2
+
+The legacy `state/*` and `decoder/*` measurements above read the final endpoint,
+whereas `intervention/*` reads frame 3. Preserve those keys and meanings. Comparing
+them as though they traced one state through the decoder is invalid.
+
+The additional namespace `aligned_d/` records `protocol_version = 2.0`. Under
+`aligned_d/frame_003/`, raw D, modulation, routing/gain and every image intervention
+read the **same state after the prefix through frame 3**, with the same queries,
+camera, physical time and fixed receiver C. Configuration donors are the paired
+same-source/core variant at that endpoint. This addition lives inside the existing
+`hybrid_diagnostic.experiment.measure` path; it is not a new loss, model module,
+CLI or training arm.
+
+| Keys below `aligned_d/frame_003/` | Meaning |
+|---|---|
+| `state/d_configuration_rms` | RMS difference between paired raw D values at frame 3 |
+| `modulation/configuration_rms` | RMS paired difference after the existing 16-D bottleneck |
+| `routing/block_{i}/configuration_rms` | RMS paired difference in the actual strength-scaled tanh routing control for each decoder block |
+| `gain/configuration_rms`, `gain/deviation_rms` | Paired gain-control difference, and RMS deviation of gain from one |
+| `moving_pixel_fraction`, `moving_pixel_count`, `moving_valid` | Support size and nonempty flag for the retained target-only moving-region definition |
+| `base/{original_target_l1,paired_target_l1}` | Baseline output error against its own and paired configuration target |
+| `base/{moving_original_target_l1,moving_paired_target_l1}` | The same two errors on the moving support |
+| `{d_swap,d_zero}/{output_l1,moving_output_l1}` | Actual prediction change from the unmodified output |
+| `{d_swap,d_zero}/{original_target_l1,paired_target_l1}` | Intervention error to each target, over all pixels |
+| `{d_swap,d_zero}/{moving_original_target_l1,moving_paired_target_l1}` | The same intervention errors on the moving support |
+| `{d_swap,d_zero}/{paired_target_gain,moving_paired_target_gain}` | Signed reduction in error to the paired target, over all pixels / moving support |
+
+For each intervention, paired-target gain is
+`error(base, paired_target) - error(intervened, paired_target)`. Positive means
+the intervention helped the intended target. Prediction change alone does not
+show useful configuration transfer. D-zero is a sensitivity control, not an
+instruction to render the paired target; its gain is reported for comparison.
+Zero D need not give zero modulation because the bottleneck contains biases.
+
+The moving support retains the legacy full-clip temporal RGB-change union,
+threshold `1e-5`, computed from targets only. It is not an input or a claim of
+causal mask prediction. This keeps output measurements comparable to the earlier
+diagnostic; it is distinct from the proposed v3 region-balanced training support.
+Empty support has `moving_valid=0`; any zero placeholder in a moving metric must
+be excluded from interpretation/aggregation. Full-image metrics remain valid.
+Predictions are measured unclipped.
+
+The diagnostic performs no optimizer update, changes no checkpoint and retains
+the module's previous train/eval mode. D swaps are decode-only: no recurrence is
+continued with mismatched C/D and KV. CPU tests check alignment and consistency
+with the legacy frame-3 output measurements; they do not establish learning.
+
+Use the path to distinguish weak representation, suppressed modulation,
+insensitive routing/gain, and output effects that miss the paired target. These
+are mechanism hypotheses on specific examples, not a claim that factorization
+has succeeded. See the [loss v3 plan](plans/mavt-cd-loss-v3.md) and
+[2×2 protocol](benchmarks/mavt-cd-loss-v3-ablation.md) for the accepted next design.
