@@ -50,8 +50,13 @@ class RuntimeConfig:
     run_name: str = "MAVT-object-state-full"
     project: str = "semantic-router"
     capacity_fraction: float = 0.9
+    capacity_max_groups: int | None = None
 
     def __post_init__(self):
+        if self.capacity_max_groups is not None and (
+            type(self.capacity_max_groups) is not int or self.capacity_max_groups < 1
+        ):
+            raise ValueError("capacity_max_groups must be a positive integer or None")
         if any(
             type(value) is not int or value < 1
             for value in (self.eval_sources, self.periodic_eval_sources, self.eval_rays)
@@ -331,6 +336,14 @@ def measure_capacity(
         raise ValueError("capacity mode requires actual CUDA measurements")
     if config.effective_groups > len(dataset):
         raise ValueError("capacity source groups must remain distinct")
+    maximum_groups = min(
+        config.effective_groups,
+        (
+            config.effective_groups
+            if runtime.capacity_max_groups is None
+            else runtime.capacity_max_groups
+        ),
+    )
     measured_times = []
     with _capacity_fixture(model, optimizer, seed=config.seed) as reset:
 
@@ -391,8 +404,21 @@ def measure_capacity(
             return result
 
         result = capacity_search(
-            probe, config.effective_groups, capacity_fraction=runtime.capacity_fraction
+            probe, maximum_groups, capacity_fraction=runtime.capacity_fraction
         )
+    # A host-resource cap bounds the search, not the physical GPU capacity.
+    # It never changes the effective optimization batch or its accumulation.
+    result["capacity_max_groups"] = runtime.capacity_max_groups
+    result["effective_groups"] = config.effective_groups
+    result["search_bound_reason"] = (
+        "runtime_capacity_max_groups"
+        if maximum_groups < config.effective_groups
+        else "effective_batch"
+    )
+    result["search_bound_reached"] = result["micro_groups"] == maximum_groups
+    result["gpu_memory_boundary_observed"] = any(
+        not measurement["safe"] for measurement in result["measurements"]
+    )
     result["capacity_fraction"] = runtime.capacity_fraction
     result["model_optimizer_rng_and_initial_state_method_restored"] = True
     return result

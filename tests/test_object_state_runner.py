@@ -406,3 +406,72 @@ def test_cpu_rng_and_loader_never_probe_cuda_availability(monkeypatch):
     torch.testing.assert_close(next(iter(loader)), torch.zeros(1, 1))
     with pytest.raises(ValueError, match="initialized CUDA"):
         _restore_rng({**state, "cuda": [torch.zeros(1, dtype=torch.uint8)]})
+
+
+def test_runtime_capacity_cap_accepts_only_positive_integers_or_none():
+    from mavt4d.object_state.runner import RuntimeConfig
+
+    assert RuntimeConfig().capacity_max_groups is None
+    assert RuntimeConfig(capacity_max_groups=32).capacity_max_groups == 32
+    for value in (0, -1, True, False, 1.5, "32"):
+        with pytest.raises(ValueError, match="capacity_max_groups"):
+            RuntimeConfig(capacity_max_groups=value)
+
+
+@pytest.mark.parametrize(
+    "cap,expected,reason",
+    [
+        (3, 3, "runtime_capacity_max_groups"),
+        (None, 8, "effective_batch"),
+        (20, 8, "effective_batch"),
+    ],
+)
+def test_capacity_measurement_respects_cap_without_changing_effective_batch(
+    monkeypatch, cap, expected, reason
+):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from mavt4d.object_state import runner
+    from mavt4d.object_state.training import TrainingConfig
+
+    calls = []
+
+    @contextmanager
+    def fixture(*args, **kwargs):
+        yield lambda: None
+
+    def update(model, optimizer, batches, trial, **kwargs):
+        groups = kwargs["micro_groups"]
+        assert trial.effective_groups == groups
+        assert next(batches).shape == (groups, 1)
+        calls.append(groups)
+        return {
+            "peak_reserved_bytes": groups * 10,
+            "device_total_bytes": 10000,
+            "update_seconds": float(groups),
+        }
+
+    monkeypatch.setattr(runner, "_capacity_fixture", fixture)
+    monkeypatch.setattr(runner, "run_update", update)
+    config = TrainingConfig(effective_groups=8)
+    runtime = runner.RuntimeConfig(capacity_max_groups=cap)
+    deadline = SimpleNamespace(
+        can_train=lambda *args: True, train=10000.0, clock=lambda: 0.0
+    )
+    result = runner.measure_capacity(
+        None,
+        None,
+        [torch.zeros(1)] * 8,
+        config,
+        runtime,
+        device=torch.device("cuda:0"),
+        logger=SimpleNamespace(log=lambda *args, **kwargs: None),
+        deadline=deadline,
+    )
+    assert max(calls) == result["maximum_groups_considered"] == expected
+    assert result["micro_groups"] == expected
+    assert config.effective_groups == result["effective_groups"] == 8
+    assert result["capacity_max_groups"] == cap
+    assert result["search_bound_reason"] == reason
+    assert result["search_bound_reached"] is True
+    assert result["gpu_memory_boundary_observed"] is False
