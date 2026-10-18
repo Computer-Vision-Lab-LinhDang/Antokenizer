@@ -64,9 +64,13 @@ class V6Lifecycle(nn.Module):
         miss = torch.where(drop, torch.zeros_like(miss), miss)
         streak = torch.where(drop, torch.zeros_like(st.seen_streak), st.seen_streak)
 
-        # Spawn: slots free at entry, existence > 0.5 and enough measured anchors.
+        # Spawn: slots free at entry, existence > 0.5 (or routed to a box by the training teacher) and enough
+        # measured anchors.
         valid = meas.anchor_meas_valid
-        spawn = (st.status == FREE) & (torch.sigmoid(meas.spawn_logit.float()) > .5) & (valid.sum(-1) >= self.spawn_anchors)
+        want = torch.sigmoid(meas.spawn_logit.float()) > .5
+        if meas.spawn_forced is not None:
+            want = want | meas.spawn_forced
+        spawn = (st.status == FREE) & want & (valid.sum(-1) >= self.spawn_anchors)
         st = replace(st, status=status, miss_streak=miss, seen_streak=streak)
         if not bool(spawn.any()):
             return st

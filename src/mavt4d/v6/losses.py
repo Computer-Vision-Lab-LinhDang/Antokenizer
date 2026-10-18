@@ -27,7 +27,7 @@ DEFAULT_WEIGHTS = {
     'recon_rgb': 1., 'recon_depth': .5,
     'pred_rgb': 1., 'pred_depth': .5,
     'enc_depth': .1,
-    'slot_pos': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05,
+    'slot_pos': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05, 'own_box': .1,
     'rig': .1,
 }
 BOX_KEYS = ('box_center', 'box_size', 'box_class', 'box_valid')
@@ -191,11 +191,14 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
        size, class CE (on a detached C_obj / anchors: understanding does not pull the state).
     2. Slots free in the prior and not spawned: their proposal (mean measured anchor, world) is matched
        without a gate to the boxes left over; L1 proposal -> box pulls proposals onto objects.
-    Spawn BCE on slots free in the prior (clips in spawn_mask): 1 if spawned onto a box (step 1) or the
-    proposal is within ``gate`` of a left-over box (step 2), else 0.
+    Spawn BCE on slots free in the prior (clips in spawn_mask): 1 if spawned onto a box (step 1), the
+    proposal is within ``gate`` of a left-over box (step 2) or the box teacher routed a box to it, else 0.
+    3. Box teacher: ownership CE pulls the tokens of each box onto the slot holding or given it (every
+       ownership layer).
     """
     zero = _zero(state.position)
-    terms = {'slot_pos': zero, 'slot_extent': zero, 'slot_class': zero, 'spawn': zero, 'proposal': zero}
+    terms = {'slot_pos': zero, 'slot_extent': zero, 'slot_class': zero, 'spawn': zero, 'proposal': zero,
+             'own_box': zero}
     if any(key not in targets for key in BOX_KEYS):
         return terms, {}
     with torch.autocast(device_type=state.position.device.type, enabled=False):
@@ -231,7 +234,15 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
             dist = (prop - box_p).abs().sum(-1)
             terms['proposal'] = masked_mean(dist, got)
             near = got & ((prop - box_p).detach().norm(dim=-1) < gate)
-            target = ((hit & free) | near).float()
+            target = (hit & free) | near
+            if meas.spawn_forced is not None:
+                target = target | (meas.spawn_forced & free)
+                tok = meas.forced_slot
+                nll = [-own.float().gather(-1, tok.clamp_min(0)[..., None]).squeeze(-1).clamp_min(1e-6).log()
+                       for own in meas.ownership_by_layer]
+                terms['own_box'] = masked_mean(torch.stack(nll).mean(0), tok >= 0)
+                logs['forced_spawns'] = meas.spawn_forced.float().sum(-1).mean()
+            target = target.float()
             mask = free & clips[:, None]
             bce = F.binary_cross_entropy_with_logits(meas.spawn_logit.float(), target, reduction='none')
             terms['spawn'] = masked_mean(bce, mask)
@@ -285,24 +296,32 @@ def step_terms(model, state, obs, targets, observed, *, aux=None, rays_per_camer
     return terms, logs
 
 
-def advance(model, state, obs, observed):
+def teacher_boxes(targets: dict):
+    """World GT boxes for the trunk's box teacher, or None when the targets carry no box orientation."""
+    if 'box_quat' not in targets or any(key not in targets for key in BOX_KEYS):
+        return None
+    return {'center': targets['box_center'], 'size': targets['box_size'], 'quat': targets['box_quat'],
+            'valid': targets['box_valid']}
+
+
+def advance(model, state, obs, observed, boxes=None):
     """step() for clips in observed [B], predict() for the rest. Returns (state, aux or None)."""
     if not bool(observed.any()):
         return model.predict(state, obs.t - state.t), None
-    post, aux = model.step(state, obs)
+    post, aux = model.step(state, obs, boxes=boxes)
     if not bool(observed.all()):
         post = where_state(observed, post, model.predict(state, obs.t - state.t))
     return post, aux
 
 
 def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera=256, bptt=3,
-                  backward=None, autocast=None, gate=4.):
+                  backward=None, autocast=None, gate=4., box_teacher=True):
     """Run one batch of clips. steps: list[Observation] (T), targets: list[dict] (T).
 
     Clip b observes its first S_b steps (S_b from seeds[b]) and is rolled out with predict() after.
     The state is detached every ``bptt`` steps; with ``backward`` (callable on a chunk loss) each chunk
     is backpropagated right away to free its graph. Returns (total loss: tensor if backward is None,
-    else detached), log dict of floats.
+    else detached), log dict of floats. box_teacher: in training, GT boxes route evidence to free slots.
     """
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
     ctx = autocast or contextlib.nullcontext
@@ -314,7 +333,8 @@ def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera
     total, chunk, sums, hits = 0., 0., {}, {}
     for t in range(n):
         with ctx():
-            state, aux = advance(model, state, steps[t], observed[:, t])
+            boxes = teacher_boxes(targets[t]) if box_teacher and model.training else None
+            state, aux = advance(model, state, steps[t], observed[:, t], boxes=boxes)
             terms, logs = step_terms(model, state, steps[t], targets[t], observed[:, t], aux=aux,
                                      rays_per_camera=rays_per_camera, gate=gate)
             loss = sum(weights.get(k, 0.) * v.float() for k, v in terms.items()) / n

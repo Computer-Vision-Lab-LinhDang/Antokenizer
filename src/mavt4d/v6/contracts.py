@@ -208,6 +208,9 @@ class TrunkOutput:
     spawn_logit: Tensor      # [B,K] existence logit for free slots
     spawn_canon: Tensor      # [B,K,A,3] canonical anchors proposed for a new slot
     camera_rows: Tensor      # [B,V] int64 state camera row used by each input camera
+    # Training only (box teacher): a GT box picks which evidence tokens a free slot measures.
+    spawn_forced: Tensor | None = None  # [B,K] bool free slot routed to an unclaimed box
+    forced_slot: Tensor | None = None   # [B,Ne] int64 slot holding or given the token's box, -1 none
 
 
 @dataclass(frozen=True)

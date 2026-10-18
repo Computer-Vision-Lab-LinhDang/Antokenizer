@@ -17,6 +17,7 @@ from .contracts import RayBatch, RenderOutput, V6State
 from .geometry import quat_to_matrix
 
 MIN_HALF_EXTENT = 0.1   # m, box floor per axis
+FIELD_MAX_VALUES = 1 << 28
 KNN = 4                 # anchors used by the inverse deformation
 ATLAS_EXTENT = 4.0      # m, atlas: 8^3 cells over [-extent, extent)^3, cell = x + 8y + 64z, LSB first (v5 layout)
 HIT_OPACITY = 1e-4      # below this a ray has no surface
@@ -199,6 +200,11 @@ class V6Decoder(nn.Module):
         bg_kv = self.background.tokens(state.background)
         with _no_autocast(rays.origin):
             rig = quat_to_matrix(state.rig_orientation.float())
+        # Field calls see B * chunk * slots-per-ray * samples * width values; past ~2^31 bytes ROCm kernels fail
+        # (hipErrorInvalidValue at batch 32), so the ray chunk shrinks with the batch.
+        per_ray = rays.origin.shape[0] * min(self.cfg.max_slots_per_ray, self.cfg.slots) * self.cfg.samples_per_segment \
+            * self.cfg.decoder_width
+        chunk = max(64, min(chunk, FIELD_MAX_VALUES // per_ray))
         parts = []
         for start in range(0, rays.origin.shape[1], chunk):
             sl = slice(start, start + chunk)

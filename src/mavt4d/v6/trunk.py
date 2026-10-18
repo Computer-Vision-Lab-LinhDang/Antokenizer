@@ -25,6 +25,9 @@ NO_RIG_LOG_R = 20.0    # rig measurement log-variance when no camera is routed
 ASSIGN_DIM = 64
 OWN_DIM = 64
 LOG_Z_CLAMP = (-5.0, 6.0)
+BOX_MIN_TOKENS = 4     # box teacher: evidence tokens inside a box before it may seed a slot
+BOX_MARGIN = (1.1, .25)  # box teacher: half-extent scale and pad (m) for the inside test
+BOX_CLAIM_M = 1.5      # box teacher: an allocated slot within max(this, half box diagonal) already holds the box
 
 
 def _mlp(i, o, hidden=None):
@@ -64,6 +67,20 @@ class TokenPoints(NamedTuple):
     features: Tensor   # [B,V,N,F] per-token evidence inputs: hypotheses, measured tag, source flag
 
 
+# Guard: keep one masked SDPA call under 2^28 scores (B*H*T*T); very large calls hit hipErrorInvalidValue on ROCm.
+SDPA_MAX_SCORES = 1 << 28
+
+
+def _sdpa_batched(q, k, v, mask):
+    b, h, t, _ = q.shape
+    step = max(1, SDPA_MAX_SCORES // (h * t * k.shape[2]))
+    if b <= step:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.)
+    return torch.cat([F.scaled_dot_product_attention(q[i:i + step], k[i:i + step], v[i:i + step],
+                                                     attn_mask=mask[i:i + step] if mask.shape[0] > 1 else mask,
+                                                     scale=1.) for i in range(0, b, step)])
+
+
 class _Block(nn.Module):
     """Pre-norm attention + MLP. QK-norm with a learned per-head logit scale, capped."""
 
@@ -82,7 +99,7 @@ class _Block(nn.Module):
         k = F.normalize(k, dim=-1)
         if mask.dtype != torch.bool:
             mask = mask.to(q.dtype)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=1.)
+        y = _sdpa_batched(q, k, v, mask)
         x = x + self.proj(y.transpose(1, 2).reshape(b, t, c))
         return x + self.mlp(self.norm2(x))
 
@@ -358,8 +375,75 @@ class V6Trunk(nn.Module):
         trash = F.one_hot(torch.tensor(cfg.slots, device=x.device), cfg.slots + 1).to(own.dtype)
         return torch.where(ev_valid[..., None], own, trash)
 
+    # ---- box teacher (training only) -------------------------------------------------------------------------
+    def _box_teacher(self, state, enc, obs, tp, own, alloc, boxes):
+        """Unclaimed GT boxes choose which evidence tokens a free slot measures; the values stay evidence-only.
+
+        A token is in a box when its LiDAR-tagged or its own depth point falls inside. A box with an allocated
+        slot near its centre is held by the nearest one; each other box with enough tokens goes (greedy) to the
+        free slot that already owns most of them.
+        Returns forced [B,K] bool, token slot [B,Ne] int64: the slot holding or given the token's box (-1: none).
+        """
+        k = self.cfg.slots
+        b, v, n, _ = tp.points.shape
+        dev = tp.points.device
+        with no_autocast(tp.points):
+            center, size, box_ok = boxes['center'].float(), boxes['size'].float(), boxes['valid'].bool()
+            m = center.shape[1]
+            forced = torch.zeros(b, k, dtype=torch.bool, device=dev)
+            if m == 0:
+                return forced, torch.full((b, v * n), -1, dtype=torch.long, device=dev)
+            # rig -> world: metadata pose where known (a training teacher may use it), else the prior's
+            known = obs.rig_pose_valid.bool().to(dev)
+            pose = obs.rig_pose.float()
+            r_wr = torch.where(known[:, None, None], pose[:, :3, :3], quat_to_matrix(state.rig_orientation.float()))
+            t_wr = torch.where(known[:, None], pose[:, :3, 3], state.rig_position.float())
+            c_rig = torch.einsum('bji,bmj->bmi', r_wr, center - t_wr[:, None])
+            r_box = r_wr.transpose(-1, -2)[:, None] @ quat_to_matrix(boxes['quat'].float())   # box -> rig
+            half = size * .5 * BOX_MARGIN[0] + BOX_MARGIN[1]
+
+            def inside(p):  # [B,Ne,3] rig -> [B,Ne,M]
+                local = torch.einsum('bmji,bnmj->bnmi', r_box, p[:, :, None] - c_rig[:, None])
+                return (local.abs() <= half[:, None]).all(-1)
+
+            ray = torch.where(tp.valid[..., None], enc.ray_cam.float(), enc.ray_cam.new_tensor([0., 0., 1.]).float())
+            z = enc.measured_depth.float()[..., 0].clamp(*LOG_Z_CLAMP).exp()
+            t = obs.cam_to_rig.float()
+            p_lid = torch.einsum('bvij,bvnj->bvni', t[..., :3, :3], ray / ray[..., 2:].clamp_min(1e-6) * z[..., None]) \
+                + t[:, :, None, :3, 3]
+            lid_ok = (enc.measured_valid & tp.valid).flatten(1)[..., None]
+            hit = (inside(p_lid.flatten(1, 2)) & lid_ok) | inside(tp.points.float().flatten(1, 2).detach())
+            hit = hit & tp.valid.flatten(1)[..., None] & box_ok[:, None]
+            hit = hit & (hit.long().cumsum(-1) == 1)                  # one box per token
+            count = hit.sum(1)                                       # [B,M]
+            reach = torch.clamp(.5 * size.norm(dim=-1), min=BOX_CLAIM_M)
+            dist = torch.cdist(state.position.float(), center)
+            near = (dist < reach[:, None]) & alloc[..., None]
+            claimed = near.any(1)
+            holder = torch.where(claimed & box_ok, dist.masked_fill(~near, float('inf')).argmin(1), -1)   # [B,M]
+            eligible = box_ok & ~claimed & (count >= BOX_MIN_TOKENS)
+            score = torch.einsum('bnm,bnk->bmk', hit.float(), own[..., :k].detach().float()) + 1e-3 * count[..., None]
+            score = score.masked_fill(~eligible[..., None] | alloc[:, None], float('-inf'))
+            slot_box = torch.full((b, k), m, dtype=torch.long, device=dev)
+            rows = torch.arange(b, device=dev)
+            for _ in range(min(m, k)):
+                best, flat = score.flatten(1).max(-1)
+                ok = torch.isfinite(best)
+                if not bool(ok.any()):
+                    break
+                bi, ki = flat // k, flat % k
+                forced[rows, ki] |= ok
+                slot_box[rows, ki] = torch.where(ok, bi, slot_box[rows, ki])
+                score[rows, bi] = torch.where(ok[:, None], float('-inf'), score[rows, bi])
+                score[rows, :, ki] = torch.where(ok[:, None], float('-inf'), score[rows, :, ki])
+            box_slot = F.pad(holder, (0, 1), value=-1)
+            box_slot.scatter_(1, slot_box, torch.where(forced, torch.arange(k, device=dev), -1))
+            box_slot[:, m] = -1
+            tok_box = torch.where(hit.any(-1), hit.float().argmax(-1), m)
+            return forced, box_slot.gather(1, tok_box)
+
     # ---- forward -------------------------------------------------------------------------------------------
-    def forward(self, state: V6State, enc: EncoderOutput, obs: Observation) -> TrunkOutput:
+    def forward(self, state: V6State, enc: EncoderOutput, obs: Observation, boxes: dict | None = None) -> TrunkOutput:
         cfg = self.cfg
         b, v, n, _ = enc.tokens.shape
         k, a, tps, vm = cfg.slots, cfg.anchors, cfg.tokens_per_slot, cfg.max_cameras
@@ -422,6 +506,13 @@ class V6Trunk(nn.Module):
         cos = torch.einsum('bnd,bkad->bnka', F.normalize(self.assign_q(xe).float(), dim=-1), F.normalize(akey.float(), dim=-1))
         assign = (self.assign_log_scale.exp().clamp(max=cfg.logit_scale_max) * cos).softmax(-1)
         weight = own[..., :k, None] * assign * ev_valid[:, :, None, None]
+        forced = token_slot = None
+        if boxes is not None:
+            forced, token_slot = self._box_teacher(state, enc, obs, tp, own, alloc, boxes)
+            # a forced slot measures exactly its box's tokens, each on its most likely anchor
+            hard = torch.zeros_like(assign).scatter_(-1, assign.argmax(-1, keepdim=True), 1.)
+            mine = (token_slot[..., None] == torch.arange(k, device=dev)) & ev_valid[..., None]
+            weight = torch.where(forced[:, None, :, None], hard * mine[..., None], weight)
         anchor_meas, meas_valid, mass = self.measure_anchors(points, weight)
 
         with no_autocast(points):
@@ -456,4 +547,4 @@ class V6Trunk(nn.Module):
             background_prop=bg[..., :-1], background_vis=torch.sigmoid(bg[..., -1]),
             spawn_logit=self.spawn_head(xs[:, :, dp]).float().squeeze(-1),
             spawn_canon=self.canon_head(neo).view(b, k, a, 3).float(),
-            camera_rows=rows)
+            camera_rows=rows, spawn_forced=forced, forced_slot=token_slot)

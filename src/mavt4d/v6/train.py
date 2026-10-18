@@ -69,6 +69,8 @@ def parse_args(argv=None):
     p.add_argument('--config', default='{}', help='JSON V6Config overrides, e.g. \'{"slots": 24}\'')
     p.add_argument('--device', default=None, help='default: cuda:LOCAL_RANK if available, else cpu')
     p.add_argument('--dry-run', action='store_true', help='synthetic random batches, no dataset')
+    p.add_argument('--no-box-teacher', dest='box_teacher', action='store_false',
+                   help='no GT-box routing of evidence to free slots (default: on while training)')
     p.add_argument('--no-heldout', dest='heldout', action='store_false',
                    help='feed every camera (default: hold one camera per clip out as a render target)')
     args = p.parse_args(argv)
@@ -187,7 +189,7 @@ def batch_to_sequence(batch, device, min_box_points=MIN_BOX_POINTS, heldout=Fals
             obs = dataclasses.replace(obs, camera_valid=cam_ok & ~held)
         steps.append(obs)
         if boxes is not None:
-            tg.update(box_center=boxes['center'][:, s], box_size=boxes['size'][:, s],
+            tg.update(box_center=boxes['center'][:, s], box_size=boxes['size'][:, s], box_quat=boxes['quaternion'][:, s],
                       box_class=boxes['category'][:, s],
                       box_valid=boxes['mask'][:, s].bool() & (boxes['num_interior_pts'][:, s] >= min_box_points))
         targets.append(tg)
@@ -384,7 +386,7 @@ def main(argv=None):
         opt.zero_grad(set_to_none=True)
         _, log = sequence_loss(model, steps, targets, seeds=seeds, weights=weights,
                                rays_per_camera=args.rays_per_camera, bptt=args.bptt, backward=backward,
-                               autocast=autocast, gate=args.match_gate)
+                               autocast=autocast, gate=args.match_gate, box_teacher=args.box_teacher)
         allreduce_grads(params, world)
         gnorm = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
         if math.isfinite(gnorm):

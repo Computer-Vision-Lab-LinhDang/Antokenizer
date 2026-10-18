@@ -68,7 +68,7 @@ def make_trunk(seed=0, **overrides):
 
 
 def out_dict(out):
-    d = {f.name: getattr(out, f.name) for f in fields(TrunkOutput)}
+    d = {f.name: getattr(out, f.name) for f in fields(TrunkOutput) if getattr(out, f.name) is not None}
     for i, o in enumerate(d.pop('ownership_by_layer')):
         d[f'ownership_by_layer{i}'] = o
     return d

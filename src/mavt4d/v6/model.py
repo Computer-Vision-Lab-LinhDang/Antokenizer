@@ -76,13 +76,14 @@ class V6Model(nn.Module):
         t = torch.as_tensor(t, device=state.t.device, dtype=torch.float64)
         return t.expand_as(state.t) - state.t  # f64 seconds; dynamics does the math in fp32
 
-    def step(self, state: V6State, obs: Observation):
-        """Observed step. Returns the posterior at obs.t and aux {enc, meas, prior}."""
+    def step(self, state: V6State, obs: Observation, boxes: dict | None = None):
+        """Observed step. Returns the posterior at obs.t and aux {enc, meas, prior}.
+        boxes (training only): world GT boxes {center, size, quat, valid} for the trunk's box teacher."""
         dt = self._dt(state, obs.t)
         prior = self.dynamics(state, dt)
         prior = replace(prior, t=obs.t.to(prior.t.dtype))  # exact clock, no f32 rounding
         enc = self.encoder(obs)
-        meas = self.trunk(prior, enc, obs)
+        meas = self.trunk(prior, enc, obs, boxes=boxes)
         post = self.writer(prior, meas, obs)
         post = self.lifecycle(post, meas, obs)
         return post, {'enc': enc, 'meas': meas, 'prior': prior}
