@@ -24,8 +24,8 @@ except Exception:  # pragma: no cover - depends on the environment
     linear_sum_assignment = None
 
 DEFAULT_WEIGHTS = {
-    'recon_rgb': 1., 'recon_depth': .5, 'recon_occ': .2,
-    'pred_rgb': 1., 'pred_depth': .5, 'pred_occ': .2,
+    'recon_rgb': 1., 'recon_depth': .5, 'recon_occ': .5,
+    'pred_rgb': 1., 'pred_depth': .5, 'pred_occ': .5,
     'enc_depth': .1,
     'slot_pos': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05, 'own_box': .1, 'assign_box': .1,
     'rig': .1,
@@ -111,8 +111,9 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
 
     cams: images [B,V,3,H,W], intrinsics [B,V,3,3], cam_to_rig [B,V,4,4], camera_valid [B,V],
     depth [B,V,H,W] (target depth, camera z), depth_valid [B,V,H,W].
-    With world GT boxes and rig (rig_to_world): class-balanced opacity BCE on target-depth rays, 1 where the
-    LiDAR point lies in a box, else 0 (objects are opaque slots; the rest belongs to the background).
+    With world GT boxes and rig (rig_to_world): class-balanced opacity BCE on target-depth rays that cross a
+    slot box (others have no density to move), 1 where the LiDAR point lies in a GT box, else 0 (objects are
+    opaque slots; the rest belongs to the background).
     Returns {rgb, rgb_n, depth, depth_n, occ, occ_n} ([B] each) and a log dict.
     """
     images = cams['images']
@@ -145,7 +146,7 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
             p_cam = uv1 @ torch.linalg.inv(k).transpose(-1, -2) * z_t.view(b, v, r, 1)
             p_rig = (p_cam @ c2r[..., :3, :3].transpose(-1, -2) + c2r[..., None, :3, 3]).reshape(b, v * r, 3)
             on = points_in_boxes(p_rig, boxes, *rig)
-            ok = ray_ok & z_ok
+            ok = ray_ok & z_ok & model.decoder.slot_hits(state, rays).any(-1)
             p = out.opacity.float().clamp(1e-4, 1 - 1e-4)
             bce = -torch.where(on, p.log(), (1 - p).log())
             pos, pos_n = _clip_mean(bce, ok & on)
