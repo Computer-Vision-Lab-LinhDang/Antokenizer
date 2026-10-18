@@ -38,7 +38,10 @@ class FunctionalResampler(nn.Module):
 
     def ownership(self,state,ev,decoder,*,proposals=False):
         desc=self.descriptor(torch.cat((state.c.mean(-2),state.d.mean(-2)),-1))
-        desc=torch.where(state.allocated[...,None],desc,self.slot_seed[None])
+        # Keep the birth identity descriptor until its first content write.
+        # Switching immediately to a random projection of empty C can route
+        # every newborn back to dustbin before either read gets evidence.
+        desc=torch.where(state.content_initialized[...,None],desc,self.slot_seed[None])
         keys=self.ownership_key(ev['tokens'])
         scores=torch.einsum('bnd,bkd->bnk',keys,torch.cat((desc,self.dustbin[None,None].expand(len(desc),1,-1)),1))/math.sqrt(self.cfg.width)
         centers=decoder.controls(state.d)[...,:3,3]
@@ -96,8 +99,19 @@ class FunctionalResampler(nn.Module):
         b,n,_=ev['tokens'].shape
         k=self.cfg.slots
         hypotheses=ev['points'].shape[2]
-        proposal,_=self.ownership(state,ev,decoder,proposals=True)
+        proposal,proposal_logits=self.ownership(state,ev,decoder,proposals=True)
         winners=F.one_hot(proposal.argmax(-1),k+1)[...,:k].bool()&ev['valid'][...,None]
+        # Empty scenes need one bounded bootstrap proposal even if a random
+        # dustbin logit initially beats every slot. Reserve one observed patch,
+        # never a fabricated geometry/status label; later dustbin remains free.
+        bootstrap=(~state.content_initialized.any(-1))&(~winners.any((1,2)))&ev['valid'].any(-1)
+        if bootstrap.any():
+            scores=proposal_logits[...,:k].detach().masked_fill(~ev['valid'][...,None],-torch.inf)
+            chosen=scores.flatten(1).argmax(-1)
+            reservation=F.one_hot(chosen,n*k).reshape(b,n,k).bool()
+            winners=winners|(reservation&bootstrap[:,None,None])
+        reserved=winners&(~state.content_initialized)[:,None]
+        reserved_rows=reserved.any(-1,keepdim=True)
         births=(~state.allocated)&winners.any(1)
         mass=proposal[...,:k].sum(1)
         pooled=torch.einsum('bnk,bne->bke',proposal[...,:k],ev['tokens'])/mass.clamp_min(1e-12)[...,None]
@@ -106,6 +120,7 @@ class FunctionalResampler(nn.Module):
                             slot_status=torch.where(births,torch.ones_like(state.slot_status),state.slot_status),slot_uid=state.slot_uid+births.long())
         ownership,logits=self.ownership(initialized,ev,decoder)
         winner=F.one_hot(ownership.argmax(-1),k+1)[...,:k].bool()&ev['valid'][...,None]
+        winner=torch.where(reserved_rows,reserved,winner)
         observed=winner.any(1)&initialized.allocated
         base_key=self.key(self.evidence_norm(ev['tokens']))
         base_val=self.value(self.evidence_norm(ev['tokens']))
@@ -146,6 +161,7 @@ class FunctionalResampler(nn.Module):
         corrected=replace(initialized,d=d)
         refined,_=self.ownership(corrected,ev,decoder)
         winning=F.one_hot(refined.argmax(-1),k+1)[...,:k].bool()&ev['valid'][...,None]
+        winning=torch.where(reserved_rows,reserved,winning)
         observed_c=winning.any(1)&initialized.allocated
         transform,z=decoder.extended_controls(d)
         canonical=decoder.canonical(points,transform,z)
@@ -157,6 +173,10 @@ class FunctionalResampler(nn.Module):
         cweights,cvalid=weights_and_valid(refined.detach())
         cweights=cweights.detach()
         cvalid=cvalid&geometry_available&torch.isfinite(canonical).all(-1)&observed_c[...,None]
+        # A newborn's first write reads its reserved support, so top-k cannot
+        # discard the only bootstrap patch in favor of unassigned equal scores.
+        first_support=winning.transpose(1,2)[...,None].expand(-1,-1,-1,hypotheses).flatten(-2)
+        cvalid=cvalid&(initialized.content_initialized[...,None]|first_support)
         cq=self.query(self.norm(initialized.c)+self.role[0]+self.c_index[None,None])
         content_read,attention=self.read(cq,ckeys,values,cweights,cvalid,return_attention=True)
         content=self.c_update(content_read)
@@ -196,7 +216,7 @@ class FunctionalResampler(nn.Module):
                        p_exist=torch.where(observed_c,exist,state.p_exist),
                        provenance=torch.where(can_write,measured_fraction,state.provenance))
         return output,{'ownership':refined,'ownership_logits':logits,'ownership_entropy':entropy,'births':births,
-                       'observed':observed_c,'support':support,'reliability':reliability,
+                       'observed':observed_c,'bootstrap':bootstrap,'support':support,'reliability':reliability,
                        'reliability_valid':(target_mass>1e-8)&can_write[:,:,None,None],
                        'reliability_target':reliability_target, 'content_support':token_support,
                        'content_attention':attention,'canonical_points':canonical,'canonical_valid':atlas_valid,

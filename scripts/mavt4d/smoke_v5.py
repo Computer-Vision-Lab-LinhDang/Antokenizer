@@ -33,10 +33,11 @@ def fixture(height, width, *, geometry):
     if geometry:
         k = torch.tensor([[width,0,width/2],[0,width,height/2],[0,0,1.]])
         depth = torch.full((frames,1,1,height,width),2.)
-        # Keep patch-center measurements in the input; hold out other pixels.
-        # Removing even/even pixels would remove every 16px patch center and
-        # accidentally smoke only the pose-only path.
-        input_valid=valid.clone(); input_valid[...,1::2,1::2]=False
+        # Keep patch centers. Alternate the held-out columns over time so a
+        # current target can have trusted depth evidence in an earlier frame.
+        # Input and target remain disjoint at every individual time step.
+        input_valid=valid.clone()
+        for t in range(frames): input_valid[t,...,1::2,(t//2)%2::2]=False
         clip.update(intrinsics=k.expand(frames,1,3,3).clone(),
                     camera_c2w=torch.eye(4).expand(frames,1,4,4).clone(),
                     camera_valid=torch.ones(frames,1,dtype=torch.bool),
@@ -87,13 +88,23 @@ def main():
             grads=[p.grad for p in model.parameters() if p.grad is not None]
             if not torch.isfinite(loss) or not all(torch.isfinite(g).all() for g in grads):
                 raise FloatingPointError('smoke nonfinite loss/gradient')
+            def module_grad_norm(module):
+                return sum(float(p.grad.detach().square().sum()) for p in module.parameters() if p.grad is not None)**.5
+            content_grad=module_grad_norm(model.resampler.c_update)
+            reliability_grad=module_grad_norm(model.resampler.reliability)
+            if content_grad == 0 or (geometry and reliability_grad == 0):
+                raise AssertionError('smoke must exercise content and supervised reliability gradients')
             norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.); optimizer.step()
             model.eval()
             with torch.no_grad():
                 state,_,diagnostics=observe_prefix(model,[clip],seed=20)
                 measured_tokens=sum(int(d.get('geometry_measured',torch.tensor(0)).sum()) for d in diagnostics)
+                reliability_labels=sum(int(d.get('reliability_valid',torch.tensor(0)).sum()) for d in diagnostics)
+                initialized_slots=int(state.content_initialized.sum())
                 if geometry and measured_tokens == 0:
                     raise AssertionError('geometry smoke must actually admit measured patch centers')
+                if initialized_slots == 0 or (geometry and reliability_labels == 0):
+                    raise AssertionError('smoke must initialize content and label reliability')
                 predicted=model.predict(state,.5)
                 restored=V5State.from_payload(state.to_payload(),cfg)
                 again=model.predict(restored,.5)
@@ -106,6 +117,8 @@ def main():
             record={**metrics,'loss':float(loss.detach()),'gradient_norm':float(norm),
                     'geometry':int(geometry),'seconds':time.monotonic()-started,
                     'measured_geometry_tokens':measured_tokens,
+                    'reliability_labeled_tokens':reliability_labels,'initialized_slots':initialized_slots,
+                    'content_gradient_norm':content_grad,'reliability_gradient_norm':reliability_grad,
                     'state_bytes':state.total_nbytes,'peak_reserved':torch.cuda.max_memory_reserved() if torch.cuda.is_available() and 'cuda' in args.device else 0}
             records.append(record); logger.log(record,step=step)
             _save(args.output/'last.pt',model,optimizer,lock={'model':cfg.to_dict(),'purpose':'smoke'},step=step,run_id=logger.run_id,capacities={'fixture':1})
