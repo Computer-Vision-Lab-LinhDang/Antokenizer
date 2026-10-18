@@ -73,32 +73,36 @@ def similarity_components(state):
 
 
 def metric_query_to_scene(state,query):
-    if not state.metric_valid.all():
-        raise ValueError('metric query requires observable metric calibration')
-    scale,rotation,translation=similarity_components(state)
-    origin=torch.einsum('bij,brj->bri',rotation.transpose(-1,-2),query.origins-translation[:,None])/scale[:,None,None]
-    direction=torch.einsum('bij,brj->bri',rotation.transpose(-1,-2),query.directions)
-    near=torch.as_tensor(query.near,device=origin.device,dtype=origin.dtype).expand(origin.shape[:2])/scale[:,None]
-    far=torch.as_tensor(query.far,device=origin.device,dtype=origin.dtype).expand(origin.shape[:2])/scale[:,None]
-    return replace(query,origins=origin,directions=direction,near=near,far=far)
+    # Geometry must not inherit the enclosing BF16 feature encoder context.
+    with torch.autocast(device_type=state.c.device.type, enabled=False):
+        if not state.metric_valid.all():
+            raise ValueError('metric query requires observable metric calibration')
+        scale,rotation,translation=similarity_components(state)
+        origin=torch.einsum('bij,brj->bri',rotation.transpose(-1,-2),query.origins-translation[:,None])/scale[:,None,None]
+        direction=torch.einsum('bij,brj->bri',rotation.transpose(-1,-2),query.directions)
+        near=torch.as_tensor(query.near,device=origin.device,dtype=origin.dtype).expand(origin.shape[:2])/scale[:,None]
+        far=torch.as_tensor(query.far,device=origin.device,dtype=origin.dtype).expand(origin.shape[:2])/scale[:,None]
+        return replace(query,origins=origin,directions=direction,near=near,far=far)
 
 
 def scene_output_to_metric(output,state):
     """RGB/opacity unchanged: marcher remains in scene units (sigma*ds invariant)."""
-    if not state.metric_valid.all():
-        raise ValueError('metric output requires observable metric calibration')
-    scale,rotation,translation=similarity_components(state)
-    result=dict(output)
-    if 'range' in result: result['range']=result['range']*scale[:,None]
-    if 'depth' in result: result['depth']=result['depth']*scale[:,None]
-    if 'points' in result: result['points']=scale[:,None,None]*torch.einsum('bij,brj->bri',rotation,result['points'])+translation[:,None]
-    if 'density' in result: result['density']=result['density']/scale.reshape(-1,*([1]*(result['density'].ndim-1)))
-    if 'controls' in result:
-        controls=result['controls']
-        r=rotation[:,None]@controls[...,:3,:3]
-        t=scale[:,None,None]*torch.einsum('bij,bkj->bki',rotation,controls[...,:3,3])+translation[:,None]
-        result['controls']=torch.cat((torch.cat((r,t[...,None]),-1),controls[...,3:,:]),-2)
-    return result
+    # Geometry must not inherit the enclosing BF16 feature encoder context.
+    with torch.autocast(device_type=state.c.device.type, enabled=False):
+        if not state.metric_valid.all():
+            raise ValueError('metric output requires observable metric calibration')
+        scale,rotation,translation=similarity_components(state)
+        result=dict(output)
+        if 'range' in result: result['range']=result['range']*scale[:,None]
+        if 'depth' in result: result['depth']=result['depth']*scale[:,None]
+        if 'points' in result: result['points']=scale[:,None,None]*torch.einsum('bij,brj->bri',rotation,result['points'])+translation[:,None]
+        if 'density' in result: result['density']=result['density']/scale.reshape(-1,*([1]*(result['density'].ndim-1)))
+        if 'controls' in result:
+            controls=result['controls']
+            r=rotation[:,None]@controls[...,:3,:3]
+            t=scale[:,None,None]*torch.einsum('bij,bkj->bki',rotation,controls[...,:3,3])+translation[:,None]
+            result['controls']=torch.cat((torch.cat((r,t[...,None]),-1),controls[...,3:,:]),-2)
+        return result
 
 
 def prepare_observation_gauge(state,observation):
@@ -107,27 +111,29 @@ def prepare_observation_gauge(state,observation):
     An already-relative sequence cannot silently ingest metric coordinates.
     Its caller must fit trusted prefix correspondences with calibrate_state.
     """
-    if observation.metric_valid is None or not observation.metric_valid.any():
-        return state,observation
-    if observation.intrinsics is None or observation.camera_c2w is None:
-        raise ValueError('metric observations require valid camera metadata')
-    measured=observation.metric_valid
-    camera_valid=observation.camera_valid if observation.camera_valid is not None else observation.geometry_valid
-    if camera_valid is not None: measured=measured&camera_valid
-    if observation.valid is not None:
-        measured=measured&observation.valid[:,:,-1].flatten(2).any(-1)
-    known=measured.any(-1)
-    initial=~state.camera_valid.any(-1)&~state.allocated.any(-1)
-    if (known&~state.metric_valid&~initial).any():
-        raise ValueError('sensor return requires observable prefix calibration before correction')
-    state=replace(state,metric_valid=state.metric_valid|(known&initial))
-    scale,rotation,translation=similarity_components(state)
-    raw=observation.camera_c2w
-    r=rotation[:,None].transpose(-1,-2)@raw[...,:3,:3]
-    t=torch.einsum('bij,bvj->bvi',rotation.transpose(-1,-2),raw[...,:3,3]-translation[:,None])/scale[:,None,None]
-    converted=torch.cat((torch.cat((r,t[...,None]),-1),raw[...,3:,:]),-2)
-    pose=torch.where(measured[...,None,None],converted,raw)
-    depth=observation.depth
-    if depth is not None:
-        depth=torch.where(measured[...,None,None,None],depth/scale[:,None,None,None,None],depth)
-    return state,replace(observation,camera_c2w=pose,depth=depth)
+    # Geometry must not inherit the enclosing BF16 feature encoder context.
+    with torch.autocast(device_type=state.c.device.type, enabled=False):
+        if observation.metric_valid is None or not observation.metric_valid.any():
+            return state,observation
+        if observation.intrinsics is None or observation.camera_c2w is None:
+            raise ValueError('metric observations require valid camera metadata')
+        measured=observation.metric_valid
+        camera_valid=observation.camera_valid if observation.camera_valid is not None else observation.geometry_valid
+        if camera_valid is not None: measured=measured&camera_valid
+        if observation.valid is not None:
+            measured=measured&observation.valid[:,:,-1].flatten(2).any(-1)
+        known=measured.any(-1)
+        initial=~state.camera_valid.any(-1)&~state.allocated.any(-1)
+        if (known&~state.metric_valid&~initial).any():
+            raise ValueError('sensor return requires observable prefix calibration before correction')
+        state=replace(state,metric_valid=state.metric_valid|(known&initial))
+        scale,rotation,translation=similarity_components(state)
+        raw=observation.camera_c2w
+        r=rotation[:,None].transpose(-1,-2)@raw[...,:3,:3]
+        t=torch.einsum('bij,bvj->bvi',rotation.transpose(-1,-2),raw[...,:3,3]-translation[:,None])/scale[:,None,None]
+        converted=torch.cat((torch.cat((r,t[...,None]),-1),raw[...,3:,:]),-2)
+        pose=torch.where(measured[...,None,None],converted,raw)
+        depth=observation.depth
+        if depth is not None:
+            depth=torch.where(measured[...,None,None,None],depth/scale[:,None,None,None,None],depth)
+        return state,replace(observation,camera_c2w=pose,depth=depth)

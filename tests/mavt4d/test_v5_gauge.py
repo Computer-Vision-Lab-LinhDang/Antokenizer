@@ -60,3 +60,57 @@ def test_symmetric_observable_calibration_is_explicitly_stop_gradient():
     scene=x.square().sum()+transform.square().sum()
     scene.backward()
     assert torch.isfinite(x.grad).all()
+
+
+def _rotated_metric_fixture():
+    from mavt4d.object_state.observation import ObservationStep
+    cfg = V5Config(slots=2, width=12, evidence_width=12, spatial_heads=3,
+                   resampler_heads=3, spatial_blocks=1, content_tokens=2, dynamic_tokens=2)
+    model = V5Model(cfg)
+    angle = torch.tensor(.37)
+    rotation = torch.tensor([[angle.cos(), -angle.sin(), 0.],
+                             [angle.sin(), angle.cos(), 0.], [0., 0., 1.]])
+    pose = torch.eye(4)[None, None].clone()
+    pose[0, 0, :3, :3] = rotation
+    pose[0, 0, :3, 3] = torch.tensor([1., 2., 3.])
+    obs = ObservationStep(torch.rand(1, 1, 2, 3, 16, 16), torch.ones(1, dtype=torch.float64),
+                          intrinsics=torch.eye(3)[None, None], camera_c2w=pose,
+                          metric_valid=torch.ones(1, 1, dtype=torch.bool))
+    return model, model.initial_state(1), obs
+
+
+@pytest.mark.parametrize('calibrated', [False, True])
+def test_observation_gauge_preserves_nonaxis_camera_so3_under_bfloat16_autocast(calibrated):
+    from mavt4d.object_state.v5.gauge import prepare_observation_gauge
+    model, state, obs = _rotated_metric_fixture()
+    if calibrated:
+        transform = obs.camera_c2w[:, 0].clone()
+        transform[:, :3, :3] *= 2.
+        state = replace(state, scene_to_metric=transform, metric_valid=torch.ones(1, dtype=torch.bool))
+    _, reference = prepare_observation_gauge(state, obs)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        _, actual = prepare_observation_gauge(state, obs)
+        # Same strict validation as the failing nuScenes training path.
+        encoded = model.observer(actual)
+    torch.testing.assert_close(actual.camera_c2w, reference.camera_c2w, atol=1e-6, rtol=1e-6)
+    assert actual.camera_c2w.dtype == encoded.ray_directions.dtype == torch.float32
+
+
+def test_metric_query_and_output_transforms_keep_float32_under_autocast():
+    model, state, obs = _rotated_metric_fixture()
+    transform = obs.camera_c2w[:, 0].clone()
+    transform[:, :3, :3] *= 2.
+    state = replace(state, scene_to_metric=transform, metric_valid=torch.ones(1, dtype=torch.bool))
+    q = RayQuery(torch.tensor([[[2., 3., 4.]]]), torch.tensor([[[0., 1., 0.]]]), .1, 5., state.t)
+    output = {'points': q.origins, 'controls': obs.camera_c2w, 'range': torch.ones(1, 1)}
+    reference_q = metric_query_to_scene(state, q)
+    reference_out = scene_output_to_metric(output, state)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        actual_q = metric_query_to_scene(state, q)
+        actual_out = scene_output_to_metric(output, state)
+    for name in ('origins', 'directions'):
+        assert getattr(actual_q, name).dtype == torch.float32
+        torch.testing.assert_close(getattr(actual_q, name), getattr(reference_q, name), atol=1e-6, rtol=1e-6)
+    for name in output:
+        assert actual_out[name].dtype == torch.float32
+        torch.testing.assert_close(actual_out[name], reference_out[name], atol=1e-6, rtol=1e-6)
