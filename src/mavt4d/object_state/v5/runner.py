@@ -103,30 +103,74 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
-def measure_capacity(model, optimizer, dataset, *, device, rays, effective, sources, logger):
-    """Actual mature G/H6/bridge backwards + Adam; restores all training state.
+class CalibrationStopped(RuntimeError):
+    """Stop requested before every source had a measured safe capacity."""
 
-    One draw is replicated only for this discarded resource probe. Real train
-    draws are sampled independently by group. CPU mode is for correctness only.
+
+def measure_capacity(model, optimizer, dataset, *, device, rays, effective, sources, logger,
+                     calibration_seconds=900., deadline=None, should_stop=None):
+    """Measure mature G/H6/bridge backwards + Adam, then restore training state.
+
+    Probe every source at batch one before round-robin growth. Search is bounded
+    by each source's logical draw count and a wall-time budget checked between
+    probes; a single in-flight probe cannot be preempted safely. CPU is only a
+    correctness path. No unmeasured capacity is substituted on timeout or OOM.
     """
+    if not math.isfinite(calibration_seconds) or calibration_seconds <= 0:
+        raise ValueError("calibration_seconds must be finite and positive")
+    limits = mixture_counts(effective, sources)
+    end = time.monotonic() + calibration_seconds
+    if deadline is not None:
+        end = min(end, deadline)
+    should_stop = should_stop or (lambda: False)
+    candidates = {}
+    for source, limit in limits.items():
+        powers = [2**i for i in range(limit.bit_length())]
+        candidates[source] = sorted(set(powers + [limit])) if device.type == "cuda" else [1]
     saved_model, saved_optimizer, saved_rng = _cpu_state(model), copy.deepcopy(optimizer.state_dict()), _rng()
-    capacities, records = {}, []
+    capacities, records, best_rates, clips = {}, [], {}, {}
+    blocked = set()
+
+    def boundary_reached():
+        stopped = should_stop()
+        if not stopped and time.monotonic() < end:
+            return False
+        missing = [name for name in sources if name not in capacities]
+        if missing:
+            if stopped:
+                raise CalibrationStopped("calibration stopped before measuring all sources")
+            raise RuntimeError("calibration budget expired: no safe measured microbatch for " + ", ".join(missing))
+        return True
+
     try:
-        for source in sources:
-            clip = dataset.draw(source, 20, profile="G", horizon=6, plan_seed=17)
-            best, best_rate = 0, -1.
-            candidates = [1] if device.type != "cuda" else [2**i for i in range(int(math.log2(effective)) + 1)]
-            for candidate in candidates:
-                model.load_state_dict(saved_model); optimizer.load_state_dict(saved_optimizer); _restore_rng(saved_rng)
+        for index in range(max(map(len, candidates.values()))):
+            for source in sources:
+                if source in blocked or index >= len(candidates[source]):
+                    continue
+                if boundary_reached():
+                    return capacities, records
+                if source not in clips:
+                    clips[source] = dataset.draw(source, 20, profile="G", horizon=6, plan_seed=17)
+                clip, candidate = clips[source], candidates[source][index]
+                # A slow decode must not bypass the stop/deadline check.
+                if boundary_reached():
+                    return capacities, records
+                model.load_state_dict(saved_model); optimizer.load_state_dict(copy.deepcopy(saved_optimizer)); _restore_rng(saved_rng)
                 optimizer.zero_grad(set_to_none=True)
                 if device.type == "cuda":
                     torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
                 started = time.monotonic()
                 try:
                     loss, _ = compute_loss(model, [clip] * candidate, step=4000, rays=rays, seed=20, bridge=True)
-                    loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.); optimizer.step()
+                    if not math.isfinite(float(loss.detach())):
+                        raise FloatingPointError("nonfinite loss in capacity probe")
+                    loss.backward()
+                    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+                    if not math.isfinite(float(norm)):
+                        raise FloatingPointError("nonfinite gradient in capacity probe")
+                    optimizer.step()
                     _sync(device)
-                    elapsed = time.monotonic() - started
+                    elapsed = max(time.monotonic() - started, 1e-9)
                     reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
                     total = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 1
                     eligible = reserved <= .9 * total
@@ -136,20 +180,19 @@ def measure_capacity(model, optimizer, dataset, *, device, rays, effective, sour
                                     "realized_profile": clip["plan"]["profile"], "future_targets": len(clip["plan"]["future"])})
                     logger.log({f"capacity/{source}/microbatch": candidate, f"capacity/{source}/draws_per_second": rate,
                                 f"capacity/{source}/peak_reserved": reserved}, step=0)
-                    if eligible and rate > best_rate:
-                        best, best_rate = candidate, rate
+                    if eligible and rate > best_rates.get(source, -1.):
+                        capacities[source], best_rates[source] = candidate, rate
                     if not eligible:
-                        break
+                        blocked.add(source)
                 except torch.OutOfMemoryError:
                     records.append({"source": source, "microbatch": candidate, "oom": True})
-                    break
+                    blocked.add(source)
                 finally:
                     optimizer.zero_grad(set_to_none=True)
-            if not best:
-                raise RuntimeError(f"no safe measured microbatch for {source}")
-            capacities[source] = best
+                if source not in capacities:
+                    raise RuntimeError(f"no safe measured microbatch for {source}")
     finally:
-        model.load_state_dict(saved_model); optimizer.load_state_dict(saved_optimizer); _restore_rng(saved_rng)
+        model.load_state_dict(saved_model); optimizer.load_state_dict(copy.deepcopy(saved_optimizer)); _restore_rng(saved_rng)
         optimizer.zero_grad(set_to_none=True)
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -289,7 +332,9 @@ def main(argv=None):
     try:
         if capacities is None:
             capacities, probes = measure_capacity(model, optimizer, dataset, device=device, rays=rays,
-                                                    effective=effective, sources=weights, logger=logger)
+                                                    effective=effective, sources=weights, logger=logger,
+                                                    calibration_seconds=training.get("calibration_seconds", 900.),
+                                                    deadline=deadline - 300., should_stop=lambda: stop[0])
             _atomic_json(output / "capacity.json", {"microbatches": capacities, "probes": probes})
         _save(output / "last.pt", model, optimizer, lock=lock, step=step, run_id=logger.run_id, capacities=capacities)
         estimate = 60.
@@ -331,6 +376,12 @@ def main(argv=None):
                                                "effective_batch": effective, "wandb_url": logger.url,
                                                "checkpoint": "last.pt", "mixture": weights})
         exit_code = 0
+    except CalibrationStopped:
+        reason, exit_code = "calibration_stopped", 0
+        _atomic_json(output / "summary.json", {"status": reason, "updates": step,
+                                               "target_updates": updates, "effective_batch": effective,
+                                               "wandb_url": logger.url, "checkpoint": None,
+                                               "mixture": weights})
     finally:
         logger.finish(exit_code=exit_code)
     print(json.dumps({"status": reason, "updates": step, "wandb_url": logger.url}), flush=True)
