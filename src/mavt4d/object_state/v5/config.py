@@ -31,6 +31,8 @@ class V5Config:
     atlas_extent: float = 4.0
     ownership_temperature: float = 1.0
     schema_version: int = 5
+    implementation_version: int = 2
+    camera_photometric: str = 'disabled'
 
     def __post_init__(self):
         self.encoder_config()
@@ -38,6 +40,8 @@ class V5Config:
             raise ValueError('v5 requires even latent width and schema version 5')
         if self.camera_views < 1 or self.depth_hypotheses < 1 or self.atlas_extent <= 0 or self.ownership_temperature <= 0:
             raise ValueError('invalid camera, depth, atlas or ownership configuration')
+        if self.implementation_version != 2 or self.camera_photometric != 'disabled':
+            raise ValueError('v5 implementation 2 fixes unused photometric state to zero')
 
     def encoder_config(self):
         values = asdict(self)

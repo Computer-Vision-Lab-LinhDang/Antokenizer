@@ -9,6 +9,17 @@ import torch.nn.functional as F
 from .manifest import Store, safe_path
 
 
+def static_capture_evidence(row):
+    """Publisher acquisition assumption, explicitly scoped; never a scene GT claim."""
+    evidence = row.get('static_scene_evidence') or {}
+    return (row.get('source') == 'arkitscenes' and row.get('depth_provenance') == 'measured'
+            and evidence.get('protocol') == 'arkitscenes-static-capture-v1'
+            and evidence.get('reference') == 'arxiv:2111.08897'
+            and evidence.get('scope') == 'sequence'
+            and bool(row.get('sequence')) and evidence.get('sequence') == row.get('sequence')
+            and evidence.get('claim') == 'publisher_capture_assumption_sensor_checked')
+
+
 def decode_record(root, row, rng, height, width, *, max_frames=36):
     frames=row['frames']
     if max_frames < 1 or not frames:
@@ -83,7 +94,8 @@ def decode_record(root, row, rng, height, width, *, max_frames=36):
     out=dict(rgb=torch.stack(images)[:,None],rgb_valid=torch.stack(image_valid)[:,None],times=times,camera_valid=cv,
              metric_valid=cv & bool(row.get('metric_valid',False)),time_valid=row.get('time_valid',True),
              timestamp_provenance=row['timestamp_provenance'],depth_provenance=row['depth_provenance'],
-             scene_static=bool(row.get('scene_static',False)),archive_sha256=row.get('archive_sha256'),
+             scene_static=static_capture_evidence(row),static_scene_evidence=row.get('static_scene_evidence'),
+             sequence=row.get('sequence'),archive_sha256=row.get('archive_sha256'),
              surface_correspondence_valid=False)
     if any(camera_valid): out.update(intrinsics=torch.stack(intrinsics)[:,None],camera_c2w=torch.stack(cameras)[:,None])
     if any('depth' in f for f in chosen):

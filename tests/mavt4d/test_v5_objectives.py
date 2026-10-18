@@ -120,14 +120,14 @@ class CapabilityBucketing(unittest.TestCase):
             compute_loss(tiny_model(),[camera,depth],step=4000,rays=1,bridge=False)
 
 class SecondPassRegression(unittest.TestCase):
-    def test_camera_validity_sets_per_example_ray_bounds(self):
+    def test_indoor_metric_and_relative_ray_bounds_follow_domain(self):
         from mavt4d.object_state.v5.training import _read_targets
         model=tiny_model(); a=clip(camera=True); b=copy.deepcopy(a)
         b['camera_valid'].zero_(); b['metric_valid'].zero_()
         state,_,_=observe_prefix(model,[a,b])
         _,_,query=_read_targets(model,state,[a,b],3,rays=2,seed=3)
         far=torch.as_tensor(query.far).expand(2,2)
-        torch.testing.assert_close(far,torch.tensor([[80.,80.],[20.,20.]]))
+        torch.testing.assert_close(far,torch.tensor([[20.,20.],[20.,20.]]))
 
     def test_unknown_fps_never_drives_physical_dynamics(self):
         model=tiny_model(); c=clip(); c['time_valid']=False

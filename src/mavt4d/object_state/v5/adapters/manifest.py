@@ -161,7 +161,10 @@ def build_arkit(root, archive, metadata):
         out=record('arkitscenes',str(m.get('visit_id') or video),archive,root,frames)
         out.update(split=arkit_split(video,m['fold'],m.get('visit_id')),depth_provenance='measured',
                    metric_valid=True,timestamp_provenance='sensor_timestamp',sequence=video,
-                   depth_detail='lowres_depth_sensor_mm',camera_provenance='arkit_sensor_pose')
+                   depth_detail='lowres_depth_sensor_mm',camera_provenance='arkit_sensor_pose',
+                   static_scene_evidence={'protocol':'arkitscenes-static-capture-v1',
+                       'reference':'arxiv:2111.08897','scope':'sequence','sequence':video,
+                       'claim':'publisher_capture_assumption_sensor_checked'})
         return out
 
 

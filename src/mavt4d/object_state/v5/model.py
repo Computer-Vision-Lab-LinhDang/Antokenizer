@@ -23,7 +23,7 @@ class V5Model(nn.Module):
         self.dynamics=CConditionedDynamics(cfg)
         self.resampler=FunctionalResampler(cfg)
         self.depth_head=nn.Sequential(nn.LayerNorm(cfg.evidence_width),nn.Linear(cfg.evidence_width,cfg.evidence_width),nn.SiLU(),nn.Linear(cfg.evidence_width,cfg.depth_hypotheses*2))
-        self.camera_head=nn.Sequential(nn.LayerNorm(cfg.evidence_width),nn.Linear(cfg.evidence_width,cfg.width),nn.SiLU(),nn.Linear(cfg.width,27))
+        self.camera_head=nn.Sequential(nn.LayerNorm(cfg.evidence_width),nn.Linear(cfg.evidence_width,cfg.width),nn.SiLU(),nn.Linear(cfg.width,23))
         nn.init.zeros_(self.camera_head[-1].weight)
         nn.init.zeros_(self.camera_head[-1].bias)
 
@@ -93,8 +93,11 @@ class V5Model(nn.Module):
             pose=torch.where(measured_cam[...,None,None],obs.camera_c2w[...,:3,:].float(),pose)
             mk=torch.stack((obs.intrinsics[...,0,0],obs.intrinsics[...,1,1],obs.intrinsics[...,0,2],obs.intrinsics[...,1,2]),-1).float()
             camera_k=torch.where(measured_cam[...,None],mk,camera_k)
+        # The current ray query has no target-view photometric identity. Keep
+        # reserved exposure/white-balance channels fixed at zero, with no
+        # learned output weights for an otherwise unused nuisance prediction.
         packed=torch.cat((pose.flatten(-2),camera_k,.1*torch.tanh(proposals[...,13:19]),
-                          .1*torch.tanh(proposals[...,19:23]),torch.sigmoid(proposals[...,23:27]),torch.zeros_like(proposals[...,:2])),-1)
+                          torch.zeros_like(proposals[...,19:23]),torch.sigmoid(proposals[...,19:23]),torch.zeros_like(proposals[...,:2])),-1)
         view_observed=valid.any(-1)
         camera=state.camera.clone()
         camera=torch.cat((torch.where(view_observed[...,None],packed,prior),camera[:,views:]),1)
@@ -169,9 +172,12 @@ class V5Model(nn.Module):
         result=replace(prior,**{key:value.index_copy(0,indices,result.tensor_dict()[key]) for key,value in prior.tensor_dict().items()})
         diagnostics={}
         for key,value in {**diag,**details}.items():
-            if value.ndim and value.shape[0]==len(indices):
+            # Keep the actual live logits: retaining grad on an index_copy
+            # descendant unused by the task loss would report a false zero.
+            if key not in ('ownership_logits','content_ownership_logits') and value.ndim and value.shape[0]==len(indices):
                 value=value.new_zeros(len(state.c),*value.shape[1:]).index_copy(0,indices,value)
             diagnostics[key]=value
+        diagnostics['ownership_logits_batch_indices']=indices
         return (result,diagnostics) if return_diagnostics else result
 
     forward=observe

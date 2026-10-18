@@ -54,7 +54,7 @@ class CapacityTests(unittest.TestCase):
         rng = torch.get_rng_state().clone()
         clock, calls = [0.], []
         dataset = Mock()
-        dataset.draw.side_effect = lambda source, *a, **kw: {"source": source, "plan": {"profile": "G", "future": list(range(6))}}
+        dataset.draw.side_effect = lambda source, *a, **kw: {"source": source, "plan": {"profile": "G", "future": list(range(6)), "observed": [True]*3+[False]*6+[True]*3}}
         def loss_fn(model, clips, **kwargs):
             calls.append((clips[0]["source"], len(clips)))
             clock[0] += 1.

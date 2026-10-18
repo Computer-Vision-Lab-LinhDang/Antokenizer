@@ -25,13 +25,14 @@ def readout_objective(prediction, targets):
     rgb_valid = valid & (status != 2)
     # Normalize each example before the logical-source average.
     err = (prediction["rgb"] - targets["rgb"]).abs().mean(-1)
-    rgb = torch.stack([masked_mean(e, m) for e, m in zip(err, rgb_valid)]).mean()
+    sample_weight = targets.get('sample_weight', torch.ones(len(err), device=err.device))
+    rgb = (torch.stack([masked_mean(e, m) for e, m in zip(err, rgb_valid)]) * sample_weight).mean()
     zero = prediction["rgb"].sum() * 0
     depth, status_loss = zero, zero
     if "range" in targets and "range" in prediction:
         mask = targets["depth_valid"] & (targets["range"] > 0)
         depth_error = (prediction["range"].clamp_min(1e-3).log() - targets["range"].clamp_min(1e-3).log()).abs()
-        depth = torch.stack([masked_mean(e, m) for e, m in zip(depth_error, mask)]).mean()
+        depth = (torch.stack([masked_mean(e, m) for e, m in zip(depth_error, mask)]) * sample_weight).mean()
     if "status_logits" in prediction:
         labels = status.clamp_min(0)
         ce = F.cross_entropy(prediction["status_logits"].transpose(1, 2), labels, reduction="none")
@@ -41,11 +42,13 @@ def readout_objective(prediction, targets):
         for error, sample_status in zip(ce, status):
             terms = [masked_mean(error, sample_status == k) for k in range(3) if (sample_status == k).any()]
             examples.append(torch.stack(terms).mean() if terms else error.sum() * 0)
-        status_loss = torch.stack(examples).mean()
+        status_loss = (torch.stack(examples) * sample_weight).mean()
     total = rgb + .5 * depth + .1 * status_loss
     return total, {"rgb": rgb.detach(), "depth": depth.detach(), "status": status_loss.detach(),
                    "status_label_coverage": (status >= 0).float().mean().detach(),
-                   **{f"status_class_{k}_coverage": (status == k).float().mean().detach() for k in range(3)}}
+                   **{f"status_class_{k}_coverage": (status == k).float().mean().detach() for k in range(3)},
+                   **{f"status_class_{k}_count_per_draw": (status == k).float().sum(-1).mean().detach() for k in range(3)},
+                   "depth_out_of_bounds": targets.get("depth_out_of_bounds",torch.zeros_like(valid)).float().mean().detach()}
 
 
 def learning_rate(step, total=20000):
@@ -68,7 +71,8 @@ def curriculum(step, seed):
 def clip_signature(clip):
     p = clip['plan']
     return (clip['source'], tuple(clip['rgb'].shape[1:]), tuple(p['prefix']),
-            tuple(p['observed']), tuple(p['future']), bool(clip.get('time_valid',True)),
+            tuple(p['observed']), tuple(p['future']), tuple(p.get('heldout',[])),
+            bool(clip.get('time_valid',True)), clip.get('bridge_selected'),bool(clip.get('force_bridge',False)),
             tuple(key in clip for key in ('intrinsics','camera_c2w','camera_valid','metric_valid','depth','depth_valid',
                 'input_depth','input_depth_valid','slot_pose','slot_pose_valid')),
             clip.get('depth_provenance','missing'),bool(clip.get('slot_assignment_trusted',False)))
@@ -85,7 +89,7 @@ def _camera_mask(clips,frame,device):
 
 def _observation(clips,frame,device,*,metadata_drop=False,mask=None):
     from dataclasses import fields
-    start=max(0,frame-1)
+    start=max(0,frame-1) if all(c.get('time_valid',True) for c in clips) else frame
     images=torch.stack([c['rgb'][start:frame+1,:1] for c in clips]).permute(0,2,1,3,4,5).to(device)
     valid=torch.stack([c['rgb_valid'][start:frame+1,:1] for c in clips]).permute(0,2,1,3,4,5).to(device)
     if mask is not None:
@@ -124,7 +128,7 @@ def _prefix_steps(model,clips,*,seed,metadata_drop=False,tube_mask=None):
         if observed:
             with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
                 state,diagnostics=model.observe(state,obs,return_diagnostics=True)
-            start=max(0,frame-1)
+            start=frame-obs.images.shape[2]+1
             # The encoder keeps a patch only when its endpoint coverage is
             # nonzero. Earlier-frame pixels in discarded patches are not inputs.
             endpoint=obs.valid[:,:,-1]
@@ -167,6 +171,19 @@ def observe_prefix(model,clips,*,seed=17,metadata_drop=False,tube_mask=None):
     return state,history,diagnostics
 
 
+def ray_bounds(clips, metric_valid):
+    """Versioned domain bounds in metres or relative scene units, never camera confidence."""
+    device = metric_valid.device
+    near, far = [], []
+    for clip, metric in zip(clips, metric_valid.tolist()):
+        domain = clip.get('ray_domain', 'driving' if clip.get('source') == 'nuscenes' else 'indoor')
+        if metric and domain in ('driving','outdoor'):
+            near.append(.1); far.append(120.)
+        else:
+            near.append(.05); far.append(20.)
+    return (torch.tensor(near, device=device)[:,None], torch.tensor(far, device=device)[:,None])
+
+
 def _read_targets(model,state,clips,frame,*,rays,seed,observed_now=False,
                   input_mask=None,hidden_only=False,view=None,history=None,
                   metadata_drop=False,aligned=False):
@@ -181,7 +198,7 @@ def _read_targets(model,state,clips,frame,*,rays,seed,observed_now=False,
         import hashlib
         identity=str(c.get('group_id',c.get('group_hash',c.get('group',c.get('source','')))))
         offset=int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4],'little')
-        generator=torch.Generator(device=device).manual_seed(seed+offset)
+        generator=torch.Generator(device=device).manual_seed(int(c.get('draw_seed',0))+seed+offset)
         samples.append(torch.randint(height*width,(rays,),generator=generator,device=device))
     indices=torch.stack(samples)
     if hidden_only and input_mask is not None:
@@ -190,7 +207,7 @@ def _read_targets(model,state,clips,frame,*,rays,seed,observed_now=False,
             if len(hidden):
                 identity=str(clips[j].get('group_id',clips[j].get('group_hash',clips[j].get('group',clips[j].get('source','')))))
                 offset=int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4],'little')
-                generator=torch.Generator(device=device).manual_seed(seed+offset)
+                generator=torch.Generator(device=device).manual_seed(int(clips[j].get('draw_seed',0))+seed+offset)
                 indices[j]=hidden[torch.randint(len(hidden),(rays,),generator=generator,device=device)]
     y,x=indices//width,indices%width
     pixels=torch.stack((x.float()+.5,y.float()+.5),-1)
@@ -207,8 +224,8 @@ def _read_targets(model,state,clips,frame,*,rays,seed,observed_now=False,
         known_camera=_camera_mask(clips,frame,device)[:,view]
         k=torch.where(known_camera[:,None,None],_frame(clips,'intrinsics',frame,device)[:,view],k)
         camera=torch.where(known_camera[:,None,None],_frame(clips,'camera_c2w',frame,device)[:,view],camera)
-    near=.1
-    far=torch.where(known_camera,80.,20.)[:,None]
+    metric_valid=torch.stack([c.get('metric_valid',torch.zeros(c['rgb'].shape[:2],dtype=torch.bool))[frame,view] for c in clips]).to(device) & known_camera
+    near,far=ray_bounds(clips,metric_valid)
     query=make_ray_query(k,camera,pixels,time=state.t,near=near,far=far)
     batch=torch.arange(b,device=device)[:,None]
     target={'rgb':image[:,view].permute(0,2,3,1)[batch,y,x],
@@ -222,7 +239,10 @@ def _read_targets(model,state,clips,frame,*,rays,seed,observed_now=False,
         target['range']=z*camera_ray.norm(dim=-1)
         depth_valid=_frame(clips,'depth_valid',frame,device)[:,view,0][batch,y,x]
         provenance=torch.tensor([c.get('depth_provenance') not in (None,'missing','pseudo') for c in clips],device=device)
-        target['depth_valid']=depth_valid & known_camera[:,None] & provenance[:,None] & torch.isfinite(z) & (z>0) & (target['range']>=near) & (target['range']<=far)
+        measured=depth_valid & known_camera[:,None] & provenance[:,None] & torch.isfinite(z) & (z>0)
+        in_bounds=(target['range']>=near) & (target['range']<=far)
+        target['depth_valid']=measured & in_bounds
+        target['depth_out_of_bounds']=measured & ~in_bounds
         if history:
             current=len(history)-1 if observed_now and history[-1]['frame']==frame else None
             target['status']=history_labels(clips,frame,pixels,history,current_index=current,view=view)
@@ -276,7 +296,7 @@ def _supported_content_losses(model,previous,state,clips,frame,history,*,rays,se
     from .objectives import per_example_mean
     zero=state.c.sum()*0
     if len(history)<2 or not any(c.get('scene_static',False) or c.get('rigid_correspondence_trusted',False) for c in clips):
-        return zero,zero
+        return zero,zero,0.,0.
     pred,target,query=_read_targets(model,state,clips,frame,rays=rays,seed=seed,history=history,observed_now=True,view=0)
     past_history=[]
     for record in history:
@@ -286,7 +306,7 @@ def _supported_content_losses(model,previous,state,clips,frame,history,*,rays,se
     past=history_labels(clips,frame,target['pixels'],past_history,current_index=None,view=0)
     support=(past==1)&(target['status']==0)
     if not bool(support.any()) or 'range' not in target:
-        return zero,zero
+        return zero,zero,0.,0.
     identity=(previous.slot_uid==state.slot_uid)&previous.content_initialized&state.content_initialized
     swapped=replace(state,c=torch.where(identity[...,None,None],previous.c,state.c))
     reused=model.read(swapped,query)
@@ -313,7 +333,7 @@ def _supported_content_losses(model,previous,state,clips,frame,history,*,rays,se
     density,color=composite(current); target_density,target_color=composite(teacher)
     error=(density-target_density).abs()+(color-target_color).abs().mean(-1)
     can=per_example_mean(error,support & identity.any(-1)[:,None])
-    return reuse,can
+    return reuse,can,float(support.float().sum()/len(clips)),float((support & identity.any(-1)[:,None]).float().sum()/len(clips))
 
 
 def _bridge_read_loss(model,branch,clips,frame,*,rays,seed):
@@ -330,6 +350,39 @@ def _bridge_read_loss(model,branch,clips,frame,*,rays,seed):
     return total
 
 
+def draw_tube_masks(clips, *, step, seed, device):
+    """Per-logical-draw augmentation, independent of batching, workers, and retries."""
+    b=len(clips); plan=clips[0]['plan']; h,w=clips[0]['rgb'].shape[-2:]
+    masks={}; selected=torch.zeros(b,device=device,dtype=torch.bool)
+    object_centered=torch.zeros_like(selected)
+    for j,clip in enumerate(clips):
+        rng=random.Random(int(clip.get('draw_seed',seed)) ^ 0x4D41534B)
+        observed=[f for f,flag in zip(plan['prefix'],plan['observed']) if flag]
+        if not clip.get('time_valid',True) or len(observed)<2 or (not clip.get('force_tube_mask',False) and (step<1000 or rng.random()>=.25)):
+            continue
+        if clip.get('force_tube_mask',False) and 'force_tube_frame' in clip:
+            frame=int(clip['force_tube_frame'])
+            if frame not in observed:
+                raise ValueError('capacity tube-mask endpoint must be actually observed')
+        else:
+            frame=rng.choice(observed)
+        side=math.sqrt(rng.uniform(.05,.25))
+        mh,mw=max(1,int(h*side)),max(1,int(w*side))
+        y,x=rng.randrange(h-mh+1),rng.randrange(w-mw+1)
+        boxes=clip.get('mask_boxes_xyxy',{}).get(frame,[])
+        if boxes:
+            left,top,right,bottom=rng.choice(boxes)
+            cx=rng.uniform(left,right); cy=rng.uniform(top,bottom)
+            x=max(0,min(w-mw,round(cx-mw/2))); y=max(0,min(h-mh,round(cy-mh/2)))
+            object_centered[j]=True
+        if frame not in masks:
+            masks[frame]=torch.ones(b,1,min(2,frame+1),1,h,w,dtype=torch.bool,device=device)
+        masks[frame][j,...,y:y+mh,x:x+mw]=False
+        selected[j]=True
+    counts=torch.full((b,),plan['observed'].count(False),device=device,dtype=torch.float32)+selected.float()
+    return masks,counts,object_centered
+
+
 def compute_loss(model,clips,*,step,rays=256,seed=17,bridge=True,readout_callback=None,evaluation_view=None):
     """Homogeneous microbatch. All real horizons; no future enters filtering.
 
@@ -343,21 +396,27 @@ def compute_loss(model,clips,*,step,rays=256,seed=17,bridge=True,readout_callbac
     _,_,future_weight=curriculum(step,seed)
     zero=next(model.parameters()).sum()*0
     terms={key:zero for key in ('current','future','hidden','bridge','proposal','pseudo','reuse','canonical','reliability','controls','tracks','masks','warp')}
-    metrics={key:0. for key in ('rgb','depth','status','status_label_coverage','status_class_0_coverage','status_class_1_coverage','status_class_2_coverage')}
-    rng=random.Random(seed); tube_mask={}
-    if step>=1000 and rng.random()<.25 and len(plan['prefix'])>1:
-        frame=rng.choice(plan['prefix']); h,w=clips[0]['rgb'].shape[-2:]
-        side=math.sqrt(rng.uniform(.05,.25)); mh,mw=max(1,int(h*side)),max(1,int(w*side))
-        y,x=rng.randrange(h-mh+1),rng.randrange(w-mw+1)
-        mask=torch.ones(b,1,min(2,frame+1),1,h,w,dtype=torch.bool,device=device)
-        mask[...,y:y+mh,x:x+mw]=False; tube_mask[frame]=mask
-    hidden_count=sum(not flag or frame in tube_mask for frame,flag in zip(plan['prefix'],plan['observed']))
+    metrics={key:0. for key in ('rgb','depth','status','status_label_coverage','status_class_0_coverage','status_class_1_coverage','status_class_2_coverage','status_class_0_count_per_draw','status_class_1_count_per_draw','status_class_2_count_per_draw','depth_out_of_bounds')}
+    ownership_samples=[]; reuse_valid=0.; canonical_valid=0.
+    tube_mask,hidden_count,object_centered=draw_tube_masks(clips,step=step,seed=seed,device=device)
     observed_count=max(1,sum(plan['observed'])); reads=0
     def emit(kind,frame,pred,target,query,state,history):
         if readout_callback is not None:
             readout_callback(kind=kind,frame=frame,prediction=pred,targets=target,query=query,state=state,history=history)
     for ordinal,frame,observed,previous,state,history,diag,obs in _prefix_steps(model,clips,seed=seed,tube_mask=tube_mask):
         if observed:
+            if 'ownership_logits' in diag and 'ownership_valid' in diag:
+                logits=diag['ownership_logits']; valid=diag['ownership_valid']
+                rows=diag.get('ownership_logits_batch_indices')
+                entropy=diag['ownership_entropy']
+                if rows is not None:
+                    valid=valid.index_select(0,rows); entropy=entropy.index_select(0,rows)
+                sample={'entropy_values':entropy.detach()[valid].cpu(),'grad_values':None}
+                ownership_samples.append(sample)
+                if logits.requires_grad:
+                    def capture(grad, sample=sample, valid=valid):
+                        sample['grad_values']=grad.detach().norm(dim=-1)[valid].cpu()
+                    logits.register_hook(capture)
             proposal=proposal_objective(diag)
             if proposal is not None: terms['proposal']=terms['proposal']+proposal/observed_count
             pseudo=pseudo_proposal_objective(diag,clips,frame,model.config.patch_size)
@@ -368,20 +427,35 @@ def compute_loss(model,clips,*,step,rays=256,seed=17,bridge=True,readout_callbac
                 terms[key]=terms[key]+value/observed_count
             terms['controls']=terms['controls']+camera_control_objective(previous,clips,frame,diag)/observed_count
             terms['warp']=terms['warp']+warp_nuisance_objective(model,state)/observed_count
-            reuse,can=_supported_content_losses(model,previous,state,clips,frame,history,rays=rays,seed=seed+ordinal+771)
+            reuse,can,reuse_count,canonical_count=_supported_content_losses(model,previous,state,clips,frame,history,rays=rays,seed=seed+ordinal+771)
             terms['reuse']=terms['reuse']+reuse/observed_count; terms['canonical']=terms['canonical']+can/observed_count
+            reuse_valid+=reuse_count; canonical_valid+=canonical_count
         prediction,target,query=_read_targets(model,state,clips,frame,rays=rays,seed=seed+ordinal,
             observed_now=observed,input_mask=obs.valid,view=(0 if ordinal%2==0 else None) if evaluation_view is None else evaluation_view,history=history)
-        loss,m=readout_objective(prediction,target); terms['current']=terms['current']+loss/len(plan['prefix'])
+        loss,m=readout_objective(prediction,target); terms['current']=terms['current']+loss/(len(plan['prefix'])+len(plan.get('heldout',[])))
         for key in metrics: metrics[key]+=float(m[key])
         reads+=1; emit('current',frame,prediction,target,query,state,history)
         if not observed or frame in tube_mask:
             prediction,target,query=_read_targets(model,state,clips,frame,rays=rays,seed=seed+ordinal+97,
                 input_mask=obs.valid,hidden_only=True,view=0,history=history,observed_now=observed)
-            hidden,_=readout_objective(prediction,target); terms['hidden']=terms['hidden']+hidden/max(1,hidden_count)
+            eligible=torch.ones(b,dtype=torch.bool,device=device) if not observed else ~tube_mask[frame].flatten(1).all(-1)
+            target['sample_weight']=eligible.float()/hidden_count.clamp_min(1)
+            target['rgb_valid']=target['rgb_valid'] & eligible[:,None]
+            target['status']=torch.where(eligible[:,None],target['status'],-1)
+            if 'depth_valid' in target: target['depth_valid']=target['depth_valid'] & eligible[:,None]
+            hidden,hidden_metrics=readout_objective(prediction,target); terms['hidden']=terms['hidden']+hidden
+            for key in metrics:
+                if key.endswith('_count_per_draw'): metrics[key]+=float(hidden_metrics[key])
             emit('hidden',frame,prediction,target,query,state,history)
+    for frame in plan.get('heldout', []):
+        prediction,target,query=_read_targets(model,state,clips,frame,rays=rays,seed=seed+frame+431,
+            observed_now=False,view=0,history=history)
+        loss,m=readout_objective(prediction,target)
+        terms['current']=terms['current']+loss/(len(plan['prefix'])+len(plan['heldout']))
+        for key in metrics: metrics[key]+=float(m[key])
+        reads+=1; emit('heldout',frame,prediction,target,query,state,history)
     cutoff=state
-    bridge_active=bridge and all('intrinsics' in c for c in clips) and seed%4==0
+    bridge_active=bridge and all('intrinsics' in c for c in clips) and all(c.get('force_bridge',False) or c.get('bridge_selected',seed%4==0) for c in clips)
     branch=None; bridge_aligned=False
     if bridge_active:
         branch,branch_history,branch_diag=observe_prefix(model,clips,seed=seed,metadata_drop=True,tube_mask=tube_mask)
@@ -396,7 +470,9 @@ def compute_loss(model,clips,*,step,rays=256,seed=17,bridge=True,readout_callbac
     for frame in sorted(futures):
         time=_frame(clips,'times',frame,device); state=model.predict(state,time-state.t)
         pred,target,query=_read_targets(model,state,clips,frame,rays=rays,seed=seed+frame,history=history,view=evaluation_view)
-        loss,_=readout_objective(pred,target); terms['future']=terms['future']+loss/max(1,len(futures))
+        loss,future_metrics=readout_objective(pred,target); terms['future']=terms['future']+loss/max(1,len(futures))
+        for key in metrics:
+            if key.endswith('_count_per_draw'): metrics[key]+=float(future_metrics[key])
         emit('future',frame,pred,target,query,state,history)
         if branch is not None:
             branch=model.predict(branch,time-branch.t)
@@ -405,11 +481,13 @@ def compute_loss(model,clips,*,step,rays=256,seed=17,bridge=True,readout_callbac
     bridge_weight=.2*min(1.,step/1000)
     total=terms['current']+future_weight*terms['future']+terms['hidden']+bridge_weight*terms['bridge']
     total=total+.1*(terms['proposal']+terms['reliability']+terms['reuse']+terms['controls']+terms['tracks']+terms['masks'])+.05*terms['canonical']+.01*terms['warp']+.2*terms['pseudo']
-    metrics={key:value/max(1,reads) for key,value in metrics.items()}
+    metrics={key:(value if key.endswith('_count_per_draw') else value/max(1,reads)) for key,value in metrics.items()}
     metrics.update({key:float(value.detach()) for key,value in terms.items()})
     metrics.update(observed_steps=sum(plan['observed']),gap_steps=plan['observed'].count(False),future_valid=len(futures),
-        hidden_draw=float(hidden_count>0),microbatch=b,bridge_active=float(bridge_active),bridge_aligned=float(bridge_aligned),
+        tube_mask_distinct_endpoints=len(tube_mask),hidden_draw=float((hidden_count>0).float().mean()),tube_mask_object_centered=float(object_centered.float().mean()),tube_mask_random=float(((hidden_count>plan['observed'].count(False)) & ~object_centered).float().mean()),heldout_views=len(plan.get('heldout',[])),microbatch=b,bridge_active=float(bridge_active),bridge_aligned=float(bridge_aligned),
         timestamp_fps_derived=sum(c.get('timestamp_provenance')=='frame_index_fps' for c in clips)/b,
         prefix_span_seconds=sum(float(c['times'][plan['prefix'][-1]]-c['times'][0]) if c.get('time_valid',True) else 0. for c in clips)/b,
         prefix_span_valid=sum(bool(c.get('time_valid',True)) for c in clips)/b)
+    metrics.update(reuse_valid_per_draw=reuse_valid,canonical_valid_per_draw=canonical_valid)
+    metrics['_ownership_samples']=ownership_samples
     return total,metrics

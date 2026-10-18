@@ -48,19 +48,35 @@ def fixture(height, width, *, geometry):
     return clip
 
 
+def resolve_model_config(path=None, *, tiny=False):
+    if tiny and path is not None:
+        raise ValueError("--tiny cannot override an explicit --model-config")
+    if path is not None:
+        payload = json.loads(Path(path).read_text())
+        return V5Config(**payload.get("model", payload))
+    if tiny:
+        return V5Config(slots=2,content_tokens=2,dynamic_tokens=2,width=16,evidence_width=24,
+            spatial_blocks=1,spatial_heads=3,window_size=2,relay_tokens=2,samples_per_ray=4,query_chunk_size=4)
+    return V5Config()
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--device',default='cuda:0')
     parser.add_argument('--tiny',action='store_true',help='CPU contract fixture, never a capacity estimate')
+    parser.add_argument('--model-config',type=Path,help='Exact model dictionary or full run config; incompatible with --tiny')
     parser.add_argument('--wandb',action='store_true')
     parser.add_argument('--project',default='mavt-v5')
     parser.add_argument('--restore',type=Path,help='Fresh-process state/rollout verification only')
     args=parser.parse_args()
+    requested_config=resolve_model_config(args.model_config,tiny=args.tiny)
     torch.set_num_threads(2); torch.manual_seed(17)
     args.output.mkdir(parents=True,exist_ok=True)
     if args.restore:
         saved=torch.load(args.restore,map_location=args.device,weights_only=False)
+        if args.model_config is not None and requested_config.to_dict()!=saved['config']:
+            raise ValueError('restore checkpoint differs from explicit model config')
         model=V5Model(V5Config(**saved['config'])).to(args.device).eval()
         model.load_state_dict(saved['model'])
         state=V5State.from_payload(saved['state'],model.config)
@@ -71,9 +87,7 @@ def main():
         print('fresh-process restore PASS',flush=True)
         return
     if (args.output/'summary.json').exists(): raise FileExistsError('use a fresh smoke output directory')
-    cfg=V5Config(slots=2,content_tokens=2,dynamic_tokens=2,width=16,evidence_width=24,
-                 spatial_blocks=1,spatial_heads=3,window_size=2,relay_tokens=2,
-                 samples_per_ray=4,query_chunk_size=4) if args.tiny else V5Config()
+    cfg=requested_config
     model=V5Model(cfg).to(args.device); optimizer=_optimizer(model)
     logger=RunLogger(args.output,config={'purpose':'v5-correctness-smoke','tiny':args.tiny,'model':cfg.to_dict()},
                      runtime=RuntimeConfig(project=args.project,run_name='v5-integration-smoke'),enabled=args.wandb)
@@ -114,7 +128,7 @@ def main():
                 state.validate(cfg)
             model.train()
             if torch.device(args.device).type=='cuda': torch.cuda.synchronize()
-            record={**metrics,'loss':float(loss.detach()),'gradient_norm':float(norm),
+            record={**{key:value for key,value in metrics.items() if not key.startswith('_')},'loss':float(loss.detach()),'gradient_norm':float(norm),
                     'geometry':int(geometry),'seconds':time.monotonic()-started,
                     'measured_geometry_tokens':measured_tokens,
                     'reliability_labeled_tokens':reliability_labels,'initialized_slots':initialized_slots,

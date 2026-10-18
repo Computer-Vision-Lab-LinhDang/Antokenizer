@@ -33,8 +33,7 @@ class FunctionalResampler(nn.Module):
         self.d_update=nn.Sequential(nn.Linear(3*d+4,2*d),nn.SiLU(),nn.Linear(2*d,d))
         self.d_gate=nn.Linear(3*d+4,d)
         self.c_update=nn.Sequential(nn.LayerNorm(d),nn.Linear(d,d))
-        self.reliability=nn.Sequential(nn.Linear(5,32),nn.SiLU(),nn.Linear(32,1))
-        self.existence=nn.Linear(d+1,1)
+        self.reliability=nn.Sequential(nn.Linear(4,32),nn.SiLU(),nn.Linear(32,1))
 
     def ownership(self,state,ev,decoder,*,proposals=False):
         desc=self.descriptor(torch.cat((state.c.mean(-2),state.d.mean(-2)),-1))
@@ -159,7 +158,7 @@ class FunctionalResampler(nn.Module):
         candidate=initialized.d+torch.sigmoid(self.d_gate(inp))*self.d_update(inp)
         d=torch.where(observed[...,None,None],candidate,initialized.d)
         corrected=replace(initialized,d=d)
-        refined,_=self.ownership(corrected,ev,decoder)
+        refined,refined_logits=self.ownership(corrected,ev,decoder)
         winning=F.one_hot(refined.argmax(-1),k+1)[...,:k].bool()&ev['valid'][...,None]
         winning=torch.where(reserved_rows,reserved,winning)
         observed_c=winning.any(1)&initialized.allocated
@@ -200,7 +199,9 @@ class FunctionalResampler(nn.Module):
         uncertainty=-(ev['probabilities'].clamp_min(1e-12).log()*ev['probabilities']).sum(-1)
         uncertainty=uncertainty[:,:,None].expand(-1,-1,hypotheses).flatten(1,2)
         token_uncertainty=(attention.detach()*uncertainty[:,None,None]).sum(-1,keepdim=True).detach()
-        trust=torch.cat((token_support,token_ambiguity,token_measured,token_uncertainty,reliability_target),-1).detach()
+        # Inference uses observable support/provenance/ambiguity only. The
+        # measured residual label above is supervision, never a gate feature.
+        trust=torch.cat((token_support,token_ambiguity,token_measured,token_uncertainty),-1).detach()
         reliability=torch.sigmoid(self.reliability(trust))
         alpha=(token_support*reliability).detach()
         can_write=observed_c&cvalid.any(-1)
@@ -209,17 +210,24 @@ class FunctionalResampler(nn.Module):
         c=torch.where(can_write[...,None,None],merged,initialized.c)
         atlas_valid=(winning.transpose(1,2)[...,None]&(ev['probabilities'][:,None]>0)).flatten(-2)&cvalid
         bits=atlas_update(state.support_bits,canonical.detach(),atlas_valid,extent=self.cfg.atlas_extent)
-        exist=torch.sigmoid(self.existence(torch.cat((d.mean(-2),torch.log1p(support)[...,None]),-1))).squeeze(-1)
+        # Preserve the state schema's legacy p_exist field as a lifecycle
+        # indicator, not an unsupervised learned probability/density channel.
+        exist=(state.content_initialized|can_write).to(state.p_exist.dtype)
         output=replace(corrected,c=c,support_bits=bits,content_initialized=state.content_initialized|can_write,
                        slot_status=torch.where(observed_c,torch.ones_like(state.slot_status),corrected.slot_status),
                        last_seen=torch.where(observed_c,state.t[:,None],state.last_seen),
                        p_exist=torch.where(observed_c,exist,state.p_exist),
                        provenance=torch.where(can_write,measured_fraction,state.provenance))
-        return output,{'ownership':refined,'ownership_logits':logits,'ownership_entropy':entropy,'births':births,
+        return output,{'ownership':ownership,'ownership_logits':logits,
+                       'ownership_entropy':-(ownership.clamp_min(1e-12).log()*ownership).sum(-1),
+                       'ownership_valid':ev['valid'],'content_ownership':refined,
+                       'content_ownership_logits':refined_logits,'content_ownership_entropy':entropy,'births':births,
                        'observed':observed_c,'bootstrap':bootstrap,'support':support,'reliability':reliability,
                        'reliability_valid':(target_mass>1e-8)&can_write[:,:,None,None],
                        'reliability_target':reliability_target, 'content_support':token_support,
                        'content_attention':attention,'canonical_points':canonical,'canonical_valid':atlas_valid,
                        'candidate_dropped_mass':(cweights.sum(-1)-cweights.masked_fill(~cvalid,0).topk(min(self.cfg.candidates,cweights.shape[-1]),dim=-1).values.sum(-1)).clamp_min(0),
-                       'capacity_overflow':ev['valid'].sum(-1)*(~output.allocated).sum(-1).eq(0),
+                       # Token assignments do not identify unseen object counts.
+                       'unassigned_evidence_count':(refined.argmax(-1).eq(k)&ev['valid']).sum(-1),
+                       'slot_capacity_full':output.allocated.all(-1),
                        'canonical_outside_fraction':((canonical.abs()>=self.cfg.atlas_extent).any(-1)&atlas_valid).float().sum()/atlas_valid.sum().clamp_min(1)}

@@ -64,14 +64,18 @@ def sample_plan(times, profile, *, seed=17, horizon=6):
     if len(times) == 1:
         return {"prefix": [0], "observed": [True], "future": [], "profile": "image"}
     if len(times) < 3:
-        raise ValueError("video needs observation and a real held-out frame")
-    schedule = observation_schedule(profile, seed)
+        raise ValueError("no eligible temporal profile: video needs observation and a real held-out frame")
     endpoints = list(range(1, len(times), 2))
-    # Reserve at least one future endpoint. G must retain a genuine revisit;
-    # if footage is too short use S and report the realized profile.
-    if len(endpoints) <= len(schedule):
-        schedule = [True] * min(3, max(1, len(endpoints) - 1))
-        profile = "S-short"
+    schedules = {name: observation_schedule(name, seed) for name in ('S','L','G')}
+    eligible = [name for name, flags in schedules.items() if len(endpoints) >= len(flags)
+                and float(times[-1] - times[endpoints[len(flags)-1]]) >= .5 * horizon - .05]
+    if not eligible:
+        raise ValueError('no eligible temporal profile for requested horizon')
+    if profile not in eligible:
+        # Re-sample only among feasible profiles; do not shorten the observation contract.
+        profile = random.Random(seed ^ 0x50524F46).choices(eligible,
+                    weights=[{'S':.4,'L':.3,'G':.3}[name] for name in eligible])[0]
+    schedule = schedules[profile]
     prefix = endpoints[:len(schedule)]
     future = []
     for h in range(1, horizon + 1):
@@ -83,6 +87,48 @@ def sample_plan(times, profile, *, seed=17, horizon=6):
         if abs(float(times[candidate] - desired)) <= .05 and candidate not in future:
             future.append(candidate)
     return {"prefix": prefix, "observed": schedule, "future": future, "profile": profile}
+
+
+def static_view_plan(count, profile, *, seed=17):
+    """Camera-index schedule; held-out views never become tubelet inputs."""
+    if count < 3:
+        raise ValueError("static multiview requires two observations and a held-out view")
+    rng = random.Random(seed)
+    eligible = ["S"] + (["L"] if count >= 4 else []) + (["G"] if count >= 5 else [])
+    if profile not in eligible:
+        profile = rng.choice(eligible)
+    observed = 2 if profile == "S" else 3
+    gap = rng.randint(1, min(3, count - observed - 1)) if profile == "G" else 0
+    flags = [True, True] + [False] * gap + [True] if profile == "G" else [True] * observed
+    return {"prefix": list(range(len(flags))), "observed": flags,
+            "heldout": [len(flags)], "future": [], "profile": profile + "-views",
+            "temporal_supervision": False}
+
+
+def normalize_clip_gauge(clip):
+    """Anchor all input/target geometry once, using only an admitted camera."""
+    if "camera_c2w" not in clip:
+        return clip
+    from .gauge import normalize_camera_sequence
+    valid = clip["camera_valid"]
+    admitted = torch.zeros_like(valid)
+    for frame, observed in zip(clip["plan"]["prefix"], clip["plan"]["observed"]):
+        if observed:
+            # The encoder receives camera metadata only for tubelet endpoints.
+            admitted[frame, 0] = True
+    if not bool((valid & admitted).any()):
+        # Future-only camera labels cannot choose an inference origin.
+        clip['camera_valid'] = torch.zeros_like(valid)
+        clip['metric_valid'] = torch.zeros_like(valid)
+        clip['gauge_provenance'] = 'unanchored_camera_metadata_unavailable'
+        return clip
+    poses, mapping = normalize_camera_sequence(clip["camera_c2w"], valid, admitted)
+    clip["camera_c2w"] = poses
+    clip["scene_to_external"] = clip.get("scene_to_external", torch.eye(4, dtype=mapping.dtype)) @ mapping
+    if "object_to_world" in clip:
+        clip["object_to_world"] = torch.linalg.inv(mapping) @ clip["object_to_world"]
+    clip["gauge_provenance"] = "first_admitted_camera_se3_v1"
+    return clip
 
 
 def validate_clip(clip):
@@ -216,14 +262,37 @@ class NaturalSources:
         self.manifest_hashes["nuscenes"] = nuscenes_metadata_fingerprint(metadata_root, "v1.0-trainval", official)
 
     def inventory(self):
+        from .adapters.decode import static_capture_evidence
+        static_records = {source: sum(static_capture_evidence(row) for rows in groups.values()
+                                     for row in rows if isinstance(row,dict))
+                          for source,groups in self.groups.items()}
         return {"schema": "natural-v5-seven-source-v1", "split": self.split,
                 "groups": {s: len(g) for s, g in self.groups.items()},
                 "records": {s: sum(map(len, g.values())) for s, g in self.groups.items()},
                 "manifest_sha256": self.manifest_hashes,
                 "mixture": self.mixture, "synthetic_main": False, "input_views": 1,
-                "nuscenes_keyframes_only": True, "celebv_draw_cap": .5}
+                "nuscenes_keyframes_only": True, "celebv_draw_cap": .5,
+                "static_capture_protocol_records": static_records,
+                "data_contract": "per_draw_endpoint_gauge_multiview_v2",
+                "status_normalization": "per_example_present_classes_v1",
+                "ray_bounds": "domain_gauge_v1"}
 
     def draw(self, source, seed, *, profile="S", horizon=6, plan_seed=17, group=None):
+        for attempt in range(32):
+            try:
+                clip = self._draw_once(source, seed + attempt * 2000066, profile=profile,
+                                       horizon=horizon, plan_seed=plan_seed, group=group)
+            except ValueError as error:
+                if 'no eligible temporal profile' not in str(error):
+                    raise
+                continue
+            clip['draw_seed'] = seed
+            clip['bridge_selected'] = random.Random(seed ^ 0x42524944).random() < .25
+            clip['eligibility_resamples'] = attempt
+            return clip
+        raise ValueError(f'{source}: no eligible temporal profile in 32 group draws')
+
+    def _draw_once(self, source, seed, *, profile="S", horizon=6, plan_seed=17, group=None):
         rng = random.Random(seed)
         keys = self.keys[source]
         if source == "openvid":
@@ -235,7 +304,7 @@ class NaturalSources:
         key = group if group is not None else keys[rng.randrange(len(keys))]
         if key not in self.groups[source]: raise ValueError("unknown frozen source group")
         if source == "nuscenes":
-            clip = self._nuscenes(key, rng, profile, horizon)
+            clip = self._nuscenes(key, rng, profile, horizon, plan_seed=plan_seed)
         elif source not in ("openimages", "openvid"):
             from .adapters.decode import decode_record
             row = rng.choice(self.groups[source][key])
@@ -251,23 +320,38 @@ class NaturalSources:
             else:
                 clip = self._video(path, rng, profile, horizon, plan_seed=plan_seed)
         clip.setdefault("rgb_valid", torch.ones(*clip["rgb"].shape[:2], 1, self.height, self.width, dtype=torch.bool))
-        clip.update(source=source, group=key, seed=seed)
-        if clip.get("time_valid", True) and len(clip["times"]) != 2:
+        clip.update(source=source, group=key, seed=seed, draw_seed=seed)
+        clip["bridge_selected"] = random.Random(seed ^ 0x42524944).random() < .25
+        if clip.get("time_valid", True):
             clip["plan"] = sample_plan(clip["times"], profile, seed=plan_seed, horizon=horizon)
         else:
-            clip["plan"] = {"prefix": list(range(min(len(clip["times"]), 6))),
-                            "observed": [True] * min(len(clip["times"]), 6),
-                            "future": [], "profile": "unordered_views", "temporal_supervision": False}
-        if not clip.get("time_valid", True):
-            clip["plan"]["future"] = []
-            clip["plan"]["temporal_supervision"] = False
+            clip["plan"] = static_view_plan(len(clip["times"]), profile, seed=plan_seed)
         clip.setdefault("camera_valid", torch.zeros(*clip["rgb"].shape[:2], dtype=torch.bool))
         clip.setdefault("metric_valid", torch.zeros(*clip["rgb"].shape[:2], dtype=torch.bool))
         clip.setdefault("depth_provenance", "missing")
         clip.setdefault("time_valid", source != "openimages")
         clip.setdefault("timestamp_provenance", "single_image")
         clip.setdefault("scene_static", False)
+        normalize_clip_gauge(clip)
         return validate_clip(clip)
+
+    def capacity_draw(self, source, seed, *, horizon=6, profile="G", attempts=96):
+        """Find a real maximum-profile draw, or fail with explicit missing coverage."""
+        for attempt in range(attempts):
+            candidate_seed = seed + attempt * 104729
+            # G max schedule uses six observations and six skipped endpoints.
+            plan_seed = (next(s for s in range(candidate_seed, candidate_seed + 2000)
+                             if len(observation_schedule("G", s)) == 12) if profile == "G" else candidate_seed)
+            clip = self.draw(source, candidate_seed, profile=profile, horizon=horizon, plan_seed=plan_seed)
+            plan = clip["plan"]
+            if source == "openimages":
+                return clip
+            if not clip.get("time_valid", True):
+                if plan["profile"] == profile+"-views" and (profile != "G" or plan["observed"].count(False) == 3):
+                    return clip
+            elif plan["profile"] == profile and len(plan["future"]) == horizon and len(plan["prefix"]) == (12 if profile=="G" else 3):
+                return clip
+        raise ValueError(f"{source}: no proven maximum {profile}/H{horizon} capacity draw in {attempts} attempts")
 
     def _video(self, path, rng, profile, horizon, *, plan_seed=17):
         import cv2
@@ -299,17 +383,17 @@ class NaturalSources:
         finally:
             cap.release()
 
-    def _nuscenes(self, key, rng, profile, horizon):
+    def _nuscenes(self, key, rng, profile, horizon, *, plan_seed=17):
         from mavt4d.data.nuscenes import CAM6, resize_crop
         tb, samples = self.nusc, self.groups["nuscenes"][key]
-        wanted = 2 * (len(observation_schedule(profile, 17)) + horizon)
+        wanted = 2 * (len(observation_schedule(profile, plan_seed)) + horizon)
         start = rng.randint(0, max(0, len(samples) - wanted))
         chosen = samples[start:start + wanted]
         first_view = rng.randrange(6)
         channels = (CAM6[first_view], CAM6[(first_view + rng.randrange(1, 6)) % 6])
         images, intrinsics, cameras, times, depths, input_depths = [], [], [], [], [], []
+        mask_boxes = {}
         first_sd = tb.keyframe_data[chosen[0]][channels[0]]
-        gauge = np.linalg.inv(tb.ego_to_global(first_sd) @ tb.sensor_to_ego(first_sd))
         for sample in chosen:
             im_t, k_t, pose_t, depth_t, input_t = [], [], [], [], []
             lidar_key = tb.keyframe_data[sample]["LIDAR_TOP"]
@@ -330,8 +414,28 @@ class NaturalSources:
                 k[0] *= self.width / original_w
                 k[1] *= self.height / original_h
                 camera_world = tb.ego_to_global(sd) @ tb.sensor_to_ego(sd)
+                if channel == channels[0]:
+                    from mavt4d.data.nuscenes import _se3
+                    boxes = []
+                    for token in tb.annotations_of.get(sample, ()):
+                        annotation = tb.sample_annotation[token]
+                        transform = _se3(annotation['rotation'], annotation['translation'])
+                        width, length, height = annotation['size']
+                        corners = np.array([[x*length/2,y*width/2,z*height/2]
+                                            for x in (-1,1) for y in (-1,1) for z in (-1,1)])
+                        world = corners @ transform[:3,:3].T + transform[:3,3]
+                        cam = (world-camera_world[:3,3]) @ camera_world[:3,:3]
+                        if not (cam[:,2] > .1).all():
+                            continue  # avoid unbounded boxes crossing the near plane
+                        projected = cam @ k.T
+                        uv_box = projected[:,:2]/projected[:,2:]
+                        left, top = np.maximum(uv_box.min(0), [0,0])
+                        right, bottom = np.minimum(uv_box.max(0), [self.width,self.height])
+                        if right>left and bottom>top:
+                            boxes.append([float(left),float(top),float(right),float(bottom)])
+                    mask_boxes[len(images)] = boxes
                 k_t.append(torch.tensor(k, dtype=torch.float32))
-                pose_t.append(torch.tensor(gauge @ camera_world, dtype=torch.float32))
+                pose_t.append(torch.tensor(camera_world, dtype=torch.float32))
                 camera_points = (points - camera_world[:3, 3]) @ camera_world[:3, :3]
                 pixel = camera_points @ k.T
                 z = camera_points[:, 2]
@@ -357,4 +461,5 @@ class NaturalSources:
                 "depth_valid": torch.stack(depths) > 0,
                 "input_depth_valid": torch.stack(input_depths) > 0,
                 "timestamp_provenance": "sensor_keyframe", "camera_channels": channels,
-                "depth_provenance": "measured", "depth_detail": "sparse_lidar_no_dynamic_transport"}
+                "depth_provenance": "measured", "depth_detail": "sparse_lidar_no_dynamic_transport",
+                "mask_boxes_xyxy": mask_boxes, "mask_boxes_provenance": "projected_gt_boxes_not_surface_correspondence"}

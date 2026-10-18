@@ -8,6 +8,44 @@ import torch
 
 
 @torch.no_grad()
+def normalize_camera_sequence(camera_c2w, camera_valid, observed):
+    """Anchor all cameras once to the first admitted sensor pose, without scale.
+
+    Poses are [T,V,4,4]; admission is [T] or [T,V]. The returned SE(3)
+    maps normalized scene coordinates back to the dataset frame, whose units
+    are unchanged. A pose alone never establishes metric units. Invalid poses
+    stay invalid and cannot select the origin, including held-out cameras.
+    """
+    if camera_c2w.ndim != 4 or camera_c2w.shape[-2:] != (4,4):
+        raise ValueError('camera sequence must be [T,V,4,4]')
+    if camera_valid.shape != camera_c2w.shape[:2] or camera_valid.dtype != torch.bool:
+        raise ValueError('camera validity must be boolean [T,V]')
+    if observed.shape == camera_c2w.shape[:1]:
+        observed=observed[:,None].expand_as(camera_valid)
+    if observed.shape != camera_valid.shape or observed.dtype != torch.bool:
+        raise ValueError('admitted cameras must be boolean [T] or [T,V]')
+    indices=(camera_valid&observed).nonzero()
+    if not len(indices):
+        raise ValueError('no admitted valid camera can establish sequence frame')
+    poses=camera_c2w.float()
+    valid_poses=poses[camera_valid]
+    rotations=valid_poses[:,:3,:3]
+    identity=torch.eye(3,device=poses.device).expand_as(rotations)
+    if (not torch.isfinite(valid_poses).all() or
+        not torch.allclose(rotations.transpose(-1,-2)@rotations,identity,atol=1e-4,rtol=1e-4) or
+        not torch.allclose(torch.linalg.det(rotations),torch.ones(len(rotations),device=poses.device),atol=1e-4,rtol=1e-4) or
+        not torch.allclose(valid_poses[:,3],poses.new_tensor([0.,0.,0.,1.]).expand(len(valid_poses),4))):
+        raise ValueError('valid camera poses must be finite SE(3) transforms')
+    anchor=poses[indices[0,0],indices[0,1]].clone()
+    inverse=torch.eye(4,device=poses.device)
+    inverse[:3,:3]=anchor[:3,:3].T
+    inverse[:3,3]=-anchor[:3,:3].T@anchor[:3,3]
+    with torch.autocast(device_type=poses.device.type,enabled=False):
+        normalized=inverse@poses
+    return torch.where(camera_valid[...,None,None],normalized,poses),anchor
+
+
+@torch.no_grad()
 def fit_prefix_similarity(scene_points, metric_points, valid, times, cutoff,
                           *, residual_tolerance=.05):
     """Fit x_metric=s R x_scene+b with at least 3 noncollinear correspondences.
@@ -126,7 +164,11 @@ def prepare_observation_gauge(state,observation):
         initial=~state.camera_valid.any(-1)&~state.allocated.any(-1)
         if (known&~state.metric_valid&~initial).any():
             raise ValueError('sensor return requires observable prefix calibration before correction')
-        state=replace(state,metric_valid=state.metric_valid|(known&initial))
+        anchor_now=known&initial&~state.metric_valid
+        first=measured.long().argmax(-1)
+        anchor=observation.camera_c2w[torch.arange(len(first),device=first.device),first].float()
+        state=replace(state,metric_valid=state.metric_valid|(known&initial),
+                      scene_to_metric=torch.where(anchor_now[:,None,None],anchor,state.scene_to_metric))
         scale,rotation,translation=similarity_components(state)
         raw=observation.camera_c2w
         r=rotation[:,None].transpose(-1,-2)@raw[...,:3,:3]

@@ -67,7 +67,9 @@ class V5Readout(nn.Module):
             raise ValueError('ray directions must be normalized')
         transforms,z=self.extended_controls(state.d)
         k=state.c.shape[1]
-        existence=state.p_exist*state.allocated*state.content_initialized
+        # Only explicit lifecycle eligibility gates a field. Learned confidence
+        # must not become a second density/appearance channel outside C.
+        existence=state.allocated*state.content_initialized
         fractions=(torch.arange(self.cfg.samples_per_ray,device=state.c.device)+.5)/self.cfg.samples_per_ray
         chunks=[]
         for start in range(0,r,ray_chunk_size or self.cfg.query_chunk_size):
