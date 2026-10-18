@@ -28,7 +28,11 @@ class ObservationStep:
     camera_c2w: Tensor | None = None  # endpoint [B,V,4,4]
     depth: Tensor | None = None  # measured camera-z [B,V,1,H,W]
     depth_valid: Tensor | None = None
-    geometry_valid: Tensor | None = None  # calibrated/synchronized views [B,V]
+    geometry_valid: Tensor | None = None  # legacy alias for camera_valid [B,V]
+    camera_valid: Tensor | None = None  # camera pose/intrinsics valid independently of depth
+    metric_valid: Tensor | None = None  # source declares metric units [B,V], not a fitted bridge
+    time_valid: Tensor | None = None  # [B], physical timestamps known
+    timestamp_provenance: str | None = None
 
     def to(self, device) -> ObservationStep:
         return ObservationStep(
@@ -273,7 +277,13 @@ class SparseObservationEncoder(nn.Module):
         calibrated = obs.intrinsics is not None and obs.camera_c2w is not None
         if (obs.intrinsics is None) != (obs.camera_c2w is None):
             raise ValueError("camera intrinsics and camera_c2w are required together")
-        geo_valid = obs.geometry_valid
+        geo_valid = obs.camera_valid if obs.camera_valid is not None else obs.geometry_valid
+        if obs.camera_valid is not None and obs.geometry_valid is not None and not torch.equal(obs.camera_valid,obs.geometry_valid):
+            raise ValueError("camera_valid and legacy geometry_valid disagree")
+        if obs.metric_valid is not None and (obs.metric_valid.shape != (b,views) or obs.metric_valid.dtype != torch.bool):
+            raise ValueError("metric_valid must be boolean [B,V]")
+        if obs.time_valid is not None and (obs.time_valid.shape != (b,) or obs.time_valid.dtype != torch.bool):
+            raise ValueError("time_valid must be boolean [B]")
         if geo_valid is None:
             geo_valid = torch.full(
                 (b, views), calibrated, dtype=torch.bool, device=device
