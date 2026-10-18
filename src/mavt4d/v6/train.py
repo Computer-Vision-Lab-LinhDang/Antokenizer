@@ -1,0 +1,418 @@
+"""V6 training CLI (torchrun ready).
+
+    PYTHONPATH=src python -m mavt4d.v6.train --data-root ~/data/argoverse2/sensor --split train --bf16 \
+        --checkpoint-layers --ckpt-dir runs/v6
+    PYTHONPATH=src torchrun --nproc_per_node 8 -m mavt4d.v6.train ...
+    PYTHONPATH=src python -m mavt4d.v6.train --dry-run --max-steps 2      # synthetic batch, no dataset
+
+Gradients are all-reduced by hand after the truncated-BPTT chunks (each chunk is backpropagated
+right away), so unused modules and multiple backward passes per step need no DDP special cases.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import os
+import random
+import time
+from datetime import timedelta
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+from .config import V6Config
+from .contracts import Observation
+from .losses import DEFAULT_WEIGHTS, sequence_loss
+from .model import V6Model
+
+MIN_BOX_POINTS = 5        # box "seen": >= 5 LiDAR points inside
+BUCKET_ELEMENTS = 1 << 24
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description='Train MAVT v6 on Argoverse 2 Sensor clips.')
+    p.add_argument('--data-root', default=None, help='e.g. ~/data/argoverse2/sensor')
+    p.add_argument('--split', default='train')
+    p.add_argument('--steps', type=int, default=6, help='time steps per clip')
+    p.add_argument('--step-dt', type=float, default=.5, help='seconds between clip steps')
+    p.add_argument('--batch-size', type=int, default=2, help='clips per process')
+    p.add_argument('--lr', type=float, default=3e-4)
+    p.add_argument('--min-lr-ratio', type=float, default=.1)
+    p.add_argument('--warmup', type=int, default=1000)
+    p.add_argument('--weight-decay', type=float, default=.05)
+    p.add_argument('--grad-clip', type=float, default=1.)
+    p.add_argument('--max-steps', type=int, default=100_000)
+    p.add_argument('--log-every', type=int, default=10)
+    p.add_argument('--save-every', type=int, default=1000)
+    p.add_argument('--keep', type=int, default=3, help='numbered checkpoints kept besides last.pt')
+    p.add_argument('--ckpt-dir', default='runs/v6')
+    p.add_argument('--resume', default=None, help="checkpoint path, or 'auto' for <ckpt-dir>/last.pt if present")
+    p.add_argument('--backbone', default='dinov3_vits16',
+                   choices=('dinov3_vits16', 'siglip2_so400m16', 'siglip2_b16'),
+                   help='encoder layout (sets encoder width/heads/layers/registers)')
+    p.add_argument('--backbone-weights', '--dinov3', dest='backbone_weights', default=None,
+                   help='pretrained encoder weights: HF repo id, local dir or file '
+                        '(server: ~/mavt/weights/dinov3-vits16 or siglip2-*-patch16-256)')
+    p.add_argument('--bf16', action='store_true', help='bf16 autocast (Kalman/geometry stay fp32 inside modules)')
+    p.add_argument('--checkpoint-layers', action='store_true', help='activation checkpointing of encoder/trunk blocks')
+    p.add_argument('--cameras', default='all', help="'all', 'random' or a camera count")
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--rays-per-camera', type=int, default=256)
+    p.add_argument('--bptt', type=int, default=3, help='detach the state every N steps')
+    p.add_argument('--match-gate', type=float, default=4., help='slot-box match radius (m)')
+    p.add_argument('--weights', default='{}', help='JSON loss-weight overrides, e.g. \'{"pred_rgb": 2}\'')
+    p.add_argument('--config', default='{}', help='JSON V6Config overrides, e.g. \'{"slots": 24}\'')
+    p.add_argument('--device', default=None, help='default: cuda:LOCAL_RANK if available, else cpu')
+    p.add_argument('--dry-run', action='store_true', help='synthetic random batches, no dataset')
+    p.add_argument('--no-heldout', dest='heldout', action='store_false',
+                   help='feed every camera (default: hold one camera per clip out as a render target)')
+    args = p.parse_args(argv)
+    if not args.dry_run and not args.data_root:
+        p.error('--data-root is required unless --dry-run')
+    c = str(args.cameras)
+    args.cameras = int(c) if c.isdigit() else c
+    return args
+
+
+# ---------------------------------------------------------------- distributed
+
+def setup_distributed(device_arg=None):
+    world = int(os.environ.get('WORLD_SIZE', 1))
+    rank = int(os.environ.get('RANK', 0))
+    local = int(os.environ.get('LOCAL_RANK', 0))
+    if device_arg:
+        device = torch.device(device_arg)
+    elif torch.cuda.is_available():  # ROCm builds report as cuda
+        device = torch.device('cuda', local)
+    else:
+        device = torch.device('cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    if world > 1 and not dist.is_initialized():
+        # nccl maps to RCCL on ROCm
+        dist.init_process_group('nccl' if device.type == 'cuda' else 'gloo', timeout=timedelta(minutes=30))
+    return rank, world, device
+
+
+def broadcast_model(model, world):
+    if world > 1:
+        for t in list(model.parameters()) + list(model.buffers()):
+            dist.broadcast(t.data, 0)
+
+
+def allreduce_grads(params, world):
+    """Mean gradients over ranks; unused parameters contribute zeros."""
+    if world == 1:
+        return
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+    bucket, size = [], 0
+    for p in params + [None]:
+        if p is not None:
+            bucket.append(p.grad)
+            size += p.numel()
+        if bucket and (p is None or size >= BUCKET_ELEMENTS):
+            flat = _flatten_dense_tensors(bucket)
+            dist.all_reduce(flat)
+            flat.div_(world)
+            for g, f in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
+                g.copy_(f)
+            bucket, size = [], 0
+
+
+def mean_logs(log, world):
+    if world == 1:
+        return log
+    gathered = [None] * world
+    dist.all_gather_object(gathered, log)
+    keys = set().union(*gathered)
+    return {k: sum(g[k] for g in gathered if k in g) / sum(k in g for g in gathered) for k in sorted(keys)}
+
+
+# ---------------------------------------------------------------- data
+
+def to_device(x, device):
+    if isinstance(x, torch.Tensor):
+        return x.to(device, non_blocking=True)
+    if isinstance(x, dict):
+        return {k: to_device(v, device) for k, v in x.items()}
+    return x
+
+
+def observation(batch, s):
+    images = batch['images'][:, s]
+    if not images.is_floating_point():
+        images = images.float().div_(255)
+    return Observation(images=images, tube_dt=batch['tube_dt'][:, s], intrinsics=batch['intrinsics'][:, s],
+                       cam_to_rig=batch['cam_to_rig'][:, s], camera_key=batch['camera_key'][:, s],
+                       camera_valid=batch['camera_valid'][:, s], depth=batch['depth'][:, s],
+                       depth_valid=batch['depth_valid'][:, s], rig_pose=batch['rig_pose'][:, s],
+                       rig_pose_valid=batch['rig_pose_valid'][:, s],
+                       has_metric_depth=batch['has_metric_depth'][:, s], t=batch['t'][:, s])
+
+
+def pick_heldout(camera_valid, generator=None):
+    """One camera per clip kept out of the input as a render target: [B,T,V] valid -> [B,V] mask.
+    Only clips with >= 2 valid cameras at the first step give one up."""
+    ok = camera_valid[:, 0].bool()
+    score = torch.rand(ok.shape, generator=generator).to(ok.device).masked_fill(~ok, -1.)
+    held = torch.zeros_like(ok)
+    held.scatter_(1, score.argmax(1, keepdim=True), True)
+    return held & ok & (ok.sum(1, keepdim=True) >= 2)
+
+
+def batch_to_sequence(batch, device, min_box_points=MIN_BOX_POINTS, heldout=False, generator=None):
+    """Collated clip batch (data_av2.collate_clips layout, step dim 1) -> list[Observation], list[targets].
+    heldout: one camera per clip is removed from the input at every step and rendered as a target."""
+    batch = to_device(batch, device)
+    steps, targets = [], []
+    boxes = batch.get('boxes')
+    held = pick_heldout(batch['camera_valid'], generator) if heldout else None
+    for s in range(batch['t'].shape[1]):
+        obs = observation(batch, s)
+        tg = {'target_depth': batch['target_depth'][:, s], 'target_valid': batch['target_valid'][:, s]}
+        if held is not None and bool(held.any()):
+            cam_ok = obs.camera_valid.bool()
+            hv = (held & cam_ok)[..., None, None]
+            tg['heldout'] = {'images': obs.images[:, :, -1], 'intrinsics': obs.intrinsics, 'cam_to_rig': obs.cam_to_rig,
+                             'camera_valid': held & cam_ok,
+                             'depth': torch.where(obs.depth_valid.bool(), obs.depth, tg['target_depth']),
+                             'depth_valid': (obs.depth_valid.bool() | tg['target_valid'].bool()) & hv}
+            obs = dataclasses.replace(obs, camera_valid=cam_ok & ~held)
+        steps.append(obs)
+        if boxes is not None:
+            tg.update(box_center=boxes['center'][:, s], box_size=boxes['size'][:, s],
+                      box_class=boxes['category'][:, s],
+                      box_valid=boxes['mask'][:, s].bool() & (boxes['num_interior_pts'][:, s] >= min_box_points))
+        targets.append(tg)
+    return steps, targets
+
+
+def clip_seeds(batch, base_seed, step, rank):
+    logs = batch.get('log_id')
+    ts = batch.get('timestamp_ns')
+    n = batch['t'].shape[0]
+    if logs is None or ts is None:
+        return [f'{base_seed}:{step}:{rank}:{i}' for i in range(n)]
+    return [f'{base_seed}:{step}:{logs[i]}:{int(ts[i, 0])}' for i in range(n)]
+
+
+def _ego_from_cam():
+    # camera +z forward, +x right, +y down -> ego +x forward, +y left, +z up
+    return torch.tensor([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]])
+
+
+def synthetic_batch(cfg, batch_size, steps, cameras, step_dt=.5, generator=None, max_boxes=8):
+    """Random batch in the collate_clips layout (for --dry-run and tests)."""
+    g = generator
+    b, t, f, h, w = batch_size, steps, cfg.tubelet, cfg.image_height, cfg.image_width
+    v = min(cfg.max_cameras, cameras if isinstance(cameras, int) else cfg.max_cameras)
+    images = torch.rand(b, t, v, f, 3, h, w, generator=g)
+    k = torch.tensor([[.8 * w, 0., w / 2 - .5], [0., .8 * w, h / 2 - .5], [0., 0., 1.]])
+    c2r = torch.eye(4).repeat(v, 1, 1)
+    for i in range(v):
+        yaw = 2 * math.pi * i / v
+        rz = torch.tensor([[math.cos(yaw), -math.sin(yaw), 0.], [math.sin(yaw), math.cos(yaw), 0.], [0., 0., 1.]])
+        c2r[i, :3, :3] = rz @ _ego_from_cam()
+        c2r[i, :3, 3] = torch.tensor([1.5, 0., 1.6])
+    camera_valid = torch.ones(b, t, v, dtype=torch.bool)
+    if b > 1 and v > 1:
+        camera_valid[-1, :, -1] = False  # one dead camera row
+    z = 2 + 58 * torch.rand(b, t, v, h, w, generator=g)
+    u = torch.rand(b, t, v, h, w, generator=g)
+    depth_valid, target_valid = u < .05, (u >= .05) & (u < .07)
+    time_s = torch.arange(t, dtype=torch.float64)[None].repeat(b, 1) * step_dt
+    rig = torch.eye(4).repeat(b, t, 1, 1)
+    rig[..., 0, 3] = 5. * time_s.float()  # ego drives forward at 5 m/s
+    center = torch.rand(b, max_boxes, 3, generator=g) * torch.tensor([30., 20., 0.]) + torch.tensor([5., -10., .8])
+    velocity = torch.randn(b, max_boxes, 3, generator=g) * torch.tensor([3., 1., 0.])
+    boxes = dict(center=center[:, None] + velocity[:, None] * time_s.float()[..., None, None],
+                 size=torch.tensor([4.5, 1.9, 1.6]).expand(b, t, max_boxes, 3).clone(),
+                 quaternion=torch.tensor([1., 0., 0., 0.]).expand(b, t, max_boxes, 4).clone(),
+                 category=torch.randint(0, 30, (b, 1, max_boxes), generator=g).expand(b, t, max_boxes).clone(),
+                 track=torch.arange(max_boxes).expand(b, t, max_boxes).clone(),
+                 num_interior_pts=torch.full((b, t, max_boxes), 20, dtype=torch.int64),
+                 mask=torch.rand(b, 1, max_boxes, generator=g).expand(b, t, max_boxes) < .75)
+    return dict(images=images, tube_dt=torch.full((b, t), .1), intrinsics=k.expand(b, t, v, 3, 3).clone(),
+                cam_to_rig=c2r.expand(b, t, v, 4, 4).clone(), camera_key=torch.arange(v).expand(b, t, v).clone(),
+                camera_valid=camera_valid, depth=torch.where(depth_valid, z, 0.), depth_valid=depth_valid,
+                target_depth=torch.where(target_valid, z, 0.), target_valid=target_valid,
+                rig_pose=rig, rig_pose_valid=torch.ones(b, t, dtype=torch.bool),
+                has_metric_depth=torch.ones(b, t, dtype=torch.bool), t=time_s, boxes=boxes)
+
+
+def batches(args, cfg, rank, world, device):
+    """Infinite batch iterator."""
+    if args.dry_run:
+        g = torch.Generator().manual_seed(args.seed * 1000 + rank)
+        while True:
+            yield synthetic_batch(cfg, args.batch_size, args.steps, args.cameras, args.step_dt, generator=g)
+    from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
+    from .data_av2 import Av2ClipDataset, collate_clips
+    dataset = Av2ClipDataset(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps,
+                             step_dt=args.step_dt, cameras=args.cameras, seed=args.seed, uint8_images=True)
+    if len(dataset) == 0:
+        raise RuntimeError(f'no clips under {args.data_root}/{args.split}')
+    if world > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True)
+    else:
+        sampler = RandomSampler(dataset, generator=torch.Generator().manual_seed(args.seed))
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers,
+                        collate_fn=collate_clips, drop_last=True, pin_memory=device.type == 'cuda',
+                        persistent_workers=args.num_workers > 0,
+                        prefetch_factor=2 if args.num_workers > 0 else None)
+    epoch = 0
+    while True:
+        if hasattr(sampler, 'set_epoch'):
+            sampler.set_epoch(epoch)
+        yield from loader
+        epoch += 1
+
+
+# ---------------------------------------------------------------- optimisation
+
+def make_optimizer(model, args):
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if p.requires_grad:
+            (decay if p.ndim >= 2 else no_decay).append(p)
+    return torch.optim.AdamW([{'params': decay, 'weight_decay': args.weight_decay},
+                              {'params': no_decay, 'weight_decay': 0.}], lr=args.lr, betas=(.9, .95))
+
+
+def lr_at(step, args):
+    if step < args.warmup:
+        return args.lr * (step + 1) / args.warmup
+    frac = min(1., (step - args.warmup) / max(1, args.max_steps - args.warmup))
+    return args.lr * (args.min_lr_ratio + (1 - args.min_lr_ratio) * .5 * (1 + math.cos(math.pi * frac)))
+
+
+def save_checkpoint(path, model, opt, step, cfg, args):
+    path = Path(path)
+    tmp = path.with_suffix('.tmp')
+    torch.save({'model': model.state_dict(), 'optimizer': opt.state_dict(), 'step': step,
+                'config': cfg.to_dict(), 'args': vars(args)}, tmp)
+    os.replace(tmp, path)
+
+
+def prune(ckpt_dir, keep):
+    numbered = sorted(ckpt_dir.glob('step_*.pt'))
+    for old in numbered[:max(0, len(numbered) - keep)]:
+        old.unlink(missing_ok=True)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    rank, world, device = setup_distributed(args.device)
+    main_rank = rank == 0
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed)  # same init on every rank (broadcast below anyway)
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    cfg = V6Config.with_backbone(args.backbone, **json.loads(args.config))
+    weights = {**DEFAULT_WEIGHTS, **json.loads(args.weights)}
+    ckpt_dir = Path(args.ckpt_dir).expanduser()
+    if main_rank:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_file = ckpt_dir / 'log.jsonl'
+
+    def emit(record):
+        if main_rank:
+            line = json.dumps(record, default=lambda o: float(o) if hasattr(o, '__float__') else str(o))
+            print(line, flush=True)
+            with open(log_file, 'a') as fh:
+                fh.write(line + '\n')
+
+    model = V6Model(cfg).to(device)
+    if args.backbone_weights:
+        from .encoder import load_backbone
+        source = args.backbone_weights
+        if Path(source).expanduser().exists():  # local path; anything else is an HF repo id
+            source = str(Path(source).expanduser())
+        loaded, missing = load_backbone(model.encoder, source)
+        share = len(loaded) / max(1, len(loaded) + len(missing))
+        emit({'event': 'backbone_weights', 'backbone': cfg.backbone, 'source': source, 'loaded': len(loaded),
+              'missing': len(missing), 'loaded_share': share})
+        if share < .5:  # a wrong path or layout must not silently train from scratch
+            raise SystemExit(f'backbone weights {source!r}: only {len(loaded)} of {len(loaded) + len(missing)} '
+                             f'encoder keys loaded into {cfg.backbone}')
+    if args.checkpoint_layers:
+        emit({'event': 'checkpointing', **model.set_activation_checkpointing(True)})
+    opt = make_optimizer(model, args)
+    params = [p for p in model.parameters() if p.requires_grad]
+    step = 0
+    resume = args.resume
+    if resume == 'auto':
+        resume = ckpt_dir / 'last.pt' if (ckpt_dir / 'last.pt').exists() else None
+    if resume:
+        state = torch.load(Path(resume).expanduser(), map_location='cpu', weights_only=False)
+        model.load_state_dict(state['model'])
+        opt.load_state_dict(state['optimizer'])
+        step = int(state['step'])
+        emit({'event': 'resume', 'path': str(resume), 'step': step})
+    broadcast_model(model, world)
+    torch.manual_seed(args.seed * 7919 + rank + step)  # per-rank ray / sample noise
+    emit({'event': 'start', 'world': world, 'device': str(device), 'params': sum(p.numel() for p in params),
+          'config': cfg.to_dict(), 'args': vars(args), 'weights': weights})
+
+    autocast = (lambda: torch.autocast(device.type, dtype=torch.bfloat16)) if args.bf16 else None
+
+    def backward(loss):
+        if loss.requires_grad:
+            loss.backward()
+
+    data = batches(args, cfg, rank, world, device)
+    model.train()
+    skipped = 0
+    t_last = time.time()
+    while step < args.max_steps:
+        t0 = time.time()
+        batch = next(data)
+        t_data = time.time() - t0
+        steps, targets = batch_to_sequence(batch, device, heldout=args.heldout)
+        seeds = clip_seeds(batch, args.seed, step, rank)
+        lr = lr_at(step, args)
+        for group in opt.param_groups:
+            group['lr'] = lr
+        opt.zero_grad(set_to_none=True)
+        _, log = sequence_loss(model, steps, targets, seeds=seeds, weights=weights,
+                               rays_per_camera=args.rays_per_camera, bptt=args.bptt, backward=backward,
+                               autocast=autocast, gate=args.match_gate)
+        allreduce_grads(params, world)
+        gnorm = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
+        if math.isfinite(gnorm):
+            opt.step()
+        else:
+            skipped += 1
+            opt.zero_grad(set_to_none=True)
+        step += 1
+        if step % args.log_every == 0 or step == 1 or step == args.max_steps:
+            log = mean_logs(log, world)
+            now = time.time()
+            record = {'step': step, 'lr': lr, 'grad_norm': gnorm, 'skipped': skipped, 'data_s': t_data,
+                      'step_s': now - t0, 'wall_s': now - t_last, **log}
+            if device.type == 'cuda':
+                record['mem_gb'] = torch.cuda.max_memory_allocated(device) / 2 ** 30
+            emit(record)
+            t_last = now
+        if main_rank and (step % args.save_every == 0 or step == args.max_steps):
+            save_checkpoint(ckpt_dir / 'last.pt', model, opt, step, cfg, args)
+            if step % args.save_every == 0:
+                save_checkpoint(ckpt_dir / f'step_{step:07d}.pt', model, opt, step, cfg, args)
+                prune(ckpt_dir, args.keep)
+    emit({'event': 'done', 'step': step, 'skipped': skipped})
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
+    return step
+
+
+if __name__ == '__main__':
+    main()
