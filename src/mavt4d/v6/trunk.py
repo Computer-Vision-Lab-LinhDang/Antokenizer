@@ -30,6 +30,16 @@ BOX_MARGIN = (1.1, .25)  # box teacher: half-extent scale and pad (m) for the in
 BOX_CLAIM_M = 1.5      # box teacher: an allocated slot within max(this, half box diagonal) already holds the box
 
 
+def _anchor_grid(a: int):
+    """Box-frame anchor grid (x, y, z) with x * y * z == a: the box teacher's token -> anchor routing."""
+    gz = 2 if a % 2 == 0 else 1
+    rest = a // gz
+    gy = math.isqrt(rest)
+    while rest % gy:
+        gy -= 1
+    return rest // gy, gy, gz
+
+
 def _mlp(i, o, hidden=None):
     return nn.Sequential(nn.Linear(i, hidden or o), nn.GELU(), nn.Linear(hidden or o, o))
 
@@ -377,12 +387,14 @@ class V6Trunk(nn.Module):
 
     # ---- box teacher (training only) -------------------------------------------------------------------------
     def _box_teacher(self, state, enc, obs, tp, own, alloc, boxes):
-        """Unclaimed GT boxes choose which evidence tokens a free slot measures; the values stay evidence-only.
+        """GT boxes choose which evidence tokens a slot measures, and on which anchor; values stay evidence-only.
 
-        A token is in a box when its LiDAR-tagged or its own depth point falls inside. A box with an allocated
-        slot near its centre is held by the nearest one; each other box with enough tokens goes (greedy) to the
-        free slot that already owns most of them.
-        Returns forced [B,K] bool, token slot [B,Ne] int64: the slot holding or given the token's box (-1: none).
+        A token is in a box when its LiDAR-tagged or its own depth point falls inside; its anchor is its cell
+        in a box-frame grid (so a seeded slot always has spread anchors). A box with an allocated slot near its
+        centre is held by the nearest one; each other box with enough tokens goes (greedy) to the free slot that
+        already owns most of them.
+        Returns forced [B,K] bool, token slot [B,Ne] (slot holding or given the token's box, -1: none),
+        token anchor [B,Ne], slot box [B,K] (box a slot holds or was given, -1: none).
         """
         k = self.cfg.slots
         b, v, n, _ = tp.points.shape
@@ -392,7 +404,8 @@ class V6Trunk(nn.Module):
             m = center.shape[1]
             forced = torch.zeros(b, k, dtype=torch.bool, device=dev)
             if m == 0:
-                return forced, torch.full((b, v * n), -1, dtype=torch.long, device=dev)
+                none = torch.full((b, v * n), -1, dtype=torch.long, device=dev)
+                return forced, none, none.clamp_min(0), torch.full((b, k), -1, dtype=torch.long, device=dev)
             # rig -> world: metadata pose where known (a training teacher may use it), else the prior's
             known = obs.rig_pose_valid.bool().to(dev)
             pose = obs.rig_pose.float()
@@ -402,9 +415,8 @@ class V6Trunk(nn.Module):
             r_box = r_wr.transpose(-1, -2)[:, None] @ quat_to_matrix(boxes['quat'].float())   # box -> rig
             half = size * .5 * BOX_MARGIN[0] + BOX_MARGIN[1]
 
-            def inside(p):  # [B,Ne,3] rig -> [B,Ne,M]
-                local = torch.einsum('bmji,bnmj->bnmi', r_box, p[:, :, None] - c_rig[:, None])
-                return (local.abs() <= half[:, None]).all(-1)
+            def local(p):  # [B,Ne,3] rig -> box frame scaled to [-1, 1] inside the inflated box, [B,Ne,M,3]
+                return torch.einsum('bmji,bnmj->bnmi', r_box, p[:, :, None] - c_rig[:, None]) / half[:, None]
 
             ray = torch.where(tp.valid[..., None], enc.ray_cam.float(), enc.ray_cam.new_tensor([0., 0., 1.]).float())
             z = enc.measured_depth.float()[..., 0].clamp(*LOG_Z_CLAMP).exp()
@@ -412,15 +424,24 @@ class V6Trunk(nn.Module):
             p_lid = torch.einsum('bvij,bvnj->bvni', t[..., :3, :3], ray / ray[..., 2:].clamp_min(1e-6) * z[..., None]) \
                 + t[:, :, None, :3, 3]
             lid_ok = (enc.measured_valid & tp.valid).flatten(1)[..., None]
-            hit = (inside(p_lid.flatten(1, 2)) & lid_ok) | inside(tp.points.float().flatten(1, 2).detach())
+            u_lid, u_tok = local(p_lid.flatten(1, 2)), local(tp.points.float().flatten(1, 2).detach())
+            in_lid = (u_lid.abs() <= 1).all(-1) & lid_ok
+            hit = in_lid | (u_tok.abs() <= 1).all(-1)
             hit = hit & tp.valid.flatten(1)[..., None] & box_ok[:, None]
             hit = hit & (hit.long().cumsum(-1) == 1)                  # one box per token
+            u = torch.where(in_lid[..., None], u_lid, u_tok)          # the point that put the token inside
+            tok_box = torch.where(hit.any(-1), hit.float().argmax(-1), m)
+            u = u.gather(2, tok_box.clamp_max(m - 1)[..., None, None].expand(-1, -1, 1, 3)).squeeze(2)
+            grid = torch.tensor(_anchor_grid(self.cfg.anchors), device=dev)
+            cell = ((u + 1) * .5 * grid).floor().long().clamp(min=0).minimum(grid - 1)
+            token_anchor = (cell[..., 0] * grid[1] + cell[..., 1]) * grid[2] + cell[..., 2]
             count = hit.sum(1)                                       # [B,M]
             reach = torch.clamp(.5 * size.norm(dim=-1), min=BOX_CLAIM_M)
             dist = torch.cdist(state.position.float(), center)
             near = (dist < reach[:, None]) & alloc[..., None]
             claimed = near.any(1)
-            holder = torch.where(claimed & box_ok, dist.masked_fill(~near, float('inf')).argmin(1), -1)   # [B,M]
+            # a held box with no token inside leaves its slot to the model's own routing
+            holder = torch.where(claimed & box_ok & (count > 0), dist.masked_fill(~near, float('inf')).argmin(1), -1)
             eligible = box_ok & ~claimed & (count >= BOX_MIN_TOKENS)
             score = torch.einsum('bnm,bnk->bmk', hit.float(), own[..., :k].detach().float()) + 1e-3 * count[..., None]
             score = score.masked_fill(~eligible[..., None] | alloc[:, None], float('-inf'))
@@ -439,8 +460,11 @@ class V6Trunk(nn.Module):
             box_slot = F.pad(holder, (0, 1), value=-1)
             box_slot.scatter_(1, slot_box, torch.where(forced, torch.arange(k, device=dev), -1))
             box_slot[:, m] = -1
-            tok_box = torch.where(hit.any(-1), hit.float().argmax(-1), m)
-            return forced, box_slot.gather(1, tok_box)
+            # slot -> box: given boxes, else one box it holds
+            held = torch.full((b, k + 1), -1, dtype=torch.long, device=dev)
+            held.scatter_(1, torch.where(holder >= 0, holder, k), torch.arange(m, device=dev).expand(b, m).contiguous())
+            spawn_box = torch.where(forced, slot_box, held[:, :k])
+            return forced, box_slot.gather(1, tok_box), token_anchor, spawn_box
 
     # ---- forward -------------------------------------------------------------------------------------------
     def forward(self, state: V6State, enc: EncoderOutput, obs: Observation, boxes: dict | None = None) -> TrunkOutput:
@@ -506,13 +530,15 @@ class V6Trunk(nn.Module):
         cos = torch.einsum('bnd,bkad->bnka', F.normalize(self.assign_q(xe).float(), dim=-1), F.normalize(akey.float(), dim=-1))
         assign = (self.assign_log_scale.exp().clamp(max=cfg.logit_scale_max) * cos).softmax(-1)
         weight = own[..., :k, None] * assign * ev_valid[:, :, None, None]
-        forced = token_slot = None
+        forced = token_slot = spawn_box = assign_nll = None
         if boxes is not None:
-            forced, token_slot = self._box_teacher(state, enc, obs, tp, own, alloc, boxes)
-            # a forced slot measures exactly its box's tokens, each on its most likely anchor
-            hard = torch.zeros_like(assign).scatter_(-1, assign.argmax(-1, keepdim=True), 1.)
-            mine = (token_slot[..., None] == torch.arange(k, device=dev)) & ev_valid[..., None]
-            weight = torch.where(forced[:, None, :, None], hard * mine[..., None], weight)
+            forced, token_slot, token_anchor, spawn_box = self._box_teacher(state, enc, obs, tp, own, alloc, boxes)
+            # a slot given or holding a box measures exactly the box's tokens, each on its box-grid anchor
+            mine = (token_slot[..., None] == torch.arange(k, device=dev)) & ev_valid[..., None]       # [B,Ne,K]
+            hot = F.one_hot(token_anchor, a).to(weight.dtype)                                         # [B,Ne,A]
+            weight = torch.where((spawn_box >= 0)[:, None, :, None], mine[..., None] * hot[:, :, None], weight)
+            picked = assign.gather(2, token_slot.clamp_min(0)[:, :, None, None].expand(-1, -1, 1, a)).squeeze(2)
+            assign_nll = -picked.gather(-1, token_anchor[..., None]).squeeze(-1).clamp_min(1e-6).log()
         anchor_meas, meas_valid, mass = self.measure_anchors(points, weight)
 
         with no_autocast(points):
@@ -547,4 +573,5 @@ class V6Trunk(nn.Module):
             background_prop=bg[..., :-1], background_vis=torch.sigmoid(bg[..., -1]),
             spawn_logit=self.spawn_head(xs[:, :, dp]).float().squeeze(-1),
             spawn_canon=self.canon_head(neo).view(b, k, a, 3).float(),
-            camera_rows=rows, spawn_forced=forced, forced_slot=token_slot)
+            camera_rows=rows, spawn_forced=forced, forced_slot=token_slot, spawn_box=spawn_box,
+            assign_nll=assign_nll)

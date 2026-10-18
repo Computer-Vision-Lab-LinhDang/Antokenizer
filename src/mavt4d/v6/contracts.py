@@ -211,6 +211,8 @@ class TrunkOutput:
     # Training only (box teacher): a GT box picks which evidence tokens a free slot measures.
     spawn_forced: Tensor | None = None  # [B,K] bool free slot routed to an unclaimed box
     forced_slot: Tensor | None = None   # [B,Ne] int64 slot holding or given the token's box, -1 none
+    spawn_box: Tensor | None = None     # [B,K] int64 box a slot holds or was given, -1 none
+    assign_nll: Tensor | None = None    # [B,Ne] -log assign of the token's box-grid anchor in forced_slot
 
 
 @dataclass(frozen=True)

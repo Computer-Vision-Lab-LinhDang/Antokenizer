@@ -35,13 +35,18 @@ def test_box_teacher_spawns_from_evidence_only():
     meas = aux['meas']
     assert meas.spawn_forced.sum(-1).tolist() == [1, 1]
     assert bool((post.status > FREE).any(-1).all())          # spawned although the spawn head says no
-    # moving the box (same tokens inside) must not move any measured value
-    _, _, steps2, targets2 = _setup((3., -2., 1.))
-    _, aux2 = advance(model, state, steps2[0], observed, boxes=teacher_boxes(targets2[0]))
-    assert torch.equal(aux2['meas'].forced_slot, meas.forced_slot)
-    assert torch.allclose(aux2['meas'].anchor_meas, meas.anchor_meas)
+    # measured anchors are means of the box's own evidence points, spread over >= 3 box-grid anchors
+    pts = model.trunk.token_points(aux['enc'], steps[0]).points.flatten(1, 2)
+    for i in range(2):
+        k = int(meas.spawn_forced[i].float().argmax())
+        mine = pts[i][meas.forced_slot[i] == k]
+        ok = meas.anchor_meas_valid[i, k]
+        assert int(ok.sum()) >= 3
+        got = meas.anchor_meas[i, k][ok]
+        assert bool((got >= mine.amin(0) - 1e-4).all() & (got <= mine.amax(0) + 1e-4).all())
     terms, logs = step_terms(model, post, steps[0], targets[0], observed, aux=aux, rays_per_camera=16)
     assert torch.isfinite(terms['own_box']) and terms['own_box'] > 0
+    assert torch.isfinite(terms['assign_box']) and terms['assign_box'] > 0
     assert logs['forced_spawns'] == 1.
     terms['own_box'].backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.trunk.own_heads.parameters())
@@ -56,9 +61,11 @@ def test_box_teacher_off_without_boxes_or_when_claimed():
     assert not bool((post.status > FREE).any())
     post, _ = advance(model, state, steps[0], observed, boxes=teacher_boxes(targets[0]))
     # the slot now sits inside the box: the box is claimed and no second slot is forced
-    _, aux = advance(model, post, steps[1], observed, boxes=teacher_boxes(targets[1]))
+    post2, aux = advance(model, post, steps[1], observed, boxes=teacher_boxes(targets[1]))
     assert not bool(aux['meas'].spawn_forced.any())
-    # ... but its tokens still teach ownership to the slot that holds it
+    # ... but the slot holding it keeps measuring its tokens, so it survives the tentative check
     held = (post.status > FREE).float().argmax(-1)
     tok = aux['meas'].forced_slot
     assert bool((tok >= 0).any()) and bool(((tok == held[:, None]) | (tok < 0)).all())
+    assert aux['meas'].spawn_box.gather(1, held[:, None]).squeeze(1).tolist() == [0, 0]
+    assert bool((post2.status.gather(1, held[:, None]) > FREE).all())

@@ -27,7 +27,7 @@ DEFAULT_WEIGHTS = {
     'recon_rgb': 1., 'recon_depth': .5,
     'pred_rgb': 1., 'pred_depth': .5,
     'enc_depth': .1,
-    'slot_pos': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05, 'own_box': .1,
+    'slot_pos': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05, 'own_box': .1, 'assign_box': .1,
     'rig': .1,
 }
 BOX_KEYS = ('box_center', 'box_size', 'box_class', 'box_valid')
@@ -188,24 +188,33 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
     """Slots vs world boxes (box_center/size/class/valid).
 
     1. Allocated slots (incl. just spawned) matched within ``gate``: L1 position, L1 anchor extent vs box
-       size, class CE (on a detached C_obj / anchors: understanding does not pull the state).
+       size, class CE (on a detached C_obj / anchors: understanding does not pull the state). A slot the box
+       teacher paired with a box is matched to it at any distance.
     2. Slots free in the prior and not spawned: their proposal (mean measured anchor, world) is matched
        without a gate to the boxes left over; L1 proposal -> box pulls proposals onto objects.
     Spawn BCE on slots free in the prior (clips in spawn_mask): 1 if spawned onto a box (step 1), the
     proposal is within ``gate`` of a left-over box (step 2) or the box teacher routed a box to it, else 0.
     3. Box teacher: ownership CE pulls the tokens of each box onto the slot holding or given it (every
-       ownership layer).
+       ownership layer); anchor CE pulls each onto its box-grid anchor.
     """
     zero = _zero(state.position)
     terms = {'slot_pos': zero, 'slot_extent': zero, 'slot_class': zero, 'spawn': zero, 'proposal': zero,
-             'own_box': zero}
+             'own_box': zero, 'assign_box': zero}
     if any(key not in targets for key in BOX_KEYS):
         return terms, {}
     with torch.autocast(device_type=state.position.device.type, enabled=False):
         center, size = targets['box_center'].float(), targets['box_size'].float()
         cls, box_ok = targets['box_class'].long(), targets['box_valid'].bool()
         allocated = state.status > FREE
-        match, taken = match_slots(state.position, allocated, center, box_ok, gate)
+        paired = None if meas is None or meas.spawn_box is None else torch.where(allocated, meas.spawn_box, -1)
+        if paired is None:
+            match, taken = match_slots(state.position, allocated, center, box_ok, gate)
+        else:
+            m = center.shape[1]
+            taken = torch.zeros(paired.shape[0], m + 1, dtype=torch.bool, device=paired.device)
+            taken = taken.scatter(1, torch.where(paired >= 0, paired, m), True)[:, :m].cpu()
+            match, taken = match_slots(state.position, allocated & (paired < 0), center, box_ok, gate, taken=taken)
+            match = torch.where(paired >= 0, paired, match)
         hit = match >= 0
         idx = match.clamp_min(0)
         box_c = center.gather(1, idx[..., None].expand(-1, -1, 3))
@@ -241,6 +250,7 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
                 nll = [-own.float().gather(-1, tok.clamp_min(0)[..., None]).squeeze(-1).clamp_min(1e-6).log()
                        for own in meas.ownership_by_layer]
                 terms['own_box'] = masked_mean(torch.stack(nll).mean(0), tok >= 0)
+                terms['assign_box'] = masked_mean(meas.assign_nll.float(), tok >= 0)
                 logs['forced_spawns'] = meas.spawn_forced.float().sum(-1).mean()
             target = target.float()
             mask = free & clips[:, None]

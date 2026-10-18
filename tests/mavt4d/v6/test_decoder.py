@@ -171,3 +171,16 @@ def test_dense_features_do_not_pull_geometry():
     assert torch.equal(dense[0, 48:], und.dense_background.expand(16, -1))
     dense.square().sum().backward()
     assert state.position.grad is None and state.offset.grad is None
+
+
+def test_field_attention_row_chunks_match():
+    from mavt4d.v6 import decoder as dec
+    torch.manual_seed(0)
+    q, k, v = torch.randn(70, 4, 8, 16), torch.randn(70, 4, 6, 16), torch.randn(70, 4, 6, 16)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    old = dec.SDPA_MAX_ROWS
+    try:
+        dec.SDPA_MAX_ROWS = 16
+        assert torch.allclose(dec._sdpa_rows(q, k, v), ref, atol=1e-6)
+    finally:
+        dec.SDPA_MAX_ROWS = old

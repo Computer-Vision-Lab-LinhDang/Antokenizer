@@ -18,6 +18,9 @@ from .geometry import quat_to_matrix
 
 MIN_HALF_EXTENT = 0.1   # m, box floor per axis
 FIELD_MAX_VALUES = 1 << 28
+# ROCm attention kernels put the batch in a grid dimension capped at 65535: batch 32 x 1536 rays x 2 slots
+# (98k) fails with hipErrorInvalidValue, so field attention runs in row chunks below that cap.
+SDPA_MAX_ROWS = 1 << 15
 KNN = 4                 # anchors used by the inverse deformation
 ATLAS_EXTENT = 4.0      # m, atlas: 8^3 cells over [-extent, extent)^3, cell = x + 8y + 64z, LSB first (v5 layout)
 HIT_OPACITY = 1e-4      # below this a ray has no surface
@@ -45,6 +48,13 @@ def _heads(x: Tensor, heads: int) -> Tensor:
 
 def _merge(x: Tensor) -> Tensor:
     return x.transpose(-2, -3).flatten(-2)
+
+
+def _sdpa_rows(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    if q.shape[0] <= SDPA_MAX_ROWS:
+        return F.scaled_dot_product_attention(q, k, v)
+    return torch.cat([F.scaled_dot_product_attention(q[i:i + SDPA_MAX_ROWS], k[i:i + SDPA_MAX_ROWS], v[i:i + SDPA_MAX_ROWS])
+                      for i in range(0, q.shape[0], SDPA_MAX_ROWS)])
 
 
 def _no_autocast(t: Tensor):
@@ -88,7 +98,7 @@ class _Field(nn.Module):
             k, v = slot_kv.chunk(2, -1)
             qh = _heads(self.q_proj[i](self.q_norm[i](q)), self.heads)
             kh, vh = _heads(k, self.heads), _heads(v, self.heads)
-            q = q + self.o_proj[i](_merge(F.scaled_dot_product_attention(qh, kh.to(qh.dtype), vh.to(qh.dtype))))
+            q = q + self.o_proj[i](_merge(_sdpa_rows(qh, kh.to(qh.dtype), vh.to(qh.dtype))))
             q = q + self.ffn[i](q)
         feat = self.out_norm(q)
         sigma = F.softplus(self.density(feat).squeeze(-1))
@@ -115,8 +125,7 @@ class _Background(nn.Module):
         q = self.query(fourier(dirs, self.bands, period=2 * math.pi))
         k, v = kv.chunk(2, -1)
         qh = _heads(q, self.heads)
-        read = _merge(F.scaled_dot_product_attention(qh, _heads(k, self.heads).to(qh.dtype),
-                                                     _heads(v, self.heads).to(qh.dtype)))
+        read = _merge(_sdpa_rows(qh, _heads(k, self.heads).to(qh.dtype), _heads(v, self.heads).to(qh.dtype)))
         return torch.sigmoid(self.out(torch.cat((read, q), -1)))
 
 
