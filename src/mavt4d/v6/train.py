@@ -51,12 +51,12 @@ def parse_args(argv=None):
     p.add_argument('--keep', type=int, default=3, help='numbered checkpoints kept besides last.pt')
     p.add_argument('--ckpt-dir', default='runs/v6')
     p.add_argument('--resume', default=None, help="checkpoint path, or 'auto' for <ckpt-dir>/last.pt if present")
-    p.add_argument('--backbone', default='dinov3_vits16',
-                   choices=('dinov3_vits16', 'siglip2_so400m16', 'siglip2_b16'),
+    p.add_argument('--backbone', default='dinov3_vitl16',
+                   choices=('dinov3_vitl16', 'dinov3_vits16', 'siglip2_so400m16', 'siglip2_b16'),
                    help='encoder layout (sets encoder width/heads/layers/registers)')
     p.add_argument('--backbone-weights', '--dinov3', dest='backbone_weights', default=None,
                    help='pretrained encoder weights: HF repo id, local dir or file '
-                        '(server: ~/mavt/weights/dinov3-vits16 or siglip2-*-patch16-256)')
+                        '(server: ~/mavt/weights/dinov3-vitl16, dinov3-vits16 or siglip2-*-patch16-256)')
     p.add_argument('--bf16', action='store_true', help='bf16 autocast (Kalman/geometry stay fp32 inside modules)')
     p.add_argument('--checkpoint-layers', action='store_true', help='activation checkpointing of encoder/trunk blocks')
     p.add_argument('--cameras', default='all', help="'all', 'random' or a camera count")

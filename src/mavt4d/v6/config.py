@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 # Encoder layouts that pretrained weights can be loaded into (encoder.load_backbone).
 BACKBONES = {
     'dinov3_vits16': dict(encoder_width=384, encoder_heads=6, encoder_layers=12, encoder_registers=4),
+    'dinov3_vitl16': dict(encoder_width=1024, encoder_heads=16, encoder_layers=24, encoder_registers=4),
     'siglip2_b16': dict(encoder_width=768, encoder_heads=12, encoder_layers=12, encoder_registers=0),
     'siglip2_so400m16': dict(encoder_width=1152, encoder_heads=16, encoder_layers=27, encoder_registers=0,
                              encoder_mlp_hidden=4304),

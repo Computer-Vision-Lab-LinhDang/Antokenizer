@@ -22,6 +22,7 @@ from .contracts import EncoderOutput, Observation
 from .rays import fourier_log_depth, patch_depth_stats, patch_rays
 
 DINOV3_REPO = 'facebook/dinov3-vits16-pretrain-lvd1689m'
+DINOV3_REPOS = {'dinov3_vits16': DINOV3_REPO, 'dinov3_vitl16': 'facebook/dinov3-vitl16-pretrain-lvd1689m'}
 SIGLIP2_REPO = 'google/siglip2-base-patch16-256'
 SIGLIP2_REPOS = {'siglip2_b16': SIGLIP2_REPO, 'siglip2_so400m16': 'google/siglip2-so400m-patch16-256'}
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -36,6 +37,7 @@ LAYOUTS = {
     'siglip2_b16': dict(mean=(.5, .5, .5), std=(.5, .5, .5), eps=1e-6, gelu='tanh', ls_init=1.0, rope=False),
 }
 LAYOUTS['siglip2_so400m16'] = LAYOUTS['siglip2_b16']
+LAYOUTS['dinov3_vitl16'] = LAYOUTS['dinov3_vits16']
 DUV_MAX = 8.0                                  # hypothesis offset within the 16 px patch
 LOG_Z_RANGE = (math.log(0.5), math.log(250.))  # metres
 LOG_SIGMA_MAX = 5.0
@@ -385,7 +387,7 @@ def _to_local(sd: dict) -> dict:
 
 
 def load_dinov3(encoder: V6Encoder, source=DINOV3_REPO) -> tuple[list[str], list[str]]:
-    """Best-effort DINOv3 ViT-S/16 load: HF repo id, local dir, .safetensors or .pth/.bin file.
+    """Best-effort DINOv3 ViT/16 (S or L) load: HF repo id, local dir, .safetensors or .pth/.bin file.
 
     The 2D patch weight goes into the last-frame slice of the tube Conv3d (earlier frames stay 0). Never raises:
     returns ([], all keys) when weights or libraries are unavailable, so callers keep the random init.
@@ -512,4 +514,4 @@ def load_backbone(encoder: V6Encoder, source=None) -> tuple[list[str], list[str]
     """Load pretrained weights for encoder.cfg.backbone."""
     if encoder.cfg.backbone in SIGLIP2_REPOS:
         return load_siglip2(encoder, source)
-    return load_dinov3(encoder, DINOV3_REPO if source is None else source)
+    return load_dinov3(encoder, DINOV3_REPOS[encoder.cfg.backbone] if source is None else source)

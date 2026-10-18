@@ -225,3 +225,13 @@ def test_siglip2_shapes_and_load(tmp_path):
         out = enc(make_obs(cfg, v=3))
     assert out.tokens.shape == (1, 3, cfg.patches_per_camera, e) and torch.isfinite(out.tokens).all()
     assert load_backbone(V6Encoder(cfg), tmp_path / 'missing')[0] == []
+
+
+def test_backbone_presets():
+    s, l = V6Config.with_backbone('dinov3_vits16'), V6Config.with_backbone('dinov3_vitl16', slots=3)
+    assert (s.encoder_width, s.encoder_layers, s.encoder_heads, s.encoder_registers) == (384, 12, 6, 4)
+    assert (l.encoder_width, l.encoder_layers, l.encoder_heads, l.encoder_registers, l.slots) == (1024, 24, 16, 4, 3)
+    so = V6Config.with_backbone('siglip2_so400m16')
+    assert (so.encoder_width, so.encoder_layers, so.encoder_mlp_hidden) == (1152, 27, 4304)
+    with pytest.raises(ValueError):
+        V6Config.with_backbone('vit_h')
