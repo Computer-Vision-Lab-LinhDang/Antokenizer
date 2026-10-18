@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from mavt4d.v6.config import V6Config
@@ -48,8 +50,11 @@ def test_box_teacher_spawns_from_evidence_only():
     assert torch.isfinite(terms['own_box']) and terms['own_box'] > 0
     assert torch.isfinite(terms['assign_box']) and terms['assign_box'] > 0
     assert logs['forced_spawns'] == 1.
-    terms['own_box'].backward()
+    # every LiDAR target point lies in the (huge) box: the opacity term asks for opaque slots
+    assert logs['obj_rays'] > 0 and torch.isfinite(terms['recon_occ']) and terms['recon_occ'] > 0
+    (terms['own_box'] + terms['recon_occ']).backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.trunk.own_heads.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.decoder.field.parameters())
 
 
 def test_box_teacher_off_without_boxes_or_when_claimed():
@@ -69,3 +74,14 @@ def test_box_teacher_off_without_boxes_or_when_claimed():
     assert bool((tok >= 0).any()) and bool(((tok == held[:, None]) | (tok < 0)).all())
     assert aux['meas'].spawn_box.gather(1, held[:, None]).squeeze(1).tolist() == [0, 0]
     assert bool((post2.status.gather(1, held[:, None]) > FREE).all())
+
+
+def test_points_in_boxes_uses_box_yaw():
+    from mavt4d.v6.losses import points_in_boxes
+    yaw = torch.tensor(math.pi / 4)
+    boxes = {'center': torch.tensor([[[10., 0., 0.]]]), 'size': torch.tensor([[[4., 1., 2.]]]),
+             'quat': torch.stack((torch.cos(yaw / 2), torch.zeros(()), torch.zeros(()), torch.sin(yaw / 2)))[None, None],
+             'valid': torch.tensor([[True]])}
+    pts = torch.tensor([[[10 + 1.4, 1.4, 0.], [10 + 1.4, -1.4, 0.], [10., 0., 0.]]])
+    got = points_in_boxes(pts, boxes, torch.eye(3)[None], torch.zeros(1, 3))
+    assert got.tolist() == [[True, False, True]]
