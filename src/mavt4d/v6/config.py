@@ -61,6 +61,15 @@ class V6Config:
     box_sigma_max: float = 1.0        # m, cap on the position std that inflates a slot box
     box_soft_margin: float = 0.25
     decoder_width: int = 256
+    # Static scene map: world-frame BEV grid of C cells (scene_samples 0: off, no modules, 1x1 state)
+    scene_samples: int = 0            # samples per ray through the map, log-spaced in [scene_near, far]
+    scene_width: int = 32             # channels per cell (the last two: height moments)
+    scene_cell: float = 1.0           # m
+    scene_cells_x: int = 160
+    scene_cells_y: int = 160
+    scene_x_min: float = -64.0        # m, world x of the grid's lower edge (world = rig at the clip's first step)
+    scene_y_min: float = -80.0
+    scene_near: float = 1.0           # m, first scene sample along a ray
     schema_version: int = 6
 
     def __post_init__(self):
@@ -74,6 +83,9 @@ class V6Config:
             raise ValueError('invalid camera, slot or depth-hypothesis count')
         if self.backbone not in BACKBONES:
             raise ValueError(f'unknown backbone {self.backbone!r}')
+        if self.scene_samples < 0 or (self.scene_samples and (min(self.scene_cells_x, self.scene_cells_y) < 1
+                                                               or self.scene_width < 3)):
+            raise ValueError('invalid scene map size')
         if self.schema_version != 6:
             raise ValueError('v6 config requires schema_version 6')
 
@@ -97,6 +109,11 @@ class V6Config:
     def scene_tokens(self):
         # one token per camera row, background tokens, one global token
         return self.max_cameras + self.background_tokens + 1
+
+    @property
+    def scene_shape(self):
+        """(NY, NX, channels) of the scene map; (1, 1, 1) when it is off."""
+        return (self.scene_cells_y, self.scene_cells_x, self.scene_width) if self.scene_samples else (1, 1, 1)
 
     @property
     def patches_per_camera(self):

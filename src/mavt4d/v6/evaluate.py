@@ -6,10 +6,11 @@
 
 Protocol: each clip observes its first --observe steps and is rolled out with predict() after; one camera per
 clip (with >= 2 cameras) never enters the input and is rendered on a pixel grid (every --stride-th pixel) at
-every step. Records per clip and step go to records_rank*.jsonl, then summary.json / summary.md by step:
+every step, from the camera's metadata pose (ego motion is the known action; rig_* metrics score the state's own
+pose). Records per clip and step go to records_rank*.jsonl, then summary.json / summary.md by step:
 rendering (PSNR, SSIM, L1) on the held-out camera and on sampled rays of the input cameras next to a
 constant-colour baseline; LiDAR depth where the decoder has a surface (coverage, AbsRel, RMSE, delta<1.25)
-next to a constant-median baseline; object opacity on LiDAR points in / out of GT boxes and its AUC; slots vs
+next to a constant-median baseline, and on rays that end on a solid surface (mass >= 0.5) by range; object opacity on LiDAR points in / out of GT boxes and its AUC; slots vs
 GT boxes (Hungarian on centre distance: precision, recall, centre / extent / velocity error, class accuracy,
 track identity kept across steps, hold-last-position baseline on rolled-out steps); rig pose error; and the
 training loss terms.
@@ -32,13 +33,15 @@ import torch.nn.functional as F
 from .config import V6Config
 from .contracts import FREE
 from .geometry import quat_to_matrix
-from .losses import DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, rig_to_world, step_terms, teacher_boxes
+from .losses import (DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, render_view, rig_to_world, step_terms,
+                     teacher_boxes)
 from .model import V6Model
 from .train import batch_to_sequence, setup_distributed, synthetic_batch
 
 GATES = (2., 4.)            # m, slot-box match radius for precision / recall; errors use the larger one
 HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'in_psnr', 'held_depth_cov', 'held_absrel',
-            'held_absrel_const', 'held_delta1', 'obj_opacity', 'bg_opacity', 'opacity_auc', 'slots', 'boxes',
+            'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50', 'held_absrel50_near',
+            'held_absrel50_mid', 'held_absrel50_far', 'obj_opacity', 'bg_opacity', 'opacity_auc', 'slots', 'boxes',
             'precision_2m', 'recall_2m', 'precision_4m', 'recall_4m', 'center_err', 'center_err_hold',
             'vel_err', 'vel_err_zero', 'id_kept', 'class_acc', 'rig_t_err', 'rig_r_deg', 'loss_terms')
 
@@ -180,6 +183,13 @@ def render_metrics(model, state, cams, idx, boxes=None, rig=None):
              absrel_const=cmean((med[:, None] - zt).abs() / zt, cov), rmse=cmean((z - zt).square(), cov).sqrt(),
              delta1=cmean((torch.maximum(z / zt, zt / z.clamp_min(1e-2)) < 1.25).float(), cov),
              opacity=cmean(out.opacity.float(), ok_cam[:, :, None].expand(b, v, r).reshape(b, v * r)))
+    # rays that end on a real surface (half the mass or more): coverage and AbsRel, also by LiDAR range
+    solid = out.sample_w.float().sum(-1) if out.sample_w is not None else (out.depth > 0).float()
+    cov50 = lidar & (solid >= .5)
+    rel = (z - zt).abs() / zt
+    m.update(depth_cov50=cov50.sum(-1) / lidar.sum(-1), absrel50=cmean(rel, cov50),
+             absrel50_near=cmean(rel, cov50 & (zt < 20)), absrel50_mid=cmean(rel, cov50 & (zt >= 20) & (zt < 40)),
+             absrel50_far=cmean(rel, cov50 & (zt >= 40)))
     if boxes is not None:
         uv1 = torch.cat((pixels, torch.ones_like(pixels[..., :1])), -1)
         p_cam = uv1 @ torch.linalg.inv(k).transpose(-1, -2) * z_t.view(b, v, r, 1)
@@ -309,7 +319,7 @@ def picture_row(model, state, held, tg, obs):
     cams = {k: v[:1] for k, v in held.items()}
     h, w = cams['images'].shape[-2:]
     idx = torch.arange(h * w, device=cams['images'].device)[None, None]
-    _, out, z = render_metrics(model, _slice(state, 1), cams, idx)
+    _, out, z = render_metrics(model, render_view(_slice(state, 1), _slice(obs, 1)), cams, idx)
     gt = cams['images'][0, 0].float().cpu()
     rgb = out.rgb[0].float().clamp(0, 1).view(h, w, 3).permute(2, 0, 1).cpu()
     inv = torch.where(z[0] > 0, 1 / z[0].clamp_min(1.), 0.).view(h, w).cpu()
@@ -349,14 +359,16 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
                     'camera_valid': obs.camera_valid, 'depth': tg['target_depth'], 'depth_valid': tg['target_valid']}
             hh, ww = cams['images'].shape[-2:]
             idx = torch.randint(0, hh * ww, (b, cams['images'].shape[1], args.rays_per_camera), device=device)
-            got, _, _ = render_metrics(model, state, cams, idx, boxes, rig)
-            m.update({f'in_{k}': v for k, v in got.items() if k in ('psnr', 'psnr_const', 'l1', 'depth_cov', 'absrel')})
+            view = render_view(state, obs)   # targets are seen from the camera's actual pose
+            got, _, _ = render_metrics(model, view, cams, idx, boxes, rig)
+            m.update({f'in_{k}': v for k, v in got.items()
+                      if k in ('psnr', 'psnr_const', 'l1', 'depth_cov', 'absrel', 'depth_cov50', 'absrel50')})
             if 'heldout' in tg:
                 held, has = heldout_view(tg['heldout'])
                 ys = torch.arange(0, hh, args.stride, device=device)
                 xs = torch.arange(0, ww, args.stride, device=device)
                 grid = (ys[:, None] * ww + xs[None]).flatten()
-                got, out, _ = render_metrics(model, state, held, grid[None, None].expand(b, 1, -1), boxes, rig)
+                got, out, _ = render_metrics(model, view, held, grid[None, None].expand(b, 1, -1), boxes, rig)
                 nan = torch.full((b,), math.nan, device=device)
                 m.update({f'held_{k}': torch.where(has, v, nan) for k, v in got.items()
                           if not k.startswith(('obj_', 'bg_', 'opacity_'))})

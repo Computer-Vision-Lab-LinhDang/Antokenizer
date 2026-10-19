@@ -17,6 +17,8 @@ import torch.nn.functional as F
 
 from .contracts import FREE, Observation, V6State
 from .geometry import quat_to_matrix
+from .scene import GATE_SEEN
+from .write import matrix_to_quat
 
 try:  # Hungarian when available, greedy otherwise
     from scipy.optimize import linear_sum_assignment
@@ -24,8 +26,8 @@ except Exception:  # pragma: no cover - depends on the environment
     linear_sum_assignment = None
 
 DEFAULT_WEIGHTS = {
-    'recon_rgb': 1., 'recon_depth': .5, 'recon_occ': .5,
-    'pred_rgb': 1., 'pred_depth': .5, 'pred_occ': .5,
+    'recon_rgb': 1., 'recon_depth': .5, 'recon_occ': .5, 'recon_los': .5,
+    'pred_rgb': 1., 'pred_depth': .5, 'pred_occ': .5, 'pred_los': .5,
     'enc_depth': .1,
     'slot_pos': .1, 'slot_vel': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05,
     'own_box': .1, 'assign_box': .1,
@@ -33,6 +35,7 @@ DEFAULT_WEIGHTS = {
 }
 BOX_KEYS = ('box_center', 'box_size', 'box_class', 'box_valid')
 OCC_MARGIN = .05   # m, box pad when testing whether a LiDAR target point is on an object
+LOS_RATIO = 1.12   # line of sight: no mass before z / ratio, the rest in [z / ratio, z * ratio] (ray depth z)
 
 
 def masked_mean(value, mask):
@@ -107,15 +110,28 @@ def rig_to_world(state: V6State, obs: Observation):
     return r, torch.where(known[:, None], pose[:, :3, 3], state.rig_position.float())
 
 
+def render_view(state: V6State, obs: Observation) -> V6State:
+    """The state to render step targets from: the rig pose from metadata where known. Ego motion is the known
+    action; after predict() the state's own rig pose is a constant-velocity guess, scored by the rig metrics."""
+    r, t = rig_to_world(state, obs)
+    known = obs.rig_pose_valid.bool()[:, None]
+    return replace(state, rig_position=torch.where(known, t, state.rig_position.float()).to(state.rig_position.dtype),
+                   rig_orientation=torch.where(known, matrix_to_quat(r), state.rig_orientation.float())
+                   .to(state.rig_orientation.dtype))
+
+
 def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=None, rig=None):
-    """Per-clip L1 RGB on sampled pixels and log-depth L1 on target-depth pixels.
+    """Per-clip L1 RGB on sampled pixels and log-depth L1 on target-depth pixels that have a surface.
 
     cams: images [B,V,3,H,W], intrinsics [B,V,3,3], cam_to_rig [B,V,4,4], camera_valid [B,V],
     depth [B,V,H,W] (target depth, camera z), depth_valid [B,V,H,W].
     With world GT boxes and rig (rig_to_world): class-balanced opacity BCE on target-depth rays that cross a
     slot box (others have no density to move), 1 where the LiDAR point lies in a GT box, else 0 (objects are
     opaque slots; the rest belongs to the background).
-    Returns {rgb, rgb_n, depth, depth_n, occ, occ_n} ([B] each) and a log dict.
+    With the scene map on, line of sight on every target-depth ray: compositing mass in front of the LiDAR point,
+    plus, where something can put a surface there (seen map cell, GT box), the mass missing around it; depth L1
+    then also needs that. Without the map slots alone could only satisfy it wrongly, so it is off.
+    Returns {rgb, rgb_n, depth, depth_n, occ, occ_n, los, los_n} ([B] each) and a log dict.
     """
     images = cams['images']
     b, v, _, h, w = images.shape
@@ -133,21 +149,42 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     z_ok = cams['depth_valid'].bool().flatten(-2).gather(-1, idx).reshape(b, v * r) & (z_t > 0)
     ray_ok = ok_cam[:, :, None].expand(b, v, r).reshape(b, v * r)
     rgb, rgb_n = _clip_mean((out.rgb.float() - rgb_t).abs().mean(-1), ray_ok)
-    # The decoder has no background depth (0 where no slot surface): depth only where a surface exists.
+    # The LiDAR point of each target ray: rig frame (GT box test) and world (scene map test).
+    with torch.autocast(device_type=idx.device.type, enabled=False):
+        uv1 = torch.cat((pixels, torch.ones_like(pixels[..., :1])), -1)
+        p_cam = uv1 @ torch.linalg.inv(k).transpose(-1, -2) * z_t.view(b, v, r, 1)
+        p_rig = (p_cam @ c2r[..., :3, :3].transpose(-1, -2) + c2r[..., None, :3, 3]).reshape(b, v * r, 3)
+        on = None if boxes is None else points_in_boxes(p_rig, boxes, *rig)
+    # Depth is 0 where the ray meets no surface (no slot, and no scene map or an unseen part of it).
     surf = out.depth.detach() > 0
+    target = ray_ok & z_ok
+    los, los_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
+    logs = {}
+    if model.decoder.scene is not None:
+        t_ray = z_t / z_scale.clamp_min(1e-6)
+        with torch.autocast(device_type=idx.device.type, enabled=False):
+            point = rays.origin.float() + t_ray[..., None] * rays.direction.float()
+            seen = model.decoder.scene_gate(state, point) >= GATE_SEEN
+        # where the map has no evidence at the LiDAR point (or past it, off the grid) nothing can put a surface
+        # there: only free space in front of it is supervised; slots answer for points on objects
+        reach = seen | (out.opacity.detach() > .01 if on is None else on)
+        st, sw = out.sample_t.float(), out.sample_w.float()
+        front = torch.where(st < t_ray[..., None] / LOS_RATIO, sw, 0.).sum(-1)
+        band = torch.where(st <= t_ray[..., None] * LOS_RATIO, sw, 0.).sum(-1) - front
+        los, los_n = _clip_mean(front + torch.where(reach, 1 - band, 0.), target)
+        logs.update(los_front=masked_mean(front.detach(), target), los_band=masked_mean(band.detach(), target & reach),
+                    depth_rays_seen=(target & reach).sum().detach().float())
+        target_depth = target & surf & reach
+    else:
+        target_depth = target & surf
     z_pred = (out.depth.float() * z_scale).clamp_min(1e-2)
-    depth, depth_n = _clip_mean((z_pred.log() - z_t.clamp_min(1e-2).log()).abs(), ray_ok & z_ok & surf)
-    logs = {'depth_rays': (ray_ok & z_ok).sum().detach().float(),
-            'depth_rays_on_surface': (ray_ok & z_ok & surf).sum().detach().float(),
-            'opacity': masked_mean(out.opacity.float().detach(), ray_ok)}
+    depth, depth_n = _clip_mean((z_pred.log() - z_t.clamp_min(1e-2).log()).abs(), target_depth)
+    logs.update(depth_rays=target.sum().detach().float(), depth_rays_on_surface=(target & surf).sum().detach().float(),
+                opacity=masked_mean(out.opacity.float().detach(), ray_ok))
     occ, occ_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
     if boxes is not None:
         with torch.autocast(device_type=idx.device.type, enabled=False):
-            uv1 = torch.cat((pixels, torch.ones_like(pixels[..., :1])), -1)
-            p_cam = uv1 @ torch.linalg.inv(k).transpose(-1, -2) * z_t.view(b, v, r, 1)
-            p_rig = (p_cam @ c2r[..., :3, :3].transpose(-1, -2) + c2r[..., None, :3, 3]).reshape(b, v * r, 3)
-            on = points_in_boxes(p_rig, boxes, *rig)
-            ok = ray_ok & z_ok & model.decoder.slot_hits(state, rays).any(-1)
+            ok = target & model.decoder.slot_hits(state, rays).any(-1)
             p = out.opacity.float().clamp(1e-4, 1 - 1e-4)
             bce = -torch.where(on, p.log(), (1 - p).log())
             pos, pos_n = _clip_mean(bce, ok & on)
@@ -156,7 +193,8 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
             occ_n = pos_n + neg_n
             logs.update(obj_rays=(ok & on).sum().float(), obj_opacity=masked_mean(p.detach(), ok & on),
                         bg_opacity=masked_mean(p.detach(), ok & ~on))
-    return {'rgb': rgb, 'rgb_n': rgb_n, 'depth': depth, 'depth_n': depth_n, 'occ': occ, 'occ_n': occ_n}, logs
+    return {'rgb': rgb, 'rgb_n': rgb_n, 'depth': depth, 'depth_n': depth_n, 'occ': occ, 'occ_n': occ_n,
+            'los': los, 'los_n': los_n}, logs
 
 
 # ---------------------------------------------------------------- encoder depth
@@ -334,10 +372,11 @@ def step_terms(model, state, obs, targets, observed, *, aux=None, rays_per_camer
         cam_sets.append(targets['heldout'])
     boxes = teacher_boxes(targets)
     rig = None if boxes is None else rig_to_world(state, obs)
-    rendered = [render_loss(model, state, cams, rays_per_camera, boxes=boxes, rig=rig) for cams in cam_sets]
+    view = render_view(state, obs)
+    rendered = [render_loss(model, view, cams, rays_per_camera, boxes=boxes, rig=rig) for cams in cam_sets]
     terms, logs = {}, dict(rendered[0][1])
     for name, mask in (('recon', observed), ('pred', ~observed)):
-        for key in ('rgb', 'depth', 'occ'):
+        for key in ('rgb', 'depth', 'occ', 'los'):
             terms[f'{name}_{key}'] = torch.stack([clips_mean(r[key], r[f'{key}_n'], mask) for r, _ in rendered]).mean()
     if aux is not None:
         terms['enc_depth'], l = encoder_depth_loss(aux['enc'], obs, model.cfg)

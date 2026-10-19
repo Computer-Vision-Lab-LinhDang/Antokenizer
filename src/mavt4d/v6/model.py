@@ -86,6 +86,7 @@ class V6Model(nn.Module):
         meas = self.trunk(prior, enc, obs, boxes=boxes)
         post = self.writer(prior, meas, obs)
         post = self.lifecycle(post, meas, obs)
+        post = self.writer.write_scene(post, meas, obs, enc)
         return post, {'enc': enc, 'meas': meas, 'prior': prior}
 
     def predict(self, state: V6State, dt) -> V6State:

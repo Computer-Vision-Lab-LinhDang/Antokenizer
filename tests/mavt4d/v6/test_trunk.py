@@ -245,8 +245,10 @@ def test_camera_permutation(known_rows):
         if name == 'camera_rows':
             continue
         x, y = a[name], b[name]
-        if name.startswith('ownership'):
+        if name.startswith('ownership') or name == 'points':
             x = x.view(B, V, N, -1)[:, perm].flatten(1, 2)
+        elif name == 'point_log_sigma':
+            x = x.view(B, V, N)[:, perm].flatten(1)
         if x.dtype == torch.bool:
             assert torch.equal(x, y), name
         else:

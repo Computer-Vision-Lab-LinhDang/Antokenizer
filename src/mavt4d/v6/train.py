@@ -58,6 +58,8 @@ def parse_args(argv=None):
                    'while the slowest step and save so far still fit (0: no limit). SIGTERM also stops and saves')
     p.add_argument('--ckpt-dir', default='runs/v6')
     p.add_argument('--resume', default=None, help="checkpoint path, or 'auto' for <ckpt-dir>/last.pt if present")
+    p.add_argument('--init', default=None, help='checkpoint whose weights start a new run (step 0, fresh optimizer); '
+                   'modules it lacks keep their init. Ignored when --resume finds a checkpoint')
     p.add_argument('--backbone', default='dinov3_vitl16',
                    choices=('dinov3_vitl16', 'dinov3_vits16', 'siglip2_so400m16', 'siglip2_b16'),
                    help='encoder layout (sets encoder width/heads/layers/registers)')
@@ -317,6 +319,15 @@ PRETRAINED = ('encoder.patch_embed.', 'encoder.blocks.', 'encoder.norm.', 'encod
 NO_DECAY = ('cls_token', 'register_tokens', 'pos_embed')
 
 
+def init_weights(model, path):
+    """Load a checkpoint's model weights; keys the model lacks are an error, keys the checkpoint lacks keep their init."""
+    src = torch.load(Path(path).expanduser(), map_location='cpu', weights_only=False)
+    missing, unexpected = model.load_state_dict(src.get('model', src), strict=False)
+    if unexpected:
+        raise SystemExit(f'--init {path}: {len(unexpected)} keys the model does not have, e.g. {unexpected[:3]}')
+    return missing, unexpected
+
+
 def make_optimizer(model, args):
     """AdamW; the pretrained encoder trains at lr x --backbone-lr-mult; no decay on vectors and prefix tokens."""
     groups = {}
@@ -421,6 +432,10 @@ def main(argv=None):
             emit({'event': 'optimizer_reset', 'reason': str(err)})
         step = int(state['step'])
         emit({'event': 'resume', 'path': str(resume), 'step': step})
+    elif args.init:
+        missing, _ = init_weights(model, args.init)
+        emit({'event': 'init', 'path': args.init, 'missing': len(missing),
+              'new_modules': sorted({k.rsplit('.', 2)[0] for k in missing})})
     broadcast_model(model, world)
     torch.manual_seed(args.seed * 7919 + rank + step)  # per-rank ray / sample noise
     emit({'event': 'start', 'world': world, 'device': str(device), 'params': sum(p.numel() for p in params),

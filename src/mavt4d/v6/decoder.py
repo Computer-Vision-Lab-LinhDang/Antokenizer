@@ -2,8 +2,10 @@
 
 Each ray reads only the slots whose box (from D, inflated by the position std) it crosses, samples
 inside those segments, maps samples to the slot's canonical frame and queries a cross-attention
-field over that slot's C_obj tokens. Left-over transmittance takes a colour from the background
-tokens. Reads only the state; geometry and compositing run in fp32.
+field over that slot's C_obj tokens. With the scene map on (cfg.scene_samples), each ray also takes
+log-spaced samples through the static map (scene.py), composited with the slot samples by depth. Left-over
+transmittance takes a sky colour from the background tokens. Reads only the state; geometry and compositing
+run in fp32.
 """
 import math
 
@@ -15,6 +17,7 @@ from torch.utils.checkpoint import checkpoint
 from .config import V6Config
 from .contracts import RayBatch, RenderOutput, V6State
 from .geometry import quat_to_matrix
+from .scene import SceneField
 
 MIN_HALF_EXTENT = 0.1   # m, box floor per axis
 FIELD_MAX_VALUES = 1 << 28
@@ -135,6 +138,7 @@ class V6Decoder(nn.Module):
         self.cfg = cfg
         self.field = _Field(cfg)
         self.background = _Background(cfg)
+        self.scene = SceneField(cfg) if cfg.scene_samples else None
         self.checkpoint_field = checkpoint_field
 
     # ---- geometry from D (fp32) ----
@@ -183,6 +187,29 @@ class V6Decoder(nn.Module):
             return checkpoint(self.field, canon, dirs, h_feat, *kv, use_reentrant=False)
         return self.field(canon, dirs, h_feat, *kv)
 
+    def _scene(self, grid, points):
+        if self.checkpoint_field and self.training and torch.is_grad_enabled():
+            return checkpoint(self.scene, grid, points, use_reentrant=False)
+        return self.scene(grid, points)
+
+    def scene_gate(self, state: V6State, points: Tensor) -> Tensor:
+        """Evidence gate of the scene map at world points [B,P,3] -> [B,P] in [0, 1] (0 with the map off)."""
+        if self.scene is None:
+            return points.new_zeros(points.shape[:2])
+        with _no_autocast(points):
+            return self.scene.read(self.scene.grid(state), points.float())[..., -1].clamp(0, 1)
+
+    def scene_samples(self, near: Tensor, far: Tensor):
+        """Stratified samples, log-spaced over [max(near, scene_near), far]: t, delta [B,R,S]."""
+        s = self.cfg.scene_samples
+        lo = near.clamp_min(self.cfg.scene_near).log()
+        hi = far.log().maximum(lo + 1e-3)
+        j = torch.arange(s + 1, device=near.device, dtype=torch.float32) / s
+        edges = (lo[..., None] + (hi - lo)[..., None] * j).exp()
+        width = edges[..., 1:] - edges[..., :-1]
+        u = torch.rand_like(width) if self.training else torch.full_like(width, .5)
+        return edges[..., :-1] + width * u, width
+
     def field_at(self, state: V6State, slots: Tensor, points: Tensor, directions: Tensor | None = None):
         """Field at canonical points [B,Q,3] of slots [B,Q] -> sigma [B,Q], rgb [B,Q,3]. Reads c_obj, h."""
         kv, h_feat = self.field.slot_cache(state.c_obj, state.h)
@@ -207,23 +234,29 @@ class V6Decoder(nn.Module):
         geo = self.slot_geometry(state)
         kv, h_feat = self.field.slot_cache(state.c_obj, state.h)
         bg_kv = self.background.tokens(state.background)
+        grid = None if self.scene is None else self.scene.grid(state)
         with _no_autocast(rays.origin):
             rig = quat_to_matrix(state.rig_orientation.float())
         # Field calls see B * chunk * slots-per-ray * samples * width values; past ~2^31 bytes ROCm kernels fail
         # (hipErrorInvalidValue at batch 32), so the ray chunk shrinks with the batch.
-        per_ray = rays.origin.shape[0] * min(self.cfg.max_slots_per_ray, self.cfg.slots) * self.cfg.samples_per_segment \
-            * self.cfg.decoder_width
+        cfg = self.cfg
+        per_ray = rays.origin.shape[0] * (min(cfg.max_slots_per_ray, cfg.slots) * cfg.samples_per_segment
+                                          * cfg.decoder_width + cfg.scene_samples * self.scene_width)
         chunk = max(64, min(chunk, FIELD_MAX_VALUES // per_ray))
         parts = []
         for start in range(0, rays.origin.shape[1], chunk):
             sl = slice(start, start + chunk)
             parts.append(self._render_chunk(geo, kv, h_feat, bg_kv, rig, rays.origin[:, sl], rays.direction[:, sl],
-                                            rays.near_far[:, sl]))
+                                            rays.near_far[:, sl], grid))
         out = {key: torch.cat([p[key] for p in parts], 1) for key in parts[0]}
         out['status'] = self.status(state, out['opacity'], out['surface_slot'], out['surface_canon'])
         return RenderOutput(**out)
 
-    def _render_chunk(self, geo, kv, h_feat, bg_kv, rig, origin, direction, near_far):
+    @property
+    def scene_width(self):
+        return 0 if self.scene is None else self.scene.inp.out_features
+
+    def _render_chunk(self, geo, kv, h_feat, bg_kv, rig, origin, direction, near_far, grid=None):
         cfg = self.cfg
         b, r = origin.shape[:2]
         k = geo['rot'].shape[1]
@@ -267,31 +300,49 @@ class V6Decoder(nn.Module):
         with _no_autocast(origin):
             sigma = sigma.float().reshape(b, r, m, s) * occ * ok[..., None]
             rgb, bg = rgb.float().reshape(b, r, m, s, 3), bg.float()
+            t, delta, sigma = t.flatten(-2), delta.flatten(-2), sigma.flatten(-2)
+            slot_id = idx[..., None].expand(-1, -1, -1, s).flatten(-2)
+            rgb, canon = rgb.flatten(2, 3), canon.flatten(2, 3)
+            if grid is not None:  # static scene samples: slot id -1, no canonical point
+                t_sc, delta_sc = self.scene_samples(near, far)
+                points = origin[:, :, None] + t_sc[..., None] * direction[:, :, None]
+        if grid is not None:
+            sigma_sc, rgb_sc = self._scene(grid, points.flatten(1, 2))
+            with _no_autocast(origin):
+                n_sc = t_sc.shape[-1]
+                t, delta = torch.cat((t, t_sc), -1), torch.cat((delta, delta_sc), -1)
+                sigma = torch.cat((sigma, sigma_sc.float().view(b, r, n_sc)), -1)
+                slot_id = torch.cat((slot_id, torch.full_like(t_sc, -1, dtype=slot_id.dtype)), -1)
+                rgb = torch.cat((rgb, rgb_sc.float().view(b, r, n_sc, 3)), 2)
+                canon = torch.cat((canon, canon.new_zeros(b, r, n_sc, 3)), 2)
+        with _no_autocast(origin):
             # composite all samples sorted by depth
-            t_all, order = t.flatten(-2).sort(dim=-1, stable=True)
+            t_all, order = t.sort(dim=-1, stable=True)
             take = lambda v: v.gather(-1, order)
-            sigma, delta = take(sigma.flatten(-2)), take(delta.flatten(-2))
-            slot_id = take(idx[..., None].expand(-1, -1, -1, s).flatten(-2))
-            rgb = rgb.flatten(2, 3).gather(2, order[..., None].expand(-1, -1, -1, 3))
-            canon = canon.flatten(2, 3).gather(2, order[..., None].expand(-1, -1, -1, 3))
+            sigma, delta, slot_id = take(sigma), take(delta), take(slot_id)
+            rgb = rgb.gather(2, order[..., None].expand(-1, -1, -1, 3))
+            canon = canon.gather(2, order[..., None].expand(-1, -1, -1, 3))
             optical = sigma * delta
             total = optical.cumsum(-1)
             weight = torch.exp(-(total - optical)) * -torch.expm1(-optical)
             residual = torch.exp(-total[..., -1])
-            opacity = -torch.expm1(-total[..., -1])
+            solid = -torch.expm1(-total[..., -1])                                   # slots and scene
+            on_slot = slot_id >= 0
+            opacity = solid if grid is None else torch.where(on_slot, weight, 0.).sum(-1)  # visible object mass
             color = (weight[..., None] * rgb).sum(-2) + residual[..., None] * bg
-            hit_ray = opacity > HIT_OPACITY
-            depth = torch.where(hit_ray, (weight * t_all).sum(-1) / opacity.clamp_min(HIT_OPACITY), torch.zeros_like(opacity))
+            hit_ray = solid > HIT_OPACITY
+            depth = torch.where(hit_ray, (weight * t_all).sum(-1) / solid.clamp_min(HIT_OPACITY), torch.zeros_like(solid))
             # first surface: accumulated weight crosses 0.5, else the max-weight sample
             crossed = weight.cumsum(-1) >= .5
             first = torch.where(crossed.any(-1), crossed.float().argmax(-1), weight.argmax(-1))
             surface_slot = torch.where(hit_ray, slot_id.gather(-1, first[..., None]).squeeze(-1), torch.full_like(first, -1))
             surface_canon = canon.gather(2, first[..., None, None].expand(-1, -1, 1, 3)).squeeze(2)
-            surface_canon = torch.where(hit_ray[..., None], surface_canon, torch.zeros_like(surface_canon))
-            per_slot = torch.zeros(b, r, k, device=origin.device).scatter_add(-1, slot_id, weight)
-            weights = torch.cat((per_slot, residual[..., None]), -1)
+            surface_canon = torch.where((surface_slot >= 0)[..., None], surface_canon, torch.zeros_like(surface_canon))
+            # per-slot weights; the last column takes everything else (scene samples and sky)
+            per_slot = torch.zeros(b, r, k + 1, device=origin.device).scatter_add(-1, torch.where(on_slot, slot_id, k), weight)
+            weights = torch.cat((per_slot[..., :k], per_slot[..., k:] + residual[..., None]), -1)
         return dict(rgb=color, depth=depth, opacity=opacity, surface_slot=surface_slot,
-                    surface_canon=surface_canon, weights=weights)
+                    surface_canon=surface_canon, weights=weights, sample_t=t_all, sample_w=weight)
 
     # ---- seen / inferred / unknown (rule-based, no gradient) ----
     @torch.no_grad()

@@ -102,6 +102,8 @@ class V6State:
     camera_valid: Tensor     # [B,Vmax] bool
     background: Tensor       # [B,G,W] f16
     background_evidence: Tensor  # [B,G] f32
+    scene: Tensor            # [B,NY,NX,Cs] f16 static scene map, world-frame BEV cells (cfg.scene_shape)
+    scene_evidence: Tensor   # [B,NY,NX] f32 accumulated Lambda per cell
     global_token: Tensor     # [B,W] f32
     metric_scale: Tensor     # [B] f32 depth scale for sources without metric depth
     metric_valid: Tensor     # [B] bool
@@ -146,7 +148,9 @@ class V6State:
             camera=camera, camera_key=torch.full((b, cfg.max_cameras), -1, device=device, dtype=torch.int64),
             camera_valid=zeros(b, cfg.max_cameras, dtype=torch.bool),
             background=zeros(b, cfg.background_tokens, w, dtype=torch.float16),
-            background_evidence=zeros(b, cfg.background_tokens), global_token=zeros(b, w),
+            background_evidence=zeros(b, cfg.background_tokens),
+            scene=zeros(b, *cfg.scene_shape, dtype=torch.float16), scene_evidence=zeros(b, *cfg.scene_shape[:2]),
+            global_token=zeros(b, w),
             metric_scale=torch.ones(b, device=device), metric_valid=zeros(b, dtype=torch.bool), t=t,
             config_digest=torch.tensor(list(digest), device=device, dtype=torch.uint8).expand(b, 32).clone())
 
@@ -213,6 +217,9 @@ class TrunkOutput:
     forced_slot: Tensor | None = None   # [B,Ne] int64 slot holding or given the token's box, -1 none
     spawn_box: Tensor | None = None     # [B,K] int64 box a slot holds or was given, -1 none
     assign_nll: Tensor | None = None    # [B,Ne] -log assign of the token's box-grid anchor in forced_slot
+    # Evidence-only token points, for the scene map write.
+    points: Tensor | None = None        # [B,Ne,3] rig frame, from the selected depth hypothesis
+    point_log_sigma: Tensor | None = None  # [B,Ne] log std of that hypothesis' log z
 
 
 @dataclass(frozen=True)
@@ -230,4 +237,6 @@ class RenderOutput:
     surface_slot: Tensor     # [B,R] int64 slot of the first surface, -1 for background
     surface_canon: Tensor    # [B,R,3] surface point in that slot's canonical frame
     status: Tensor           # [B,R,3] probabilities: seen, inferred, unknown
-    weights: Tensor          # [B,R,K+1] per-slot (+background) contribution, for losses
+    weights: Tensor          # [B,R,K+1] per-slot (+ everything else: scene and sky) contribution, for losses
+    sample_t: Tensor | None = None  # [B,R,S] ray depth of every composited sample, sorted
+    sample_w: Tensor | None = None  # [B,R,S] its compositing weight

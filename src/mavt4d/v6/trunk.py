@@ -574,4 +574,4 @@ class V6Trunk(nn.Module):
             spawn_logit=self.spawn_head(xs[:, :, dp]).float().squeeze(-1),
             spawn_canon=self.canon_head(neo).view(b, k, a, 3).float(),
             camera_rows=rows, spawn_forced=forced, forced_slot=token_slot, spawn_box=spawn_box,
-            assign_nll=assign_nll)
+            assign_nll=assign_nll, points=points.float(), point_log_sigma=tp.log_sigma.flatten(1).float())

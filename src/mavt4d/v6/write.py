@@ -5,7 +5,8 @@ cross block; measurements are the weighted anchor centroid (rig frame) and, with
 rotation. The rig itself is updated only from meas.rig_meas and the metadata pose (obs.rig_pose), never from
 slot measurements (no K-fold double counting); its cross terms come from the per-slot joint posterior.
 C_obj: gain lambda/Lambda with a hard evidence mask (no innovation gate). C_evt: phi(nu~) - phi(0). h: mean
-visibility gain. Unseen slots keep C, Lambda, h, desc and atlas bit-identical.
+visibility gain. Unseen slots keep C, Lambda, h, desc and atlas bit-identical. Scene map: same gain rule per
+cell (scene.py), written by write_scene after the lifecycle from token points no allocated slot holds.
 """
 from dataclasses import replace
 import math
@@ -16,6 +17,7 @@ from torch.nn import functional as F
 
 from .dynamics import exp_quat, sym
 from .geometry import quat_conj, quat_mul, quat_normalize, quat_to_matrix, skew
+from .scene import SceneMeasure, scene_write
 
 ATLAS_EXTENT = 4.0  # m; 8^3 cells over [-extent, extent)^3, cell = x + 8y + 64z, LSB first (decoder layout)
 
@@ -160,6 +162,7 @@ class V6Writer(nn.Module):
         w = cfg.latent_width
         self.evt_norm = nn.LayerNorm(w)
         self.phi = nn.Sequential(nn.Linear(6 + w + 1, hidden or 2 * w), nn.SiLU(), nn.Linear(hidden or 2 * w, w))
+        self.scene = SceneMeasure(cfg) if cfg.scene_samples else None
 
     def event_delta(self, c_evt, nu_w, log_dt):
         """R2: dC_evt = phi(nu~, C_evt, log dt) - phi(0, C_evt, log dt); exactly 0 where nu~ == 0."""
@@ -170,6 +173,13 @@ class V6Writer(nn.Module):
     def forward(self, prior, meas, obs):
         with torch.autocast(prior.position.device.type, enabled=False):
             return self._write(prior, meas, obs)
+
+    def write_scene(self, state, meas, obs, enc):
+        """Scene map write, run after the lifecycle: it reads which slots are allocated (and their boxes) to keep
+        object points out of the static map. The map itself goes from the prior to here untouched."""
+        if self.scene is None or meas.points is None:
+            return state
+        return replace(state, **scene_write(self.cfg, state, *self.scene(state, meas, obs, enc)))
 
     def _write(self, prior, meas, obs):
         cfg, st = self.cfg, prior
