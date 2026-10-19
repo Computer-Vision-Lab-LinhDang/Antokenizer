@@ -41,7 +41,7 @@ def test_evaluate_checkpoint_dry_run(tmp_path):
     assert len(lines) == 9 and {r['horizon'] for r in lines} == {0, 1}
     # pooled 2 m recall by box range (every step) and by LiDAR-tagged tokens (observed steps)
     pooled = groups['observed'].get('pooled', {})
-    assert {'recall_2m', 'recall_2m_d0_10', 'recall_2m_t0_n', 'class_pairs'} <= set(pooled), pooled
+    assert {'recall_2m', 'recall_2m_d0_10', 'recall_2m_t0_n', 'recall_2m_t0_inview_n', 'class_pairs'} <= set(pooled)
     assert 'recall_2m_t0_n' not in groups['rolled_out'].get('pooled', {})
     # the copy-last baseline exists on rolled-out steps only; observability on every step
     assert all(math.isnan(r['in_psnr_copy']) == r['observed'] for r in lines)
@@ -146,8 +146,9 @@ def test_recall_bins_pool_hits_by_range_and_lidar_tokens():
     points = torch.tensor([[[5., 0., 0.]] * 4 + [[16.3, 0., 0.], [50., 0., 0.]]])
     valid = torch.tensor([[True] * 5 + [False]])
     rig = (torch.eye(3)[None], torch.zeros(1, 3))
-    got = recall_bins(state, tg, rig, (points, valid))
-    want = {'r2m_n': 4, 'r2m_hit': 2,
+    # the 30 m box is outside every input camera (e.g. the held-out camera's sector): 0 tokens, but not for resolution
+    got = recall_bins(state, tg, rig, (points, valid), in_view=torch.tensor([[True, True, False, True]]))
+    want = {'r2m_t0_inview_n': 1, 'r2m_t0_inview_hit': 0,'r2m_n': 4, 'r2m_hit': 2,
             'r2m_d0_10_n': 1, 'r2m_d0_10_hit': 1, 'r2m_d10_20_n': 1, 'r2m_d10_20_hit': 0,
             'r2m_d20_40_n': 1, 'r2m_d20_40_hit': 1, 'r2m_d40p_n': 1, 'r2m_d40p_hit': 0,
             'r2m_t0_n': 2, 'r2m_t0_hit': 1, 'r2m_t1_2_n': 1, 'r2m_t1_2_hit': 0,

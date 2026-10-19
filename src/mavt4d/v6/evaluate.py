@@ -26,7 +26,8 @@ The pooled block (summary groups[...]['pooled']) sums counts over records instea
 recall_2m (Hungarian within 2 m, as recall_2m) by box range (horizontal distance from the rig at its metadata pose to
 the box centre: 0-10, 10-20, 20-40, >40 m) and, on observed steps, by the number of input tokens whose LiDAR tag
 (median input LiDAR z along the patch-centre ray) falls in the box the box teacher tests (1.1 x half extent + .25 m):
-0, 1-2, 3-5, >5; with each count n. class_acc / class_majority_share: accuracy and share of the most common GT class on
+0, 1-2, 3-5, >5, and t0_inview: no token, centre on an input camera's image (0 tokens from size or missing LiDAR,
+not from a box no input camera faces, e.g. in the held-out camera's sector); with each count n. class_acc / class_majority_share: accuracy and share of the most common GT class on
 the 4 m pairs class_acc scores.
 
 Sanity baselines on the input cameras' sampled pixels at rolled-out steps (NaN on observed ones): in_*_copy scores the
@@ -482,11 +483,12 @@ def spawn_misses(free_before, state, meas, token_valid, tg, rig, threshold, min_
     return rec
 
 
-def recall_bins(state, tg, rig, tokens=None, gate=GATES[0]):
+def recall_bins(state, tg, rig, tokens=None, in_view=None, gate=GATES[0]):
     """Recall counts per clip (lists of ints): boxes n and boxes with an allocated slot within gate (Hungarian, as
     recall_2m) hit, overall and by RANGE_BINS (horizontal distance from the rig, rig: rig_to_world); with tokens
     (rig-frame points [B,Ne,3], valid [B,Ne]: the input tokens' LiDAR tags) also by TOKEN_BINS, counted in the box
-    the box teacher tests."""
+    the box teacher tests. in_view [B,M] (box centre on an input camera's image) splits off t0_inview: boxes with no
+    token that a camera did face, so 0 tokens there is size or missing LiDAR, not coverage."""
     center, ok, _ = _tracked(tg)
     alloc = (state.status > FREE).cpu()
     d = torch.cdist(state.position.float().cpu(), center)
@@ -499,6 +501,8 @@ def recall_bins(state, tg, rig, tokens=None, gate=GATES[0]):
         inside = points_in_each_box(tokens[0].float(), boxes, *rig, margin=0.) & tokens[1].bool()[..., None]
         count = inside.sum(1).cpu()                                                              # [B,M]
         bins += [(name, count >= lo, count <= hi) for name, lo, hi in TOKEN_BINS]
+        if in_view is not None:
+            bins.append(('t0_inview', count == 0, in_view.bool().cpu()))
     out = {}
     for i in range(len(d)):
         hit = torch.zeros_like(ok[i])
@@ -650,7 +654,8 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
             enc = aux['enc']
             tok_ok = enc.measured_valid & enc.valid & obs.camera_valid.bool()[..., None]
             tokens = lidar_tag_points(enc, obs, tok_ok).flatten(1, 2), tok_ok.flatten(1)
-        pool = recall_bins(state, tg, rig, tokens)
+        in_view = None if tokens is None else seen_by(tg['box_center'].float(), [now], hh, ww)
+        pool = recall_bins(state, tg, rig, tokens, in_view)
         pool['cls'] = slot.pop('cls_pairs')
         if t == observe - 1:
             last_pos = state.position.float().cpu().clone()
