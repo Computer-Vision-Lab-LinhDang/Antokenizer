@@ -109,6 +109,17 @@ def test_train_dry_run(tmp_path):
     assert main(args[:2] + ['3'] + args[3:] + ['--resume', 'auto']) == 3
 
 
+
+def test_train_time_limit_stops_and_saves(tmp_path):
+    import torch
+    args = ['--dry-run', '--max-steps', '50', '--batch-size', '1', '--steps', '2', '--cameras', '1',
+            '--rays-per-camera', '16', '--device', 'cpu', '--num-workers', '0', '--warmup', '1',
+            '--ckpt-dir', str(tmp_path), '--config', json.dumps(TINY), '--time-limit', '1']
+    assert main(args) == 1  # one step plus two assumed one-minute saves no longer fit in a minute
+    records = [json.loads(line) for line in (tmp_path / 'log.jsonl').read_text().splitlines()]
+    assert {'event': 'stop', 'step': 1, 'reason': 'time_limit'} in records
+    assert torch.load(tmp_path / 'last.pt', weights_only=False)['step'] == 1
+
 def test_train_bad_backbone_weights_fail_loudly(tmp_path):
     bogus = tmp_path / 'missing-weights'
     bogus.mkdir()

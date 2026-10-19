@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import signal
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -49,6 +50,8 @@ def parse_args(argv=None):
     p.add_argument('--log-every', type=int, default=10)
     p.add_argument('--save-every', type=int, default=1000)
     p.add_argument('--keep', type=int, default=3, help='numbered checkpoints kept besides last.pt')
+    p.add_argument('--time-limit', type=float, default=0., help='minutes of wall time; stop and save last.pt '
+                   'while the slowest step and save so far still fit (0: no limit). SIGTERM also stops and saves')
     p.add_argument('--ckpt-dir', default='runs/v6')
     p.add_argument('--resume', default=None, help="checkpoint path, or 'auto' for <ckpt-dir>/last.pt if present")
     p.add_argument('--backbone', default='dinov3_vitl16',
@@ -309,7 +312,16 @@ def prune(ckpt_dir, keep):
         old.unlink(missing_ok=True)
 
 
+def any_rank(flag, world, device):
+    if world == 1:
+        return flag
+    t = torch.tensor(float(flag), device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return bool(t.item())
+
+
 def main(argv=None):
+    t_start = time.time()
     args = parse_args(argv)
     rank, world, device = setup_distributed(args.device)
     main_rank = rank == 0
@@ -370,10 +382,13 @@ def main(argv=None):
         if loss.requires_grad:
             loss.backward()
 
+    terminated = []
+    on_term = signal.signal(signal.SIGTERM, lambda *_: terminated.append(True))
     data = batches(args, cfg, rank, world, device)
     model.train()
     skipped = 0
     t_last = time.time()
+    worst_step, worst_save = 0., 60.  # a 4 GB save is assumed to take a minute until one is timed
     while step < args.max_steps:
         t0 = time.time()
         batch = next(data)
@@ -404,11 +419,21 @@ def main(argv=None):
                 record['mem_gb'] = torch.cuda.max_memory_allocated(device) / 2 ** 30
             emit(record)
             t_last = now
-        if main_rank and (step % args.save_every == 0 or step == args.max_steps):
+        worst_step = max(worst_step, time.time() - t0)
+        left = args.time_limit * 60 - (time.time() - t_start)
+        stop = any_rank(bool(terminated) or (args.time_limit > 0 and left < worst_step + 2 * worst_save), world,
+                        device)
+        if main_rank and (step % args.save_every == 0 or step == args.max_steps or stop):
+            t_save = time.time()
             save_checkpoint(ckpt_dir / 'last.pt', model, opt, step, cfg, args)
             if step % args.save_every == 0:
                 save_checkpoint(ckpt_dir / f'step_{step:07d}.pt', model, opt, step, cfg, args)
                 prune(ckpt_dir, args.keep)
+            worst_save = max(worst_save, time.time() - t_save)
+        if stop:
+            emit({'event': 'stop', 'step': step, 'reason': 'sigterm' if terminated else 'time_limit'})
+            break
+    signal.signal(signal.SIGTERM, on_term)
     emit({'event': 'done', 'step': step, 'skipped': skipped})
     if world > 1:
         dist.barrier()
