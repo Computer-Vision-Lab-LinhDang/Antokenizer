@@ -17,6 +17,16 @@ from .trunk import V6Trunk
 from .understanding import V6Understanding
 from .write import V6Writer
 
+# Weights of modules that no longer exist: older checkpoints load without them (the slot-only dense head, replaced
+# by rendered dense channels).
+RETIRED = ('understanding.dense_slot.', 'understanding.dense_pos.', 'understanding.dense_head.',
+           'understanding.dense_background')
+
+
+def drop_retired(state_dict: dict) -> dict:
+    return {k: v for k, v in state_dict.items() if not k.startswith(RETIRED)}
+
+
 # Flags a module may expose to checkpoint its own blocks.
 _CKPT_FLAGS = ('grad_checkpointing', 'activation_checkpointing', 'checkpoint_layers', 'gradient_checkpointing',
                'use_checkpoint', 'checkpoint')

@@ -240,3 +240,4 @@ class RenderOutput:
     weights: Tensor          # [B,R,K+1] per-slot (+ everything else: scene and sky) contribution, for losses
     sample_t: Tensor | None = None  # [B,R,S] ray depth of every composited sample, sorted
     sample_w: Tensor | None = None  # [B,R,S] its compositing weight
+    feature: Tensor | None = None   # [B,R,cfg.dense_dim] composited dense channels (detached weights), if on

@@ -186,7 +186,7 @@ def test_slot_boxes_keep_their_points_out_and_views_use_the_metadata_pose():
 def test_line_of_sight_penalises_mass_in_front_even_when_the_target_is_seen():
     from mavt4d.v6.losses import render_loss
     torch.manual_seed(0)
-    c = cfg()
+    c = cfg(scene_cells_x=32, scene_cells_y=32, scene_x_min=-64., scene_y_min=-64.)   # every 2-60 m target on the map
     model = V6Model(c).eval()
     steps, targets = batch_to_sequence(synthetic_batch(c, 1, 1, 1, generator=torch.Generator().manual_seed(4)),
                                        torch.device('cpu'))

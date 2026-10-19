@@ -29,7 +29,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from .config import V6Config
 from .contracts import Observation
 from .losses import DEFAULT_WEIGHTS, sequence_loss
-from .model import V6Model
+from .model import V6Model, drop_retired
 
 MIN_BOX_POINTS = 5        # box "seen": >= 5 LiDAR points inside
 BUCKET_ELEMENTS = 1 << 24
@@ -74,6 +74,9 @@ def parse_args(argv=None):
     p.add_argument('--backbone-weights', '--dinov3', dest='backbone_weights', default=None,
                    help='pretrained encoder weights: HF repo id, local dir or file '
                         '(server: ~/mavt/weights/dinov3-vitl16, dinov3-vits16 or siglip2-*-patch16-256)')
+    p.add_argument('--dense-teacher-weights', default=None,
+                   help='weights of the frozen dense teacher (with --config dense_dim > 0): HF repo id, local dir or '
+                        "file; default --backbone-weights when the teacher is the encoder's backbone, else its HF repo")
     p.add_argument('--bf16', action='store_true', help='bf16 autocast (Kalman/geometry stay fp32 inside modules)')
     p.add_argument('--checkpoint-layers', action='store_true', help='activation checkpointing of encoder/trunk blocks')
     p.add_argument('--cameras', default='all', help="'all', 'random' or a camera count")
@@ -347,10 +350,26 @@ NO_DECAY = ('cls_token', 'register_tokens', 'pos_embed')
 def init_weights(model, path):
     """Load a checkpoint's model weights; keys the model lacks are an error, keys the checkpoint lacks keep their init."""
     src = torch.load(Path(path).expanduser(), map_location='cpu', weights_only=False)
-    missing, unexpected = model.load_state_dict(src.get('model', src), strict=False)
+    missing, unexpected = model.load_state_dict(drop_retired(src.get('model', src)), strict=False)
     if unexpected:
         raise SystemExit(f'--init {path}: {len(unexpected)} keys the model does not have, e.g. {unexpected[:3]}')
     return missing, unexpected
+
+
+def make_dense_teacher(cfg, args, device, emit):
+    """The frozen dense teacher (None with cfg.dense_dim 0). A dry run without weights uses a random one."""
+    if not cfg.dense_dim:
+        return None
+    from .dense import DenseTeacher, load_teacher
+    source = args.dense_teacher_weights or (args.backbone_weights if cfg.dense_teacher == cfg.backbone else None)
+    if source and Path(source).expanduser().exists():
+        source = str(Path(source).expanduser())
+    if args.dry_run and not source:
+        teacher, loaded = DenseTeacher(cfg), 0
+    else:
+        teacher, loaded = load_teacher(cfg, source)
+    emit({'event': 'dense_teacher', 'teacher': cfg.dense_teacher, 'source': source, 'loaded': loaded})
+    return teacher.to(device)
 
 
 def make_optimizer(model, args):
@@ -440,6 +459,7 @@ def main(argv=None):
         if share < .5:  # a wrong path or layout must not silently train from scratch
             raise SystemExit(f'backbone weights {source!r}: only {len(loaded)} of {len(loaded) + len(missing)} '
                              f'encoder keys loaded into {cfg.backbone}')
+    dense_teacher = make_dense_teacher(cfg, args, device, emit)
     if args.checkpoint_layers:
         emit({'event': 'checkpointing', **model.set_activation_checkpointing(True)})
     opt = make_optimizer(model, args)
@@ -450,7 +470,7 @@ def main(argv=None):
         resume = ckpt_dir / 'last.pt' if (ckpt_dir / 'last.pt').exists() else None
     if resume:
         state = torch.load(Path(resume).expanduser(), map_location='cpu', weights_only=False)
-        model.load_state_dict(state['model'])
+        model.load_state_dict(drop_retired(state['model']))
         try:
             opt.load_state_dict(state['optimizer'])
         except ValueError as err:  # other parameter groups (e.g. new --backbone-lr-mult): fresh moments
@@ -495,7 +515,7 @@ def main(argv=None):
             _, log = sequence_loss(model, steps, targets, seeds=seeds, weights=weights,
                                    rays_per_camera=args.rays_per_camera, bptt=args.bptt, backward=backward,
                                    autocast=autocast, gate=args.match_gate, box_teacher=args.box_teacher,
-                                   teacher_p=teacher_at(step, args))
+                                   teacher_p=teacher_at(step, args), dense_teacher=dense_teacher)
             logs.append(log)
         log = average_logs(logs)
         allreduce_grads(params, world)

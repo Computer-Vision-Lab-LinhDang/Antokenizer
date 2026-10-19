@@ -70,6 +70,10 @@ class V6Config:
     scene_x_min: float = -64.0        # m, world x of the grid's lower edge (world = rig at the clip's first step)
     scene_y_min: float = -80.0
     scene_near: float = 1.0           # m, first scene sample along a ray
+    # Dense features (dense.py): every ray also renders dense_dim channels, decoded to the patch features of a frozen
+    # dense_teacher (DINOv3) on the target frame (dense_dim 0: off, no modules)
+    dense_dim: int = 0
+    dense_teacher: str = 'dinov3_vitl16'
     schema_version: int = 6
 
     def __post_init__(self):
@@ -86,6 +90,9 @@ class V6Config:
         if self.scene_samples < 0 or (self.scene_samples and (min(self.scene_cells_x, self.scene_cells_y) < 1
                                                                or self.scene_width < 3)):
             raise ValueError('invalid scene map size')
+        if self.dense_dim < 0 or (self.dense_dim and not (self.dense_teacher in BACKBONES
+                                                         and self.dense_teacher.startswith('dinov3'))):
+            raise ValueError('dense_dim must be >= 0 and dense_teacher a DINOv3 layout')
         if self.schema_version != 6:
             raise ValueError('v6 config requires schema_version 6')
 
@@ -114,6 +121,11 @@ class V6Config:
     def scene_shape(self):
         """(NY, NX, channels) of the scene map; (1, 1, 1) when it is off."""
         return (self.scene_cells_y, self.scene_cells_x, self.scene_width) if self.scene_samples else (1, 1, 1)
+
+    @property
+    def dense_target_dim(self):
+        """Width of the teacher's patch features (0 when dense features are off)."""
+        return BACKBONES[self.dense_teacher]['encoder_width'] if self.dense_dim else 0
 
     @property
     def patches_per_camera(self):

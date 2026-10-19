@@ -6,6 +6,8 @@ field over that slot's C_obj tokens. With the scene map on (cfg.scene_samples), 
 log-spaced samples through the static map (scene.py), composited with the slot samples by depth. Left-over
 transmittance takes a sky colour from the background tokens. Reads only the state; geometry and compositing
 run in fp32.
+With cfg.dense_dim, every sample (slot field, scene map, sky) also carries dense_dim feature channels after its
+colour, composited with the detached weights: the dense loss trains what the state holds, never density.
 """
 import math
 
@@ -88,6 +90,9 @@ class _Field(nn.Module):
         self.color_h = nn.Linear(c, w)
         self.color_dir = nn.Linear(3, w)
         self.color_out = nn.Sequential(nn.SiLU(), nn.Linear(w, 3))
+        # dense features: same feature + h, no view direction
+        self.dense_feat = nn.Linear(w, w) if cfg.dense_dim else None
+        self.dense_out = nn.Sequential(nn.SiLU(), nn.Linear(w, cfg.dense_dim)) if cfg.dense_dim else None
 
     def slot_cache(self, c_obj: Tensor, h: Tensor):
         """Per-slot K/V [B,K,6,2w] per layer and h feature [B,K,w]; computed once per forward."""
@@ -106,11 +111,14 @@ class _Field(nn.Module):
         feat = self.out_norm(q)
         sigma = F.softplus(self.density(feat).squeeze(-1))
         color = self.color_feat(feat) + (h_feat + self.color_dir(dirs))[:, None]
-        return sigma, torch.sigmoid(self.color_out(color))
+        rgb = torch.sigmoid(self.color_out(color))
+        if self.dense_out is None:
+            return sigma, rgb
+        return sigma, torch.cat((rgb, self.dense_out(self.dense_feat(feat) + h_feat[:, None]).to(rgb.dtype)), -1)
 
 
 class _Background(nn.Module):
-    """Ray direction (rig frame) cross-attends to the background tokens -> colour. No density."""
+    """Ray direction (rig frame) cross-attends to the background tokens -> colour (+ dense channels). No density."""
 
     def __init__(self, cfg: V6Config, width: int = 128, heads: int = 2, bands: int = 4):
         super().__init__()
@@ -119,6 +127,8 @@ class _Background(nn.Module):
         self.kv = nn.Linear(cfg.latent_width, 2 * width)
         self.query = nn.Sequential(nn.Linear(3 * (1 + 2 * bands), width), nn.SiLU(), nn.Linear(width, width))
         self.out = nn.Sequential(nn.Linear(2 * width, width), nn.SiLU(), nn.Linear(width, 3))
+        self.dense = (nn.Sequential(nn.Linear(2 * width, width), nn.SiLU(), nn.Linear(width, cfg.dense_dim))
+                      if cfg.dense_dim else None)
 
     def tokens(self, background: Tensor) -> Tensor:
         return self.kv(self.norm(background.float()))
@@ -129,7 +139,9 @@ class _Background(nn.Module):
         k, v = kv.chunk(2, -1)
         qh = _heads(q, self.heads)
         read = _merge(_sdpa_rows(qh, _heads(k, self.heads).to(qh.dtype), _heads(v, self.heads).to(qh.dtype)))
-        return torch.sigmoid(self.out(torch.cat((read, q), -1)))
+        x = torch.cat((read, q), -1)
+        rgb = torch.sigmoid(self.out(x))
+        return rgb if self.dense is None else torch.cat((rgb, self.dense(x).to(rgb.dtype)), -1)
 
 
 class V6Decoder(nn.Module):
@@ -220,14 +232,14 @@ class V6Decoder(nn.Module):
         sigma, rgb = self.field(points.float().reshape(b * q, 1, 3), directions.float().reshape(b * q, 3),
                                 gather_slots(h_feat, slots).flatten(0, 1),
                                 *[gather_slots(x, slots).flatten(0, 1) for x in kv])
-        return sigma.float().reshape(b, q), rgb.float().reshape(b, q, 3)
+        return sigma.float().reshape(b, q), rgb[..., :3].float().reshape(b, q, 3)
 
     def background_rgb(self, state: V6State, direction: Tensor) -> Tensor:
         """Background colour for world directions [B,R,3]; direction is read in the rig frame."""
         with _no_autocast(direction):
             rig = quat_to_matrix(state.rig_orientation.float())
             dirs = torch.einsum('brj,bji->bri', direction.float(), rig)
-        return self.background(self.background.tokens(state.background), dirs).float()
+        return self.background(self.background.tokens(state.background), dirs)[..., :3].float()
 
     # ---- render ----
     def forward(self, state: V6State, rays: RayBatch, chunk: int = 4096) -> RenderOutput:
@@ -299,7 +311,7 @@ class V6Decoder(nn.Module):
         bg = self.background(bg_kv, dir_rig)
         with _no_autocast(origin):
             sigma = sigma.float().reshape(b, r, m, s) * occ * ok[..., None]
-            rgb, bg = rgb.float().reshape(b, r, m, s, 3), bg.float()
+            rgb, bg = rgb.float().reshape(b, r, m, s, -1), bg.float()                # colour (+ dense) channels
             t, delta, sigma = t.flatten(-2), delta.flatten(-2), sigma.flatten(-2)
             slot_id = idx[..., None].expand(-1, -1, -1, s).flatten(-2)
             rgb, canon = rgb.flatten(2, 3), canon.flatten(2, 3)
@@ -313,14 +325,14 @@ class V6Decoder(nn.Module):
                 t, delta = torch.cat((t, t_sc), -1), torch.cat((delta, delta_sc), -1)
                 sigma = torch.cat((sigma, sigma_sc.float().view(b, r, n_sc)), -1)
                 slot_id = torch.cat((slot_id, torch.full_like(t_sc, -1, dtype=slot_id.dtype)), -1)
-                rgb = torch.cat((rgb, rgb_sc.float().view(b, r, n_sc, 3)), 2)
+                rgb = torch.cat((rgb, rgb_sc.float().view(b, r, n_sc, -1)), 2)
                 canon = torch.cat((canon, canon.new_zeros(b, r, n_sc, 3)), 2)
         with _no_autocast(origin):
             # composite all samples sorted by depth
             t_all, order = t.sort(dim=-1, stable=True)
             take = lambda v: v.gather(-1, order)
             sigma, delta, slot_id = take(sigma), take(delta), take(slot_id)
-            rgb = rgb.gather(2, order[..., None].expand(-1, -1, -1, 3))
+            rgb = rgb.gather(2, order[..., None].expand(-1, -1, -1, rgb.shape[-1]))
             canon = canon.gather(2, order[..., None].expand(-1, -1, -1, 3))
             optical = sigma * delta
             total = optical.cumsum(-1)
@@ -329,7 +341,10 @@ class V6Decoder(nn.Module):
             solid = -torch.expm1(-total[..., -1])                                   # slots and scene
             on_slot = slot_id >= 0
             opacity = solid if grid is None else torch.where(on_slot, weight, 0.).sum(-1)  # visible object mass
-            color = (weight[..., None] * rgb).sum(-2) + residual[..., None] * bg
+            color = (weight[..., None] * rgb[..., :3]).sum(-2) + residual[..., None] * bg[..., :3]
+            # dense channels: the same mix with the weights detached (features never move density)
+            feature = None if rgb.shape[-1] == 3 else (torch.einsum('brs,brsc->brc', weight.detach(), rgb[..., 3:])
+                                                         + residual.detach()[..., None] * bg[..., 3:])
             hit_ray = solid > HIT_OPACITY
             depth = torch.where(hit_ray, (weight * t_all).sum(-1) / solid.clamp_min(HIT_OPACITY), torch.zeros_like(solid))
             # first surface: accumulated weight crosses 0.5, else the max-weight sample
@@ -341,8 +356,9 @@ class V6Decoder(nn.Module):
             # per-slot weights; the last column takes everything else (scene samples and sky)
             per_slot = torch.zeros(b, r, k + 1, device=origin.device).scatter_add(-1, torch.where(on_slot, slot_id, k), weight)
             weights = torch.cat((per_slot[..., :k], per_slot[..., k:] + residual[..., None]), -1)
-        return dict(rgb=color, depth=depth, opacity=opacity, surface_slot=surface_slot,
-                    surface_canon=surface_canon, weights=weights, sample_t=t_all, sample_w=weight)
+        out = dict(rgb=color, depth=depth, opacity=opacity, surface_slot=surface_slot,
+                   surface_canon=surface_canon, weights=weights, sample_t=t_all, sample_w=weight)
+        return out if feature is None else {**out, 'feature': feature}
 
     # ---- seen / inferred / unknown (rule-based, no gradient) ----
     @torch.no_grad()

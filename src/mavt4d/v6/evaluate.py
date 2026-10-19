@@ -28,6 +28,11 @@ with that depth and the metadata poses (an upper bound for a static scene with p
 to the plain copy (in_psnr_copy_lidar) and the model (in_psnr_lidar). held_seen_now / held_seen_any: share of the
 held-out camera's LiDAR points on its grid inside an input camera's image at the same step / at any observed step so
 far, with no occlusion test (an upper bound on what the input could have shown).
+
+Dense features (G3), with a frozen DINOv3 teacher (--dense-teacher; default the checkpoint's when it renders dense
+features): in_dense_cos / held_dense_cos is the cosine of the model's decoded features to the teacher's patch features
+of the target frame at the same pixels; in_dense_cos_copy / _warp / _copy_lidar / _lidar are the copy-last and warp
+baselines above in the teacher's space (the last observed frame's features; this step's frame is only the target).
 """
 from __future__ import annotations
 
@@ -46,16 +51,18 @@ import torch.nn.functional as F
 
 from .config import V6Config
 from .contracts import FREE
+from .dense import DenseTeacher, cosine, load_teacher, sample_features, teacher_features
 from .geometry import quat_to_matrix
 from .losses import (DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, points_in_each_box, render_view,
                      rig_to_world, step_terms, teacher_boxes)
-from .model import V6Model
+from .model import V6Model, drop_retired
 from .train import batch_to_sequence, setup_distributed, synthetic_batch
 
 GATES = (2., 4.)            # m, slot-box match radius for precision / recall; errors use the larger one
-HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'held_seen_now', 'held_seen_any', 'in_psnr', 'in_psnr_copy',
-            'in_l1', 'in_l1_copy', 'in_psnr_lidar', 'in_psnr_copy_lidar', 'in_psnr_warp', 'held_depth_cov',
-            'held_absrel', 'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50',
+HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'held_dense_cos', 'held_seen_now', 'held_seen_any', 'in_psnr',
+            'in_psnr_copy', 'in_l1', 'in_l1_copy', 'in_psnr_lidar', 'in_psnr_copy_lidar', 'in_psnr_warp',
+            'in_dense_cos', 'in_dense_cos_copy', 'in_dense_cos_lidar', 'in_dense_cos_copy_lidar', 'in_dense_cos_warp',
+            'held_depth_cov', 'held_absrel', 'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50',
             'held_absrel50_near', 'held_absrel50_mid', 'held_absrel50_far', 'obj_opacity', 'bg_opacity', 'opacity_auc',
             'slots', 'boxes', 'precision_2m', 'recall_2m', 'precision_4m', 'recall_4m', 'center_err', 'center_err_hold',
             'vel_err', 'vel_err_zero', 'fc_err', 'fc_err_hold', 'fc_vel_err', 'fc_vel_zero', 'id_kept', 'class_acc',
@@ -67,6 +74,12 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description='Evaluate a MAVT v6 checkpoint on AV2 clips.')
     p.add_argument('--checkpoint', default=None, help='train.py checkpoint; none: random init (baseline)')
     p.add_argument('--backbone-weights', default=None, help='with no checkpoint: pretrained encoder weights')
+    p.add_argument('--dense-teacher', default=None, choices=('dinov3_vits16', 'dinov3_vitl16'),
+                   help="frozen teacher of the dense metrics (default: the checkpoint's when it renders dense "
+                        'features, else none); scores the copy / warp baselines also for a model without them')
+    p.add_argument('--dense-teacher-weights', default=None,
+                   help="HF repo id, local dir or file; default --backbone-weights when the teacher is the encoder's "
+                        'backbone, else its HF repo (--dry-run without weights: random)')
     p.add_argument('--data-root', default=None)
     p.add_argument('--split', default='val')
     p.add_argument('--log-fraction', type=float, default=1.0,
@@ -98,13 +111,29 @@ def load_model(args, device):
     if args.checkpoint:
         saved = torch.load(Path(args.checkpoint).expanduser(), map_location='cpu', weights_only=False)
         model = V6Model(V6Config(**{**saved['config'], **json.loads(args.config)}))  # e.g. spawn_threshold
-        model.load_state_dict(saved['model'])
+        model.load_state_dict(drop_retired(saved['model']))
         return model.to(device).eval(), int(saved.get('step', -1))
     model = V6Model(V6Config(**json.loads(args.config)))
     if args.backbone_weights:
         from .encoder import load_backbone
         load_backbone(model.encoder, str(Path(args.backbone_weights).expanduser()))
     return model.to(device).eval(), 0
+
+
+def load_dense_teacher(args, cfg, device):
+    """The frozen dense.DenseTeacher of the dense metrics on device, or None: --dense-teacher, else the model's when
+    cfg.dense_dim > 0. Weights as train.make_dense_teacher (--dry-run without: random). -> (teacher, log record)."""
+    name = args.dense_teacher or (cfg.dense_teacher if cfg.dense_dim else None)
+    if name is None:
+        return None, {}
+    if cfg.dense_dim and name != cfg.dense_teacher:
+        raise SystemExit(f'--dense-teacher {name}: the model renders {cfg.dense_teacher} features')
+    source = args.dense_teacher_weights or (args.backbone_weights if name == cfg.backbone else None)
+    if source and Path(source).expanduser().exists():
+        source = str(Path(source).expanduser())
+    tcfg = replace(cfg, dense_teacher=name)   # the teacher reads only its layout, the patch and the image size
+    teacher, loaded = (DenseTeacher(tcfg), 0) if args.dry_run and not source else load_teacher(tcfg, source)
+    return teacher.to(device), {'event': 'dense_teacher', 'teacher': name, 'source': source, 'loaded': loaded}
 
 
 def pick_clips(total, n):
@@ -224,18 +253,25 @@ def lidar_points(cams, idx, rig):
     return unproject(_pixels(idx, cams['depth'].shape[-1]), z, *camera_matrices(cams), rig), ok
 
 
-def warp_last(last, cams, idx, rig):
-    """Oracle-depth warp of the last observed frame to pixels idx [B,V,R] of the same cameras: each pixel with target
-    LiDAR depth is lifted with the target step's camera and rig pose (rig), projected into the camera at the last
-    observed step (last: images, intrinsics, cam_to_rig, camera_valid, rig) and sampled there bilinearly. An upper
-    bound on copying the past for a static scene with perfect depth and known ego motion.
-    -> rgb [B,V,R,3], ok [B,V,R]: LiDAR pixels of cameras valid at both steps that land on the image in front."""
-    images = last['images'].float()
-    b, v, _, h, w = images.shape
+def warp_pixels(last, cams, idx, rig, h, w):
+    """Where warp_last samples: pixels idx [B,V,R] of cams with target LiDAR depth, lifted with the target step's camera
+    and rig pose (rig) and projected into the same camera at the last observed step (last: intrinsics, cam_to_rig,
+    camera_valid, rig). -> uv [B,V,R,2] (0 where not ok), ok [B,V,R]: LiDAR pixels of cameras valid at both steps
+    that land on the h x w image in front."""
     points, ok = lidar_points(cams, idx, rig)
     uv, z = project(points, *camera_matrices(last), last['rig'])
     ok &= inside(uv, h, w) & (z > 0) & last['camera_valid'].bool()[..., None]
-    grid = torch.where(ok[..., None], uv / uv.new_tensor([w - 1, h - 1]) * 2 - 1, 0.)
+    return torch.where(ok[..., None], uv, 0.), ok
+
+
+def warp_last(last, cams, idx, rig):
+    """Oracle-depth warp of the last observed frame (last['images']) to pixels idx [B,V,R] of the same cameras, sampled
+    bilinearly at warp_pixels. An upper bound on copying the past for a static scene with perfect depth and known ego
+    motion. -> rgb [B,V,R,3], ok [B,V,R] (warp_pixels)."""
+    images = last['images'].float()
+    b, v, _, h, w = images.shape
+    uv, ok = warp_pixels(last, cams, idx, rig, h, w)
+    grid = uv / uv.new_tensor([w - 1, h - 1]) * 2 - 1
     rgb = F.grid_sample(images.flatten(0, 1), grid.flatten(0, 1)[:, None], padding_mode='border', align_corners=True)
     return rgb[:, :, 0].transpose(1, 2).reshape(b, v, -1, 3), ok
 
@@ -258,6 +294,37 @@ def copy_metrics(last, cams, idx, rig, rgb):
     return {'psnr_copy': cmean(psnr((old - rgb_t).square().mean((-1, -2))), both),
             'l1_copy': cmean((old - rgb_t).abs().mean((-1, -2)), both), 'psnr_warp': on_lidar(warp),
             'psnr_copy_lidar': on_lidar(old), 'psnr_lidar': on_lidar(rgb.float().clamp(0, 1).view(b, v, -1, 3))}
+
+
+def dense_cos(pred, feats, idx, valid, h, w):
+    """Cosine of predicted features pred [B,V*R,D] at pixels idx [B,V,R] of an h x w image to the teacher's features
+    feats [B,V,D,h/p,w/p] there: mean per camera valid [B,V], then over them -> [B]."""
+    b, v, r = idx.shape
+    target = sample_features(feats, _pixels(idx, w), h, w)
+    return cmean(cosine(pred.reshape(b, v, r, -1), target).mean(-1), valid.bool())
+
+
+DENSE_COPY_KEYS = ('dense_cos_copy', 'dense_cos_warp', 'dense_cos_copy_lidar', 'dense_cos_lidar')
+
+
+def dense_copy_metrics(last, cams, idx, rig, feats, pred=None):
+    """copy_metrics in the dense teacher's space, against this step's teacher features feats [B,V,D,h/p,w/p] at pixels
+    idx [B,V,R]: the last observed frame's features (last['dense']) at the same pixel on every pixel (copy), and on the
+    pixels warp_last keeps: at the warped pixel (warp), at the same pixel (copy_lidar) and the model's prediction pred
+    [B,V*R,D] (lidar; nan without pred). Mean cosine per camera valid at both steps, then the mean -> [B] each."""
+    b, v, _, h, w = cams['images'].shape
+    pixels = _pixels(idx, w)
+    now, old = sample_features(feats, pixels, h, w), sample_features(last['dense'], pixels, h, w)
+    uv, ok = warp_pixels(last, cams, idx, rig, h, w)
+    both = cams['camera_valid'].bool() & last['camera_valid'].bool()
+
+    def on_lidar(x):
+        return cmean(cmean(cosine(x, now), ok), both)
+    lidar = (on_lidar(pred.reshape(b, v, idx.shape[-1], -1)) if pred is not None
+             else torch.full((b,), math.nan, device=idx.device))
+    return {'dense_cos_copy': cmean(cosine(old, now).mean(-1), both),
+            'dense_cos_warp': on_lidar(sample_features(last['dense'], uv, h, w)), 'dense_cos_copy_lidar': on_lidar(old),
+            'dense_cos_lidar': lidar}
 
 
 def seen_by(points, views, h, w, near=.1):
@@ -541,7 +608,9 @@ def _slice(x, n):
 # ---------------------------------------------------------------- run
 
 @torch.no_grad()
-def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
+def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None, dense_teacher=None):
+    """Records per clip and step. dense_teacher (load_dense_teacher): the dense metrics; the model's only with
+    cfg.dense_dim > 0. A frame's teacher features are a target at its step, a copy / warp prediction only later."""
     gen = torch.Generator().manual_seed(args.seed * 7919 + ids[0])
     steps, targets = batch_to_sequence(batch, device, heldout=True, generator=gen)
     for s, tg in enumerate(targets):
@@ -553,6 +622,7 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
     last_pos, handoff, records, rows = None, None, [[] for _ in range(b)], []
     last, past = None, []   # input cameras at the last observed step; their geometry at every observed step
     nan = torch.full((b,), math.nan, device=device)
+    model_dense = dense_teacher is not None and model.cfg.dense_dim > 0
     for t in range(n):
         observed = torch.full((b,), t < observe, device=device)
         obs, tg = steps[t], targets[t]
@@ -561,7 +631,8 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
             boxes = teacher_boxes(tg) if args.box_teacher else None
             free_before = state.status == FREE
             state, aux = advance(model, state, obs, observed, boxes=boxes)
-            terms, _ = step_terms(model, state, obs, tg, observed, aux=aux, rays_per_camera=256)
+            terms, _ = step_terms(model, state, obs, tg, observed, aux=aux, rays_per_camera=256,
+                                  dense_teacher=dense_teacher)
             boxes, rig = teacher_boxes(tg), rig_to_world(state, obs)
             m = {}
             cams = {'images': obs.images[:, :, -1], 'intrinsics': obs.intrinsics, 'cam_to_rig': obs.cam_to_rig,
@@ -572,12 +643,21 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
             got, out, _ = render_metrics(model, view, cams, idx, boxes, rig)
             m.update({f'in_{k}': v for k, v in got.items()
                       if k in ('psnr', 'psnr_const', 'l1', 'depth_cov', 'absrel', 'depth_cov50', 'absrel50')})
+            feats = pred = None
+            if dense_teacher is not None:
+                feats = teacher_features(dense_teacher, cams['images'], cams['camera_valid'])
+            if model_dense:
+                pred = model.understanding.dense_features(out)
+                m['in_dense_cos'] = dense_cos(pred, feats, idx, cams['camera_valid'], hh, ww)
             now = {'intrinsics': obs.intrinsics, 'cam_to_rig': obs.cam_to_rig, 'camera_valid': obs.camera_valid,
                    'rig': rig}
             if t < observe:
                 past.append(now)
             got = copy_metrics(last, cams, idx, rig, out.rgb) if last is not None else {}
             m.update({f'in_{k}': got.get(k, nan) for k in COPY_KEYS})
+            if feats is not None:
+                got = dense_copy_metrics(last, cams, idx, rig, feats, pred) if last is not None else {}
+                m.update({f'in_{k}': got.get(k, nan) for k in DENSE_COPY_KEYS})
             if 'heldout' in tg:
                 held, has = heldout_view(tg['heldout'])
                 ys = torch.arange(0, hh, args.stride, device=device)
@@ -589,6 +669,10 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
                 got, out, _ = render_metrics(model, view, held, grid[None, None].expand(b, 1, -1), boxes, rig)
                 m.update({f'held_{k}': torch.where(has, v, nan) for k, v in got.items()
                           if not k.startswith(('obj_', 'bg_', 'opacity_'))})
+                if model_dense:
+                    held_feats = teacher_features(dense_teacher, held['images'], held['camera_valid'])
+                    m['held_dense_cos'] = dense_cos(model.understanding.dense_features(out), held_feats,
+                                                    grid[None, None].expand(b, 1, -1), held['camera_valid'], hh, ww)
                 m.update({k: v for k, v in got.items() if k.startswith(('obj_', 'bg_', 'opacity_'))})
                 img = out.rgb.float().clamp(0, 1).view(b, len(ys), len(xs), 3).permute(0, 3, 1, 2)
                 gt = held['images'][:, 0].float()[:, :, ys][:, :, :, xs]
@@ -608,7 +692,7 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
         if t == observe - 1:
             last_pos = state.position.float().cpu().clone()
             handoff = handoff_tracks(state, tg)
-            last = {**now, 'images': cams['images']}
+            last = {**now, 'images': cams['images'], 'dense': feats}
         loss_terms = sum(DEFAULT_WEIGHTS.get(k, 0.) * float(v) for k, v in terms.items())
         for i in range(b):
             rec = {'clip': ids[i], 'step': t, 'observed': t < observe, 'horizon': max(0, t - observe + 1),
@@ -661,6 +745,9 @@ def main(argv=None):
         torch.set_num_threads(args.threads)
     rank, world, device = setup_distributed(args.device)
     model, step = load_model(args, device)
+    dense_teacher, dense_log = load_dense_teacher(args, model.cfg, device)
+    if rank == 0 and dense_log:
+        print(json.dumps(dense_log), flush=True)
     out_dir = Path(args.out).expanduser()
     vis_dir = out_dir / 'vis'
     if rank == 0:
@@ -673,7 +760,7 @@ def main(argv=None):
     done, t0 = 0, time.time()
     for ids, batch in clip_batches(args, model.cfg, rank, world):
         records = evaluate_batch(model, batch, ids, args, device, autocast,
-                                 vis_dir if rank == 0 and done < args.vis else None)
+                                 vis_dir if rank == 0 and done < args.vis else None, dense_teacher=dense_teacher)
         with open(shard, 'a') as fh:
             fh.writelines(json.dumps(r) + '\n' for r in records)
         done += len(ids)
@@ -686,7 +773,8 @@ def main(argv=None):
         records = [json.loads(line) for f in sorted(out_dir.glob('records_rank*.jsonl')) for line in open(f)]
         summary = summarize(records, {'checkpoint': args.checkpoint, 'step': step, 'split': args.split,
                                       'log_fraction': args.log_fraction, 'observe': args.observe, 'steps': args.steps,
-                                      'stride': args.stride, 'box_teacher': args.box_teacher, 'seed': args.seed})
+                                      'stride': args.stride, 'box_teacher': args.box_teacher, 'seed': args.seed,
+                                      'dense_teacher': dense_log.get('teacher')})
         (out_dir / 'summary.json').write_text(json.dumps(summary, indent=1))
         (out_dir / 'summary.md').write_text(summary_markdown(summary))
         print(summary_markdown(summary), flush=True)

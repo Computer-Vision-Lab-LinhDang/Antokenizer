@@ -2,13 +2,18 @@ import json
 import math
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from mavt4d.v6.config import V6Config
 from mavt4d.v6.contracts import ACTIVE, FREE
-from mavt4d.v6.evaluate import auc, forecast_metrics, handoff_tracks, main, seen_by, spawn_misses, warp_last
+from mavt4d.v6.dense import DenseTeacher, sample_features, teacher_features
+from mavt4d.v6.evaluate import (auc, dense_copy_metrics, forecast_metrics, handoff_tracks, main, seen_by, spawn_misses,
+                                warp_last)
 from mavt4d.v6.train import main as train_main
 
 TINY = dict(slots=3, trunk_layers=1, encoder_layers=2, image_height=64, image_width=64, anchors=8)
+DENSE = dict(dense_dim=8, dense_teacher='dinov3_vits16')
 CAM_TO_RIG = torch.tensor([[0., 0., 1., 1.5], [-1., 0., 0., 0.], [0., -1., 0., 1.6], [0., 0., 0., 1.]])  # z forward
 
 
@@ -129,3 +134,67 @@ def test_seen_by_needs_the_point_in_front_of_an_input_camera():
     assert seen_by(points, [ahead], 12, 16).tolist() == [[True, False, False]]
     back = _camera(12, 16, 10., _rig(math.pi))   # the rig turned around: what was behind is now in view
     assert seen_by(points, [ahead, back], 12, 16).tolist() == [[True, True, False]]
+
+
+def test_dense_copy_and_warp_are_one_on_a_static_frame():
+    h, w, f = 64, 64, 40.
+    g = torch.Generator().manual_seed(0)
+    image = torch.rand(1, 1, 3, h, w, generator=g)
+    feats = teacher_features(DenseTeacher(V6Config(**TINY, **DENSE)), image, torch.ones(1, 1, dtype=torch.bool))
+    rig = _rig(.3, (5., 2., 0.))
+    depth = 2 + 30 * torch.rand(1, 1, h, w, generator=g)
+    cams = _camera(h, w, f, rig, images=image, depth=depth, depth_valid=torch.ones(1, 1, h, w, dtype=torch.bool))
+    last = _camera(h, w, f, rig, images=image, dense=feats)
+    idx = torch.arange(h * w)[None, None]
+    got = dense_copy_metrics(last, cams, idx, rig, feats)
+    for key in ('dense_cos_copy', 'dense_cos_warp', 'dense_cos_copy_lidar'):
+        assert got[key].item() == pytest.approx(1., abs=1e-4), key
+    assert math.isnan(got['dense_cos_lidar'])
+    # a model that predicts the target scores 1 on the same pixels
+    pixels = torch.stack((idx % w, idx // w), -1).float()
+    got = dense_copy_metrics(last, cams, idx, rig, feats, sample_features(feats, pixels, h, w).flatten(1, 2))
+    assert got['dense_cos_lidar'].item() == pytest.approx(1., abs=1e-5)
+
+
+def test_dense_warp_follows_the_parallax_the_copy_misses():
+    h, w, f, d, z = 12, 16, 10., .75, 5.
+    u = (torch.arange(w) / (w - 1.)).expand(h, w)
+    ramp = lambda x: torch.stack((2 * x - 1, torch.full_like(x, .25)))[None, None]  # noqa: E731  linear in u, per pixel
+    # a static wall at depth z; the rig steps d to its left, so what the target sees at u sat at u - f d / z before
+    cams = _camera(h, w, f, _rig(t=(0., d, 0.)), images=torch.zeros(1, 1, 3, h, w), depth=torch.full((1, 1, h, w), z),
+                   depth_valid=torch.ones(1, 1, h, w, dtype=torch.bool))
+    last = _camera(h, w, f, _rig(), images=torch.zeros(1, 1, 3, h, w), dense=ramp(u))
+    idx = torch.tensor([[[r * w + c for r in range(h) for c in range(2, w)]]])   # warped pixels stay on the image
+    got = dense_copy_metrics(last, cams, idx, cams['rig'], ramp(u - f * d / z / (w - 1)))
+    assert got['dense_cos_warp'].item() == pytest.approx(1., abs=1e-5)
+    assert got['dense_cos_copy_lidar'].item() < .95 and got['dense_cos_copy'].item() < .95
+
+
+def _dense_records(tmp_path, name, *extra):
+    main(['--dry-run', '--clips', '2', '--batch-size', '2', '--steps', '3', '--observe', '2', '--stride', '4',
+          '--rays-per-camera', '128', '--vis', '0', '--device', 'cpu', '--out', str(tmp_path / name), *extra])
+    return [json.loads(line) for line in open(tmp_path / name / 'records_rank0.jsonl')]
+
+
+def test_evaluate_dense_dry_run(tmp_path):
+    lines = _dense_records(tmp_path, 'on', '--config', json.dumps({**TINY, **DENSE}))
+    assert len(lines) == 6
+    for r in lines:
+        assert math.isfinite(r['in_dense_cos']) and math.isfinite(r['held_dense_cos'])
+        # copy / warp predict a rolled-out step from the last observed frame's features only
+        for key in ('in_dense_cos_copy', 'in_dense_cos_warp', 'in_dense_cos_copy_lidar', 'in_dense_cos_lidar'):
+            assert math.isnan(r[key]) == r['observed'], key
+        assert r['term_recon_dense' if r['observed'] else 'term_pred_dense'] > 0
+    assert json.loads((tmp_path / 'on' / 'summary.json').read_text())['dense_teacher'] == 'dinov3_vits16'
+    with pytest.raises(SystemExit):   # the model renders vits16 features
+        _dense_records(tmp_path, 'other', '--config', json.dumps({**TINY, **DENSE}), '--dense-teacher', 'dinov3_vitl16')
+
+
+def test_evaluate_dense_baselines_without_dense_features(tmp_path):
+    lines = _dense_records(tmp_path, 'off', '--config', json.dumps(TINY), '--dense-teacher', 'dinov3_vits16')
+    assert not any('in_dense_cos' in r or 'held_dense_cos' in r for r in lines)
+    for r in lines:
+        for key in ('in_dense_cos_copy', 'in_dense_cos_warp', 'in_dense_cos_copy_lidar'):
+            assert math.isnan(r[key]) == r['observed'], key
+        assert math.isnan(r['in_dense_cos_lidar']) and r['term_recon_dense'] == r['term_pred_dense'] == 0
+    assert not any('in_dense_cos_copy' in r for r in _dense_records(tmp_path, 'none', '--config', json.dumps(TINY)))

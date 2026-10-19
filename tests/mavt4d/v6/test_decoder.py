@@ -160,19 +160,6 @@ def test_understanding_reads_only_c():
     assert (und.slot_embedding(permuted) - emb[:, perm]).abs().amax() < 1e-5
 
 
-def test_dense_features_do_not_pull_geometry():
-    torch.manual_seed(0)
-    und, dec, rays = V6Understanding(CFG), decoder(), make_rays()
-    state = make_state()
-    state = replace(state, position=state.position.clone().requires_grad_(), offset=state.offset.clone().requires_grad_())
-    render = dec(state, rays)
-    dense = und.dense_features(state, render)
-    assert dense.shape == (1, 64, 128)
-    assert torch.equal(dense[0, 48:], und.dense_background.expand(16, -1))
-    dense.square().sum().backward()
-    assert state.position.grad is None and state.offset.grad is None
-
-
 def test_field_attention_row_chunks_match():
     from mavt4d.v6 import decoder as dec
     torch.manual_seed(0)

@@ -1,4 +1,4 @@
-"""Fast v1 objective: reconstruction, prediction rollout, encoder depth, slot boxes, rig pose.
+"""Fast v1 objective: reconstruction, prediction rollout, encoder depth, slot boxes, rig pose, dense features.
 
 Each term returns (scalar, log dict). ``sequence_loss`` runs a clip: observe the first S steps
 (S per clip from its own RNG), then roll out with ``predict``; truncated BPTT every ``bptt`` steps.
@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .contracts import FREE, Observation, V6State
+from .dense import cosine, sample_features, teacher_features
 from .geometry import quat_to_matrix
 from .scene import GATE_SEEN
 from .write import matrix_to_quat
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover - depends on the environment
 DEFAULT_WEIGHTS = {
     'recon_rgb': 1., 'recon_depth': .5, 'recon_occ': .5, 'recon_los': .5,
     'pred_rgb': 1., 'pred_depth': .5, 'pred_occ': .5, 'pred_los': .5,
+    'recon_dense': .5, 'pred_dense': .5,
     'enc_depth': .1,
     'slot_pos': .1, 'slot_vel': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05,
     'own_box': .1, 'assign_box': .1,
@@ -136,7 +138,9 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     With the scene map on, line of sight on every target-depth ray: compositing mass in front of the LiDAR point,
     plus, where something can put a surface there (seen map cell, GT box), the mass missing around it; depth L1
     then also needs that. Without the map slots alone could only satisfy it wrongly, so it is off.
-    Returns {rgb, rgb_n, depth, depth_n, occ, occ_n, los, los_n} ([B] each) and a log dict.
+    With cams['dense'] (teacher features [B,V,D,h,w] of these images, dense.teacher_features) and the model's
+    dense channels on: 1 - cosine between the decoded rendered feature and the teacher's at every sampled pixel.
+    Returns {rgb, rgb_n, depth, depth_n, occ, occ_n, los, los_n, dense, dense_n} ([B] each) and a log dict.
     """
     images = cams['images']
     b, v, _, h, w = images.shape
@@ -154,6 +158,13 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     z_ok = cams['depth_valid'].bool().flatten(-2).gather(-1, idx).reshape(b, v * r) & (z_t > 0)
     ray_ok = ok_cam[:, :, None].expand(b, v, r).reshape(b, v * r)
     rgb, rgb_n = _clip_mean((out.rgb.float() - rgb_t).abs().mean(-1), ray_ok)
+    logs = {}
+    dense, dense_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
+    if 'dense' in cams and out.feature is not None:
+        feat_t = sample_features(cams['dense'], pixels, h, w).reshape(b, v * r, -1)
+        cos = cosine(model.understanding.dense_features(out), feat_t)
+        dense, dense_n = _clip_mean(1 - cos, ray_ok)
+        logs['dense_cos'] = masked_mean(cos.detach(), ray_ok)
     # The LiDAR point of each target ray: rig frame (GT box test) and world (scene map test).
     with torch.autocast(device_type=idx.device.type, enabled=False):
         uv1 = torch.cat((pixels, torch.ones_like(pixels[..., :1])), -1)
@@ -164,7 +175,6 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     surf = out.depth.detach() > 0
     target = ray_ok & z_ok
     los, los_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
-    logs = {}
     if model.decoder.scene is not None:
         t_ray = z_t / z_scale.clamp_min(1e-6)
         with torch.autocast(device_type=idx.device.type, enabled=False):
@@ -199,7 +209,7 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
             logs.update(obj_rays=(ok & on).sum().float(), obj_opacity=masked_mean(p.detach(), ok & on),
                         bg_opacity=masked_mean(p.detach(), ok & ~on))
     return {'rgb': rgb, 'rgb_n': rgb_n, 'depth': depth, 'depth_n': depth_n, 'occ': occ, 'occ_n': occ_n,
-            'los': los, 'los_n': los_n}, logs
+            'los': los, 'los_n': los_n, 'dense': dense, 'dense_n': dense_n}, logs
 
 
 # ---------------------------------------------------------------- encoder depth
@@ -369,19 +379,26 @@ def input_cameras(obs: Observation, targets: dict):
             'depth_valid': targets['target_valid']}
 
 
-def step_terms(model, state, obs, targets, observed, *, aux=None, rays_per_camera=256, gate=4.):
+def step_terms(model, state, obs, targets, observed, *, aux=None, rays_per_camera=256, gate=4., dense_teacher=None):
     """All terms for one step. observed [B]: clip took step() (posterior) rather than predict().
-    One render per camera set; clips split into recon (observed) and pred (rolled out)."""
+    One render per camera set; clips split into recon (observed) and pred (rolled out).
+    dense_teacher (dense.DenseTeacher): its features of this step's frames are the dense targets; the frame is a
+    target only, never an input of a rolled-out step."""
     cam_sets = [input_cameras(obs, targets)]
     if 'heldout' in targets:  # cameras never fed to the model
         cam_sets.append(targets['heldout'])
+    if dense_teacher is not None and model.cfg.dense_dim:
+        # both sets hold the same last tube frames (batch_to_sequence): one teacher pass over their cameras
+        valid = torch.stack([c['camera_valid'].bool() for c in cam_sets]).any(0)
+        feats = teacher_features(dense_teacher, cam_sets[0]['images'], valid)
+        cam_sets = [{**c, 'dense': feats} for c in cam_sets]
     boxes = teacher_boxes(targets)
     rig = None if boxes is None else rig_to_world(state, obs)
     view = render_view(state, obs)
     rendered = [render_loss(model, view, cams, rays_per_camera, boxes=boxes, rig=rig) for cams in cam_sets]
     terms, logs = {}, dict(rendered[0][1])
     for name, mask in (('recon', observed), ('pred', ~observed)):
-        for key in ('rgb', 'depth', 'occ', 'los'):
+        for key in ('rgb', 'depth', 'occ', 'los', 'dense'):
             terms[f'{name}_{key}'] = torch.stack([clips_mean(r[key], r[f'{key}_n'], mask) for r, _ in rendered]).mean()
     if aux is not None:
         terms['enc_depth'], l = encoder_depth_loss(aux['enc'], obs, model.cfg)
@@ -414,7 +431,7 @@ def advance(model, state, obs, observed, boxes=None):
 
 
 def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera=256, bptt=3,
-                  backward=None, autocast=None, gate=4., box_teacher=True, teacher_p=1.):
+                  backward=None, autocast=None, gate=4., box_teacher=True, teacher_p=1., dense_teacher=None):
     """Run one batch of clips. steps: list[Observation] (T), targets: list[dict] (T).
 
     Clip b observes its first S_b steps (S_b from seeds[b]) and is rolled out with predict() after.
@@ -422,6 +439,7 @@ def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera
     is backpropagated right away to free its graph. Returns (total loss: tensor if backward is None,
     else detached), log dict of floats. box_teacher: in training, GT boxes route evidence to free slots,
     for each clip with probability teacher_p (drawn from its seed); the other clips spawn on their own.
+    dense_teacher: frozen dense.DenseTeacher for the recon_dense / pred_dense terms (None: those terms are 0).
     """
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
     ctx = autocast or contextlib.nullcontext
@@ -439,7 +457,7 @@ def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera
                 boxes = {**boxes, 'valid': boxes['valid'].bool() & taught[:, None]}
             state, aux = advance(model, state, steps[t], observed[:, t], boxes=boxes)
             terms, logs = step_terms(model, state, steps[t], targets[t], observed[:, t], aux=aux,
-                                     rays_per_camera=rays_per_camera, gate=gate)
+                                     rays_per_camera=rays_per_camera, gate=gate, dense_teacher=dense_teacher)
             loss = sum(weights.get(k, 0.) * v.float() for k, v in terms.items()) / n
         chunk = chunk + loss
         for k, v in list(terms.items()) + list(logs.items()):

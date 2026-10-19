@@ -163,7 +163,7 @@ def scene_write(cfg, prior, prop: Tensor, lam: Tensor) -> dict:
 
 
 class SceneField(nn.Module):
-    """World points -> (density gated by the cell evidence, colour), read from the scene map."""
+    """World points -> (density gated by the cell evidence, colour (+ cfg.dense_dim channels)), read from the map."""
 
     def __init__(self, cfg, width: int = 64):
         super().__init__()
@@ -173,6 +173,7 @@ class SceneField(nn.Module):
         self.density = nn.Linear(width, 1)
         nn.init.constant_(self.density.bias, DENSITY_BIAS)
         self.color = nn.Linear(width, 3)
+        self.dense = nn.Linear(width, cfg.dense_dim) if cfg.dense_dim else None
 
     def grid(self, state) -> Tensor:
         """[B, Cs + 2, NY, NX]: cell features (height moments last), log1p(Lambda), evidence gate."""
@@ -190,7 +191,7 @@ class SceneField(nn.Module):
                              align_corners=False)[..., 0].transpose(1, 2)
 
     def forward(self, grid: Tensor, points: Tensor):
-        """grid from grid(), points [B,P,3] world -> sigma [B,P] (per metre), rgb [B,P,3]."""
+        """grid from grid(), points [B,P,3] world -> sigma [B,P] (per metre), rgb [B,P,3 (+ dense_dim)]."""
         with torch.autocast(points.device.type, enabled=False):
             read = self.read(grid, points)
             gate = read[..., -1].clamp(0, 1)
@@ -203,4 +204,5 @@ class SceneField(nn.Module):
                            fourier1(dz, REL_PERIOD, REL_BANDS)), -1)
         h = self.mlp(self.inp(x))
         sigma = F.softplus(self.density(h).float().squeeze(-1)) * gate
-        return sigma, torch.sigmoid(self.color(h).float())
+        rgb = torch.sigmoid(self.color(h).float())
+        return sigma, rgb if self.dense is None else torch.cat((rgb, self.dense(h).float()), -1)

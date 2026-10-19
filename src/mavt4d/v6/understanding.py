@@ -1,8 +1,8 @@
 """Query-style understanding heads over the state.
 
 Slot embedding reads only C_obj and canonical anchors (no D, no h, no slot index), so it is
-invariant to pose and equivariant to slot order. Dense features read the rendered surface; the
-render's mixing weights and surface point are detached so understanding never pulls geometry.
+invariant to pose and equivariant to slot order. Dense features decode the channels the decoder renders
+per ray (cfg.dense_dim, composited with detached weights) into the dense teacher's feature space.
 """
 import torch
 from torch import Tensor, nn
@@ -10,7 +10,7 @@ from torch.nn import functional as F
 
 from .config import V6Config
 from .contracts import RenderOutput, V6State
-from .decoder import fourier, gather_slots
+from .decoder import fourier
 
 
 class _SelfBlock(nn.Module):
@@ -29,7 +29,7 @@ class _SelfBlock(nn.Module):
 
 
 class V6Understanding(nn.Module):
-    def __init__(self, cfg: V6Config, num_classes: int = 30, text_dim: int = 1152, dense_dim: int = 128):
+    def __init__(self, cfg: V6Config, num_classes: int = 30, text_dim: int = 1152):
         super().__init__()
         e, w = cfg.decoder_width, cfg.latent_width
         self.cfg, self.embed_dim = cfg, e
@@ -41,10 +41,9 @@ class V6Understanding(nn.Module):
         self.out = nn.Sequential(nn.LayerNorm(e), nn.Linear(e, e))
         self.classifier = nn.Linear(e, num_classes)
         self.text = nn.Linear(e, text_dim)
-        self.dense_slot = nn.Linear(e, e)
-        self.dense_pos = nn.Linear(point_dim, e)
-        self.dense_head = nn.Sequential(nn.SiLU(), nn.Linear(e, e), nn.SiLU(), nn.Linear(e, dense_dim))
-        self.dense_background = nn.Parameter(torch.zeros(dense_dim))
+        f = cfg.dense_dim
+        self.dense = (nn.Sequential(nn.Linear(f, 2 * f), nn.SiLU(), nn.Linear(2 * f, cfg.dense_target_dim))
+                      if f else None)
 
     def slot_embedding(self, state: V6State) -> Tensor:
         """[B,K,E] from c_obj tokens + canonical anchors, per slot."""
@@ -62,15 +61,8 @@ class V6Understanding(nn.Module):
     def text_proj(self, emb: Tensor) -> Tensor:
         return F.normalize(self.text(emb).float(), dim=-1)
 
-    def dense_features(self, state: V6State, render: RenderOutput, emb: Tensor | None = None) -> Tensor:
-        """[B,R,F]: position-dependent head on (surface slot embedding, canonical surface point)."""
-        if emb is None:
-            emb = self.slot_embedding(state)
-        has = render.surface_slot >= 0
-        slot_emb = gather_slots(emb, render.surface_slot.clamp_min(0))
-        pos = fourier(render.surface_canon.detach().float(), self.cfg.fourier_bands)
-        obj = self.dense_head(self.dense_slot(slot_emb) + self.dense_pos(pos)).float()
-        # mix object / background by the render's (detached) background weight
-        bg_w = render.weights[..., -1].detach().float()[..., None]
-        mixed = (1 - bg_w) * obj + bg_w * self.dense_background
-        return torch.where(has[..., None], mixed, self.dense_background.expand_as(mixed))
+    def dense_features(self, render: RenderOutput) -> Tensor:
+        """[B,R,D] in the dense teacher's feature space, from the rendered channels (cfg.dense_dim > 0)."""
+        if self.dense is None or render.feature is None:
+            raise ValueError('dense features are off (cfg.dense_dim = 0)')
+        return self.dense(render.feature.float()).float()
