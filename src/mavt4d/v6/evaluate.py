@@ -123,9 +123,10 @@ def clip_batches(args, cfg, rank, world):
             yield chunk, synthetic_batch(cfg, len(chunk), args.steps, 'all', args.step_dt, generator=g)
         return
     from torch.utils.data import DataLoader, Subset
-    from .data_av2 import collate_clips, open_av2
-    ds = open_av2(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps, step_dt=args.step_dt,
-                  cameras='all', seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
+    from .data_av2 import collate_clips
+    from .data_omniworld import open_clips
+    ds = open_clips(args.data_root, args.split, cfg, steps=args.steps, step_dt=args.step_dt,
+                    cameras='all', seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
     ids = pick_clips(len(ds), args.clips)[rank::world]
     loader = DataLoader(Subset(ds, ids), batch_size=args.batch_size, num_workers=args.num_workers,
                         collate_fn=collate_clips)

@@ -37,7 +37,8 @@ BUCKET_ELEMENTS = 1 << 24
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description='Train MAVT v6 on Argoverse 2 Sensor clips.')
-    p.add_argument('--data-root', default=None, help='e.g. ~/data/argoverse2/sensor, or a pack_av2.py output')
+    p.add_argument('--data-root', default=None, help='e.g. ~/data/argoverse2/sensor, a pack_av2.py or '
+                   'pack_omniworld.py output, or several of them comma-separated (clips concatenated)')
     p.add_argument('--log-fraction', type=float, default=1.0,
                    help='train on this share of the logs (nested: a smaller share is a subset of a larger one)')
     p.add_argument('--split', default='train')
@@ -316,9 +317,13 @@ def batches(args, cfg, rank, world, device, start=0):
         while True:
             yield synthetic_batch(cfg, args.batch_size, args.steps, args.cameras, args.step_dt, generator=g)
     from torch.utils.data import DataLoader, Subset
-    from .data_av2 import collate_clips, open_av2
-    dataset = open_av2(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps, step_dt=args.step_dt,
-                       cameras=args.cameras, seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
+    from .data_av2 import collate_clips
+    from .data_omniworld import open_clips
+    dataset = open_clips(args.data_root, args.split, cfg, steps=args.steps, step_dt=args.step_dt,
+                         cameras=args.cameras, seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
+    if rank == 0 and hasattr(dataset, 'datasets'):  # several roots: clips per source set the mixture
+        print(json.dumps({'event': 'data', 'roots': args.data_root, 'clips': [len(d) for d in dataset.datasets]}),
+              flush=True)
     if args.overfit_clips > 0:
         from .evaluate import pick_clips  # evaluate imports this module
         dataset = Subset(dataset, pick_clips(len(dataset), args.overfit_clips))
