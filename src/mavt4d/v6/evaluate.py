@@ -22,6 +22,13 @@ slots. The miss_* metrics say, on observed steps, why GT boxes got no slot withi
 or the free slot owning most of the box's tokens stayed under the spawn threshold, had too few valid anchors, or
 spawned more than 2 m away.
 
+The pooled block (summary groups[...]['pooled']) sums counts over records instead of averaging per-record ratios:
+recall_2m (Hungarian within 2 m, as recall_2m) by box range (horizontal distance from the rig at its metadata pose to
+the box centre: 0-10, 10-20, 20-40, >40 m) and, on observed steps, by the number of input tokens whose LiDAR tag
+(median input LiDAR z along the patch-centre ray) falls in the box the box teacher tests (1.1 x half extent + .25 m):
+0, 1-2, 3-5, >5; with each count n. class_acc / class_majority_share: accuracy and share of the most common GT class on
+the 4 m pairs class_acc scores.
+
 Sanity baselines on the input cameras' sampled pixels at rolled-out steps (NaN on observed ones): in_*_copy scores the
 last observed frame of the same camera. On the pixels with target LiDAR that land in that frame, in_psnr_warp warps it
 with that depth and the metadata poses (an upper bound for a static scene with perfect depth and known ego motion), next
@@ -50,9 +57,12 @@ from .geometry import quat_to_matrix
 from .losses import (DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, points_in_each_box, render_view,
                      rig_to_world, step_terms, teacher_boxes)
 from .model import V6Model
+from .trunk import BOX_MARGIN, lidar_tag_points
 from .train import batch_to_sequence, setup_distributed, synthetic_batch
 
 GATES = (2., 4.)            # m, slot-box match radius for precision / recall; errors use the larger one
+RANGE_BINS = (('d0_10', 0., 10.), ('d10_20', 10., 20.), ('d20_40', 20., 40.), ('d40p', 40., math.inf))   # m
+TOKEN_BINS = (('t0', 0, 0), ('t1_2', 1, 2), ('t3_5', 3, 5), ('t6p', 6, math.inf))   # LiDAR-tagged tokens in a box
 HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'held_seen_now', 'held_seen_any', 'in_psnr', 'in_psnr_copy',
             'in_l1', 'in_l1_copy', 'in_psnr_lidar', 'in_psnr_copy_lidar', 'in_psnr_warp', 'held_depth_cov',
             'held_absrel', 'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50',
@@ -334,6 +344,7 @@ def slot_metrics(model, state, tg, prev, last_pos=None):
     keys = ('slots', 'boxes', 'center_err', 'center_err_hold', 'extent_err', 'class_acc', 'vel_err', 'vel_err_zero',
             'id_kept') + tuple(f'{n}_{g:g}m' for g in GATES for n in ('precision', 'recall'))
     rec, nxt = {key: [] for key in keys}, []
+    rec['cls_pairs'] = []   # [GT class, correct] per 4 m pair, pooled by summarize
     nan = math.nan
     for i in range(len(d)):
         di = d[i].masked_fill(~alloc[i, :, None] | ~ok[i, None, :], math.inf)
@@ -345,6 +356,7 @@ def slot_metrics(model, state, tg, prev, last_pos=None):
             rec[f'precision_{g:g}m'].append(n / n_slot if n_slot else nan)
             rec[f'recall_{g:g}m'].append(n / n_box if n_box else nan)
         pairs = _assign(di, max(GATES))
+        rec['cls_pairs'].append([[int(cls[i, c]), int(pred_cls[i, s] == cls[i, c])] for s, c in pairs])
         cerr, herr, xerr, cacc, verr, vzero, kept = [], [], [], [], [], [], []
         here = {}
         for s, c in pairs:
@@ -468,6 +480,35 @@ def spawn_misses(free_before, state, meas, token_valid, tg, rig, threshold, min_
         for key in keys[1:]:
             rec[key].append(_mean(xs[key]))
     return rec
+
+
+def recall_bins(state, tg, rig, tokens=None, gate=GATES[0]):
+    """Recall counts per clip (lists of ints): boxes n and boxes with an allocated slot within gate (Hungarian, as
+    recall_2m) hit, overall and by RANGE_BINS (horizontal distance from the rig, rig: rig_to_world); with tokens
+    (rig-frame points [B,Ne,3], valid [B,Ne]: the input tokens' LiDAR tags) also by TOKEN_BINS, counted in the box
+    the box teacher tests."""
+    center, ok, _ = _tracked(tg)
+    alloc = (state.status > FREE).cpu()
+    d = torch.cdist(state.position.float().cpu(), center)
+    r_wr, t_wr = (x.float().cpu() for x in rig)
+    reach = torch.einsum('bji,bmj->bmi', r_wr, center - t_wr[:, None])[..., :2].norm(dim=-1)   # [B,M]
+    bins = [(name, reach >= lo, reach < hi) for name, lo, hi in RANGE_BINS]
+    if tokens is not None:
+        boxes = teacher_boxes(tg)
+        boxes = {**boxes, 'size': boxes['size'].float() * BOX_MARGIN[0] + 2 * BOX_MARGIN[1]}
+        inside = points_in_each_box(tokens[0].float(), boxes, *rig, margin=0.) & tokens[1].bool()[..., None]
+        count = inside.sum(1).cpu()                                                              # [B,M]
+        bins += [(name, count >= lo, count <= hi) for name, lo, hi in TOKEN_BINS]
+    out = {}
+    for i in range(len(d)):
+        hit = torch.zeros_like(ok[i])
+        for _, c in _assign(d[i].masked_fill(~alloc[i, :, None] | ~ok[i, None, :], math.inf), gate):
+            hit[c] = True
+        for name, above, below in [('', ok[i], ok[i])] + [(f'_{n}', a[i], b[i]) for n, a, b in bins]:
+            m = ok[i] & above & below
+            out.setdefault(f'r2m{name}_n', []).append(int(m.sum()))
+            out.setdefault(f'r2m{name}_hit', []).append(int((m & hit).sum()))
+    return out
 
 
 def rig_metrics(state, obs):
@@ -604,6 +645,13 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
             extra = forecast_metrics(state, tg, handoff, last_pos, prev)
         slot, prev = slot_metrics(model, state, tg, prev, last_pos=None if t < observe else last_pos)
         slot.update(extra)
+        tokens = None
+        if aux is not None:
+            enc = aux['enc']
+            tok_ok = enc.measured_valid & enc.valid & obs.camera_valid.bool()[..., None]
+            tokens = lidar_tag_points(enc, obs, tok_ok).flatten(1, 2), tok_ok.flatten(1)
+        pool = recall_bins(state, tg, rig, tokens)
+        pool['cls'] = slot.pop('cls_pairs')
         if t == observe - 1:
             last_pos = state.position.float().cpu().clone()
             handoff = handoff_tracks(state, tg)
@@ -615,6 +663,7 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
                    **{f'term_{k}': float(v) for k, v in terms.items()}}
             rec.update({k: float(v[i]) for k, v in m.items()})
             rec.update({k: float(v[i]) for k, v in slot.items()})
+            rec['pool'] = {k: v[i] for k, v in pool.items()}
             records[i].append(rec)
     if rows:
         save_picture(vis_dir / f'clip_{ids[0]:06d}.png', rows)
@@ -631,11 +680,37 @@ def summarize(records, meta):
                 mu = sum(xs) / len(xs)
                 sd = math.sqrt(sum((x - mu) ** 2 for x in xs) / max(1, len(xs) - 1))
                 out[key] = {'mean': mu, 'ci95': 1.96 * sd / math.sqrt(len(xs)), 'n': len(xs)}
+        pooled = pool_counts([r['pool'] for r in rs if 'pool' in r])
+        if pooled:
+            out['pooled'] = pooled
         return out
     groups = {f'step_{s}': [r for r in records if r['step'] == s] for s in sorted({r['step'] for r in records})}
     groups['observed'] = [r for r in records if r['observed']]
     groups['rolled_out'] = [r for r in records if not r['observed']]
     return {**meta, 'clips': len({r['clip'] for r in records}), 'groups': {k: stats(v) for k, v in groups.items() if v}}
+
+
+def pool_counts(pools):
+    """Sums of recall_bins counts and pooled class accuracy / majority share over records' pool dicts."""
+    out, sums = {}, {}
+    for p in pools:
+        for k, v in p.items():
+            if k != 'cls':
+                sums[k] = sums.get(k, 0) + v
+    for k in sorted(sums):
+        if k.endswith('_n'):
+            name = 'recall_2m' + k[len('r2m'):-len('_n')]
+            hit = sums.get(k[:-len('_n')] + '_hit', 0)
+            out[name] = hit / sums[k] if sums[k] else math.nan
+            out[name + '_n'] = sums[k]
+    pairs = [pair for p in pools for pair in p.get('cls', [])]
+    out['class_pairs'] = len(pairs)
+    if pairs:
+        classes = [c for c, _ in pairs]
+        major = max(set(classes), key=classes.count)
+        out.update(class_acc=sum(ok for _, ok in pairs) / len(pairs), class_majority=major,
+                   class_majority_share=classes.count(major) / len(pairs))
+    return out
 
 
 def summary_markdown(summary):
@@ -651,6 +726,11 @@ def summary_markdown(summary):
             cells.append('' if v is None else f"{v['mean']:.3f}")
         if any(cells):
             lines.append(f'| {key} | ' + ' | '.join(cells) + ' |')
+    pooled = [k for g in names for k in groups[g].get('pooled', {})]
+    for key in dict.fromkeys(pooled):
+        cells = [groups[g].get('pooled', {}).get(key) for g in names]
+        lines.append(f'| pooled {key} | ' + ' | '.join('' if v is None else f'{v:.3f}' if isinstance(v, float)
+                                                       else str(v) for v in cells) + ' |')
     return '\n'.join(lines) + '\n'
 
 

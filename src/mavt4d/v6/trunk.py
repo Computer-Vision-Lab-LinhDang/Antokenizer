@@ -68,6 +68,15 @@ def _cam_features(rot9, trans, k4, hw):
     return torch.cat((rot9, _symlog(trans), torch.stack((fx / w, fy / h, cx / w, cy / h), -1), (hw / 100).log()), -1)
 
 
+def lidar_tag_points(enc: EncoderOutput, obs: Observation, valid: Tensor) -> Tensor:
+    """Rig-frame point [B,V,N,3] of each token's measured-depth tag: its median LiDAR z along the patch-centre ray."""
+    ray = torch.where(valid[..., None], enc.ray_cam.float(), enc.ray_cam.new_tensor([0., 0., 1.]).float())
+    z = enc.measured_depth.float()[..., 0].clamp(*LOG_Z_CLAMP).exp()
+    t = obs.cam_to_rig.float()
+    return torch.einsum('bvij,bvnj->bvni', t[..., :3, :3], ray / ray[..., 2:].clamp_min(1e-6) * z[..., None]) \
+        + t[:, :, None, :3, 3]
+
+
 class TokenPoints(NamedTuple):
     points: Tensor     # [B,V,N,3] rig frame, fp32, evidence only
     log_z: Tensor      # [B,V,N] selected log depth (camera z)
@@ -418,11 +427,7 @@ class V6Trunk(nn.Module):
             def local(p):  # [B,Ne,3] rig -> box frame scaled to [-1, 1] inside the inflated box, [B,Ne,M,3]
                 return torch.einsum('bmji,bnmj->bnmi', r_box, p[:, :, None] - c_rig[:, None]) / half[:, None]
 
-            ray = torch.where(tp.valid[..., None], enc.ray_cam.float(), enc.ray_cam.new_tensor([0., 0., 1.]).float())
-            z = enc.measured_depth.float()[..., 0].clamp(*LOG_Z_CLAMP).exp()
-            t = obs.cam_to_rig.float()
-            p_lid = torch.einsum('bvij,bvnj->bvni', t[..., :3, :3], ray / ray[..., 2:].clamp_min(1e-6) * z[..., None]) \
-                + t[:, :, None, :3, 3]
+            p_lid = lidar_tag_points(enc, obs, tp.valid)
             lid_ok = (enc.measured_valid & tp.valid).flatten(1)[..., None]
             u_lid, u_tok = local(p_lid.flatten(1, 2)), local(tp.points.float().flatten(1, 2).detach())
             in_lid = (u_lid.abs() <= 1).all(-1) & lid_ok
