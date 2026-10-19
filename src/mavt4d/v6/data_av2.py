@@ -23,6 +23,7 @@ Every random decision has its own stream: Generator(PCG64(SeedSequence([seed, in
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections import OrderedDict
@@ -50,6 +51,7 @@ PURPOSE_CAMERA_PICK = 2
 PURPOSE_DEPTH_SPLIT = 3
 
 INPUT_DEPTH_FRACTION = 0.8
+PACK_INFO = 'pack.json'  # written by pack_av2.py at the root of a packed split
 MIN_DEPTH = 0.1          # m, camera z
 MAX_SYNC_DT = 0.06       # s, frame-t image vs lidar sweep
 _POSE_COLS = ['qw', 'qx', 'qy', 'qz', 'tx_m', 'ty_m', 'tz_m']
@@ -198,9 +200,21 @@ def _list_ts(directory, suffix):
     return np.sort(np.array([int(n[:-len(suffix)]) for n in names if n.endswith(suffix)], dtype=np.int64))
 
 
+def keep_share(log_ids, fraction):
+    """The first ceil(fraction * N) of the sorted log ids under a fixed permutation, in sorted order."""
+    log_ids = sorted(log_ids)
+    if fraction >= 1:
+        return log_ids
+    order = np.random.default_rng(20261019).permutation(len(log_ids))
+    keep = set(order[:math.ceil(fraction * len(log_ids))].tolist())
+    return [n for i, n in enumerate(log_ids) if i in keep]
+
+
 class Av2ClipDataset(torch.utils.data.Dataset):
     def __init__(self, root, split, cfg, steps=6, step_dt=0.5, tube_dt=0.1, cameras='all', min_multi_cam=0.2,
-                 seed=0, max_boxes=64, clip_stride=None, uint8_images=False):
+                 seed=0, max_boxes=64, clip_stride=None, uint8_images=False, log_fraction=1.0):
+        """log_fraction < 1 keeps that share of the logs, chosen by a fixed permutation of the sorted log ids, so
+        a smaller share is always a subset of a larger one (for data-scaling runs)."""
         self.dir = Path(root) / split if split else Path(root)
         self.cfg, self.steps, self.step_dt, self.tube_dt = cfg, int(steps), float(step_dt), float(tube_dt)
         self.cameras, self.min_multi_cam = cameras, float(min_multi_cam)
@@ -209,8 +223,8 @@ class Av2ClipDataset(torch.utils.data.Dataset):
         self.frames = cfg.tubelet
         self.log_ids, self.lidar_ts, self.index = [], [], []
         self._meta, self._boxes = {}, OrderedDict()
-        for log_id in sorted(os.listdir(self.dir)):
-            ts = _list_ts(self.dir / log_id / 'sensors' / 'lidar', '.feather')
+        for log_id in keep_share(self._list_logs(), log_fraction):
+            ts = self._lidar_times(self.dir / log_id)
             if len(ts) < max(self.steps, 2):
                 continue
             li = len(self.log_ids)
@@ -230,6 +244,60 @@ class Av2ClipDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.index)
 
+    # file access: everything read from disk goes through these (PackedAv2ClipDataset reads a packed copy)
+
+    def _list_logs(self):
+        return sorted(os.listdir(self.dir))
+
+    def _lidar_times(self, log):
+        return _list_ts(log / 'sensors' / 'lidar', '.feather')
+
+    def _camera_times(self, log, cam):
+        return _list_ts(log / 'sensors' / 'cameras' / cam, '.jpg')
+
+    def _has_camera(self, log, cam):
+        return (log / 'sensors' / 'cameras' / cam).is_dir()
+
+    def _table(self, path, columns=None):
+        """A .feather table as {column: numpy array}, or None when the file is absent."""
+        return _read(path, columns) if path.exists() else None
+
+    def _image(self, log, cam, ts):
+        """uint8 [H,W,3] and the (s, x0, y0) crop that maps source pixels to it."""
+        return load_image(log / 'sensors' / 'cameras' / cam / f'{ts}.jpg', self.cfg.image_height, self.cfg.image_width)
+
+    def _lidar_in_camera(self, log, lidar_t, cam, cam_T_lidar, k, cache):
+        """Sweep lidar_t in camera cam: (flat pixel index, z) of the nearest point per pixel. cache: per sweep."""
+        if 'pts' not in cache:
+            p = _read(log / 'sensors' / 'lidar' / f'{lidar_t}.feather', ['x', 'y', 'z'])
+            cache['pts'] = np.stack([p['x'], p['y'], p['z']], -1).astype(np.float64)   # stored as float16
+        pts = cache['pts']
+        return zbuffer(pts @ cam_T_lidar[:3, :3].T + cam_T_lidar[:3, 3], k, self.cfg.image_height,
+                       self.cfg.image_width)
+
+    # frame choice, shared with pack_av2.py
+
+    def _camera_frames(self, meta, cam, lidar_t):
+        """Camera timestamps of the tube for sweep lidar_t, oldest first (the last one is nearest the sweep),
+        or None when no frame is within MAX_SYNC_DT."""
+        cts = meta['cam_ts'][cam]
+        if not len(cts):
+            return None
+        cur = int(_nearest(cts, np.array([lidar_t]))[0]) if len(cts) > 1 else 0
+        if abs(cts[cur] - lidar_t) > MAX_SYNC_DT * 1e9:
+            return None
+        idx = [cur]
+        for f in range(1, self.frames):                               # earlier tube frames, strictly older
+            j = int(_nearest(cts, np.array([cts[cur] - f * self.tube_dt * 1e9]))[0]) if len(cts) > 1 else 0
+            j = min(j, idx[-1] - 1)
+            idx.append(j if j >= 0 else idx[-1])
+        return [int(cts[j]) for j in idx[::-1]]
+
+    def _cam_T_lidar(self, meta, cam, cam_t, city_T_ego):
+        """Camera (at its capture time cam_t) <- ego at the sweep (city_T_ego): ego-motion compensated."""
+        ego_cam_T_city = _se3_inv(_se3(*self._pose(meta, np.array([cam_t], dtype=np.int64)))[0])
+        return _se3_inv(meta['ego_T_cam'][cam]) @ ego_cam_T_city @ city_T_ego
+
     # per-log caches
 
     def _log_meta(self, li):
@@ -237,8 +305,8 @@ class Av2ClipDataset(torch.utils.data.Dataset):
         if meta is not None:
             return meta
         log = self.dir / self.log_ids[li]
-        intr = _read(log / 'calibration' / 'intrinsics.feather')
-        extr = _read(log / 'calibration' / 'egovehicle_SE3_sensor.feather')
+        intr = self._table(log / 'calibration' / 'intrinsics.feather')
+        extr = self._table(log / 'calibration' / 'egovehicle_SE3_sensor.feather')
         ego_T_cam = {str(n): _se3(np.array([extr[c][i] for c in _POSE_COLS[:4]], dtype=np.float64),
                                   np.array([extr[c][i] for c in _POSE_COLS[4:]], dtype=np.float64))
                      for i, n in enumerate(extr['sensor_name'])}
@@ -246,11 +314,11 @@ class Av2ClipDataset(torch.utils.data.Dataset):
         for i, n in enumerate(intr['sensor_name']):
             k[str(n)] = np.array([[intr['fx_px'][i], 0, intr['cx_px'][i]], [0, intr['fy_px'][i], intr['cy_px'][i]],
                                   [0, 0, 1]], dtype=np.float64)
-        cams = [c for c in RING_CAMERAS if c in k and c in ego_T_cam and (log / 'sensors' / 'cameras' / c).is_dir()]
-        pose = _read(log / 'city_SE3_egovehicle.feather')
+        cams = [c for c in RING_CAMERAS if c in k and c in ego_T_cam and self._has_camera(log, c)]
+        pose = self._table(log / 'city_SE3_egovehicle.feather')
         order = np.argsort(pose['timestamp_ns'])
         meta = dict(cams=cams, k=k, ego_T_cam=ego_T_cam,
-                    cam_ts={c: _list_ts(log / 'sensors' / 'cameras' / c, '.jpg') for c in cams},
+                    cam_ts={c: self._camera_times(log, c) for c in cams},
                     pose_ts=pose['timestamp_ns'][order].astype(np.int64),
                     pose_q=np.stack([pose[c] for c in _POSE_COLS[:4]], -1)[order].astype(np.float64),
                     pose_t=np.stack([pose[c] for c in _POSE_COLS[4:]], -1)[order].astype(np.float64))
@@ -261,10 +329,9 @@ class Av2ClipDataset(torch.utils.data.Dataset):
         if li in self._boxes:
             self._boxes.move_to_end(li)
             return self._boxes[li]
-        path = self.dir / self.log_ids[li] / 'annotations.feather'
+        a = self._table(self.dir / self.log_ids[li] / 'annotations.feather', _BOX_COLS)
         boxes = None
-        if path.exists():
-            a = _read(path, _BOX_COLS)
+        if a is not None:
             ts = a['timestamp_ns'].astype(np.int64)
             order = np.argsort(ts, kind='stable')
             uniq, start = np.unique(ts[order], return_index=True)
@@ -322,37 +389,23 @@ class Av2ClipDataset(torch.utils.data.Dataset):
         tube_dt = np.zeros(T)
 
         for s in range(T):
-            pts = None
-            dts = []
+            sweep, dts = {}, []
             for v, cam in enumerate(cams):
                 key = CAMERA_KEY[cam]
                 camera_key[s, v] = key
                 cam_to_rig[s, v] = meta['ego_T_cam'][cam]
-                cts = meta['cam_ts'][cam]
-                if not len(cts):
+                frames = self._camera_frames(meta, cam, lidar_ts[s])
+                if frames is None:
                     continue
-                cur = int(_nearest(cts, np.array([lidar_ts[s]]))[0]) if len(cts) > 1 else 0
-                if abs(cts[cur] - lidar_ts[s]) > MAX_SYNC_DT * 1e9:
-                    continue
-                idx = [cur]
-                for f in range(1, F):                                     # earlier tube frames, strictly older
-                    j = int(_nearest(cts, np.array([cts[cur] - f * self.tube_dt * 1e9]))[0]) if len(cts) > 1 else 0
-                    j = min(j, idx[-1] - 1)
-                    idx.append(j if j >= 0 else idx[-1])
-                idx = idx[::-1]
-                for f, j in enumerate(idx):
-                    images[s, v, f], crop = load_image(log / 'sensors' / 'cameras' / cam / f'{cts[j]}.jpg', H, W)
+                for f, ts in enumerate(frames):
+                    images[s, v, f], crop = self._image(log, cam, ts)
                 k = adjust_intrinsics(meta['k'][cam], *crop)
                 intrinsics[s, v] = k
                 camera_valid[s, v] = True
-                dts.append((cts[idx[-1]] - cts[idx[0]]) * 1e-9 / max(F - 1, 1))
+                dts.append((frames[-1] - frames[0]) * 1e-9 / max(F - 1, 1))
                 # lidar -> camera at its capture time (ego-motion compensated)
-                if pts is None:
-                    p = _read(log / 'sensors' / 'lidar' / f'{lidar_ts[s]}.feather', ['x', 'y', 'z'])
-                    pts = np.stack([p['x'], p['y'], p['z']], -1).astype(np.float64)   # stored as float16
-                ego_cam_T_city = _se3_inv(_se3(*self._pose(meta, cts[cur:cur + 1]))[0])
-                cam_T_lidar = _se3_inv(meta['ego_T_cam'][cam]) @ ego_cam_T_city @ city_T_ego[s]
-                flat, z = zbuffer(pts @ cam_T_lidar[:3, :3].T + cam_T_lidar[:3, 3], k, H, W)
+                cam_T_lidar = self._cam_T_lidar(meta, cam, frames[-1], city_T_ego[s])
+                flat, z = self._lidar_in_camera(log, int(lidar_ts[s]), cam, cam_T_lidar, k, sweep)
                 inp = rng_for(self.seed, index, PURPOSE_DEPTH_SPLIT, s, key).random(len(flat)) < INPUT_DEPTH_FRACTION
                 depth[s, v, flat[inp]] = z[inp]
                 depth_valid[s, v, flat[inp]] = True
@@ -401,6 +454,61 @@ class Av2ClipDataset(torch.utils.data.Dataset):
                 out['mask'][s, :n] = True
         return {k: torch.from_numpy(v).float() if v.dtype == np.float64 else torch.from_numpy(v)
                 for k, v in out.items()}
+
+
+class PackedAv2ClipDataset(Av2ClipDataset):
+    """A split written by pack_av2.py. It gives the same clips and tensors as Av2ClipDataset on the source split,
+    except that images were re-encoded at the target size. LiDAR is already projected into each camera, tables are
+    .npz, and nothing needs pyarrow. Only the sweeps and frames the source clips use were written."""
+
+    def __init__(self, root, split, cfg, steps=6, step_dt=0.5, tube_dt=0.1, **kw):
+        d = Path(root) / split if split else Path(root)
+        info = json.loads((d / PACK_INFO).read_text())
+        want = dict(image_height=cfg.image_height, image_width=cfg.image_width, tubelet=cfg.tubelet,
+                    steps=int(steps), step_dt=float(step_dt), tube_dt=float(tube_dt))
+        bad = {key: (info.get(key), val) for key, val in want.items() if info.get(key) != val}
+        if bad:
+            raise ValueError(f'{d} was packed for other settings (packed, wanted): {bad}')
+        self.image_ext = info['image_ext']
+        super().__init__(root, split, cfg, steps=steps, step_dt=step_dt, tube_dt=tube_dt, **kw)
+
+    def _list_logs(self):
+        return sorted(n for n in os.listdir(self.dir) if (self.dir / n / 'lidar_ts.npy').exists())
+
+    def _lidar_times(self, log):
+        return np.load(log / 'lidar_ts.npy')
+
+    def _camera_times(self, log, cam):
+        return np.load(log / 'sensors' / 'cameras' / cam / 'ts.npy')
+
+    def _has_camera(self, log, cam):
+        return (log / 'sensors' / 'cameras' / cam / 'ts.npy').exists()
+
+    def _table(self, path, columns=None):
+        path = path.with_suffix('.npz')
+        if not path.exists():
+            return None
+        with np.load(path) as z:
+            return {c: z[c] for c in (columns or z.files)}
+
+    def _image(self, log, cam, ts):
+        from PIL import Image
+        d = log / 'sensors' / 'cameras' / cam
+        with Image.open(d / f'{ts}.{self.image_ext}') as im:
+            img = np.asarray(im.convert('RGB'))
+        return img, tuple(np.load(d / 'crop.npy').tolist())
+
+    def _lidar_in_camera(self, log, lidar_t, cam, cam_T_lidar, k, cache):
+        if 'packed' not in cache:
+            with np.load(log / 'sensors' / 'lidar' / f'{lidar_t}.npz') as z:
+                cache['packed'] = dict(z)
+        return cache['packed'][f'{cam}_flat'].astype(np.int64), cache['packed'][f'{cam}_z']
+
+
+def open_av2(root, split, cfg, **kw):
+    """PackedAv2ClipDataset when root/split was written by pack_av2.py, else Av2ClipDataset."""
+    d = Path(root) / split if split else Path(root)
+    return (PackedAv2ClipDataset if (d / PACK_INFO).exists() else Av2ClipDataset)(root, split, cfg, **kw)
 
 
 def collate_clips(samples):

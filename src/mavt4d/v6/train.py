@@ -36,7 +36,9 @@ BUCKET_ELEMENTS = 1 << 24
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description='Train MAVT v6 on Argoverse 2 Sensor clips.')
-    p.add_argument('--data-root', default=None, help='e.g. ~/data/argoverse2/sensor')
+    p.add_argument('--data-root', default=None, help='e.g. ~/data/argoverse2/sensor, or a pack_av2.py output')
+    p.add_argument('--log-fraction', type=float, default=1.0,
+                   help='train on this share of the logs (nested: a smaller share is a subset of a larger one)')
     p.add_argument('--split', default='train')
     p.add_argument('--steps', type=int, default=6, help='time steps per clip')
     p.add_argument('--step-dt', type=float, default=.5, help='seconds between clip steps')
@@ -299,9 +301,9 @@ def batches(args, cfg, rank, world, device, start=0):
         while True:
             yield synthetic_batch(cfg, args.batch_size, args.steps, args.cameras, args.step_dt, generator=g)
     from torch.utils.data import DataLoader
-    from .data_av2 import Av2ClipDataset, collate_clips
-    dataset = Av2ClipDataset(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps,
-                             step_dt=args.step_dt, cameras=args.cameras, seed=args.seed, uint8_images=True)
+    from .data_av2 import collate_clips, open_av2
+    dataset = open_av2(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps, step_dt=args.step_dt,
+                       cameras=args.cameras, seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
     if len(dataset) == 0:
         raise RuntimeError(f'no clips under {args.data_root}/{args.split}')
     sampler = InfiniteSampler(len(dataset), rank, world, seed=args.seed * 100003 + start)

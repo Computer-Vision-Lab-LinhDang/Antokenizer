@@ -278,3 +278,51 @@ def test_random_camera_counts():
     assert np.mean(np.array(two) >= 2) >= 0.2
     assert choose_cameras(names, 3, 7, 0.2, 0, 0) == names[:3]
     assert choose_cameras(names, 'all', 4, 0.2, 0, 0) == names[:4]
+
+
+def _same(a, b, path=''):
+    if isinstance(a, dict):
+        assert a.keys() == b.keys(), path
+        for key in a:
+            _same(a[key], b[key], f'{path}.{key}')
+    elif torch.is_tensor(a):
+        assert a.dtype == b.dtype and torch.equal(a, b), path
+    else:
+        assert a == b, path
+
+
+def test_packed_split_gives_the_same_clips(av2_root, tmp_path, monkeypatch):
+    from mavt4d.v6.data_av2 import PackedAv2ClipDataset, open_av2
+    from mavt4d.v6.pack_av2 import pack_split
+    kw = dict(steps=3, step_dt=0.2, tube_dt=0.1)
+    assert pack_split(av2_root, 'train', tmp_path / 'png', CFG, workers=1, image_ext='png', **kw)['log_a'] > 0
+    assert pack_split(av2_root, 'train', tmp_path / 'png', CFG, workers=1, image_ext='png', **kw) == {'log_a': 0}
+    raw = _ds(av2_root)
+    want = [raw[i] for i in range(len(raw))]
+    monkeypatch.setattr(data_av2, '_read', lambda *a, **k: (_ for _ in ()).throw(AssertionError('raw read')))
+    packed = open_av2(tmp_path / 'png', 'train', CFG, **kw)
+    assert isinstance(packed, PackedAv2ClipDataset) and len(packed) == len(raw) == 4
+    for (li, j), (li2, j2) in zip(raw.index, packed.index):
+        assert li == li2 and np.array_equal(j, j2)
+    for i, x in enumerate(want):
+        _same(x, packed[i])
+    with pytest.raises(ValueError, match='other settings'):
+        open_av2(tmp_path / 'png', 'train', CFG, steps=4, step_dt=0.2, tube_dt=0.1)
+
+
+def test_packed_jpeg_images_stay_close(av2_root, tmp_path):
+    from mavt4d.v6.data_av2 import open_av2
+    from mavt4d.v6.pack_av2 import pack_split
+    kw = dict(steps=3, step_dt=0.2, tube_dt=0.1)
+    pack_split(av2_root, 'train', tmp_path, CFG, workers=2, **kw)
+    a, b = _ds(av2_root)[2], open_av2(tmp_path, 'train', CFG, **kw)[2]
+    assert torch.equal(a['target_depth'], b['target_depth']) and torch.equal(a['intrinsics'], b['intrinsics'])
+    assert (a['images'] - b['images']).abs().mean() < 2 / 255
+
+
+def test_log_share_is_nested():
+    from mavt4d.v6.data_av2 import keep_share
+    logs = [f'log_{i:03d}' for i in range(40)]
+    quarter, half = keep_share(logs, .25), keep_share(logs, .5)
+    assert len(quarter) == 10 and len(half) == 20 and set(quarter) <= set(half)
+    assert quarter == sorted(quarter) and keep_share(logs, 1.) == logs
