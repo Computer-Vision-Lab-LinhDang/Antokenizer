@@ -134,7 +134,8 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     depth [B,V,H,W] (target depth, camera z), depth_valid [B,V,H,W].
     With world GT boxes and rig (rig_to_world): class-balanced opacity BCE on target-depth rays that cross a
     slot box (others have no density to move), 1 where the LiDAR point lies in a GT box, else 0 (objects are
-    opaque slots; the rest belongs to the background).
+    opaque slots; the rest belongs to the background). Clips without box labels (boxes['labelled'] False) get
+    no such term: an object there is in no box.
     With the scene map on, line of sight on every target-depth ray: compositing mass in front of the LiDAR point,
     plus, where something can put a surface there (seen map cell, GT box), the mass missing around it; depth L1
     then also needs that. Without the map slots alone could only satisfy it wrongly, so it is off.
@@ -182,7 +183,8 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
             seen = model.decoder.scene_gate(state, point) >= GATE_SEEN
         # where the map has no evidence at the LiDAR point (or past it, off the grid) nothing can put a surface
         # there: only free space in front of it is supervised; slots answer for points on objects
-        reach = seen | (out.opacity.detach() > .01 if on is None else on)
+        guess = out.opacity.detach() > .01
+        reach = seen | (guess if on is None else torch.where(boxes['labelled'][:, None], on, guess))
         st, sw = out.sample_t.float(), out.sample_w.float()
         front = torch.where(st < t_ray[..., None] / LOS_RATIO, sw, 0.).sum(-1)
         band = torch.where(st <= t_ray[..., None] * LOS_RATIO, sw, 0.).sum(-1) - front
@@ -199,7 +201,7 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     occ, occ_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
     if boxes is not None:
         with torch.autocast(device_type=idx.device.type, enabled=False):
-            ok = target & model.decoder.slot_hits(state, rays).any(-1)
+            ok = target & model.decoder.slot_hits(state, rays).any(-1) & boxes['labelled'][:, None]
             p = out.opacity.float().clamp(1e-4, 1 - 1e-4)
             bce = -torch.where(on, p.log(), (1 - p).log())
             pos, pos_n = _clip_mean(bce, ok & on)
@@ -284,8 +286,9 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
        teacher paired with a box is matched to it at any distance.
     2. Slots free in the prior and not spawned: their proposal (mean measured anchor, world) is matched
        without a gate to the boxes left over; L1 proposal -> box pulls proposals onto objects.
-    Spawn BCE on slots free in the prior (clips in spawn_mask): 1 if spawned onto a box (step 1), the
-    proposal is within ``gate`` of a left-over box (step 2) or the box teacher routed a box to it, else 0.
+    Spawn BCE on slots free in the prior (clips in spawn_mask with box labels, box_labelled): 1 if spawned onto
+    a box (step 1), the proposal is within ``gate`` of a left-over box (step 2) or the box teacher routed a box
+    to it, else 0. A clip without box labels would only ever say 0.
     3. Box teacher: ownership CE pulls the tokens of each box onto the slot holding or given it (every
        ownership layer); anchor CE pulls each onto its box-grid anchor.
     """
@@ -331,6 +334,8 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
         if meas is not None and prior is not None:
             free = prior.status == FREE
             clips = torch.ones_like(free[:, 0]) if spawn_mask is None else spawn_mask.to(free.device).bool()
+            if 'box_labelled' in targets:
+                clips = clips & targets['box_labelled'].to(free.device).bool()
             prop, prop_ok = _proposal_position(state, meas)
             cand = free & ~allocated & prop_ok & clips[:, None]
             late, _ = match_slots(prop, cand, center, box_ok, math.inf, taken=taken)
@@ -413,11 +418,14 @@ def step_terms(model, state, obs, targets, observed, *, aux=None, rays_per_camer
 
 
 def teacher_boxes(targets: dict):
-    """World GT boxes for the trunk's box teacher, or None when the targets carry no box orientation."""
+    """World GT boxes for the trunk's box teacher, or None when the targets carry no box orientation.
+    labelled [B]: the clip has box labels at all (targets['box_labelled'], default True)."""
     if 'box_quat' not in targets or any(key not in targets for key in BOX_KEYS):
         return None
-    return {'center': targets['box_center'], 'size': targets['box_size'], 'quat': targets['box_quat'],
-            'valid': targets['box_valid']}
+    valid = targets['box_valid']
+    labelled = targets.get('box_labelled')
+    return {'center': targets['box_center'], 'size': targets['box_size'], 'quat': targets['box_quat'], 'valid': valid,
+            'labelled': torch.ones_like(valid[:, 0], dtype=torch.bool) if labelled is None else labelled.bool()}
 
 
 def advance(model, state, obs, observed, boxes=None):

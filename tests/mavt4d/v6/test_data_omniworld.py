@@ -188,7 +188,7 @@ def test_batches_go_through_batch_to_sequence(packed, cfg):
     steps, targets = batch_to_sequence(batch, torch.device('cpu'), heldout=True)
     assert len(steps) == 6 and steps[0].images.shape[:2] == (2, cfg.max_cameras)
     assert 'heldout' not in targets[0]                                     # one camera: nothing to hold out
-    assert not targets[0]['box_valid'].any()
+    assert not targets[0]['box_valid'].any() and not targets[0]['box_labelled'].any()
 
 
 def test_scene_split_by_group_hash(raw_root, tmp_path, cfg):

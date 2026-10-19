@@ -208,6 +208,8 @@ def batch_to_sequence(batch, device, min_box_points=MIN_BOX_POINTS, heldout=Fals
     batch = to_device(batch, device)
     steps, targets = [], []
     boxes = batch.get('boxes')
+    # a clip with no box at any step carries no box labels (OmniWorld): no spawn or opacity negatives from it
+    labelled = None if boxes is None else boxes['mask'].bool().flatten(1).any(1)
     held = pick_heldout(batch['camera_valid'], generator) if heldout else None
     for s in range(batch['t'].shape[1]):
         obs = observation(batch, s)
@@ -225,7 +227,7 @@ def batch_to_sequence(batch, device, min_box_points=MIN_BOX_POINTS, heldout=Fals
             if 'track' in boxes:
                 tg['box_velocity'], tg['box_velocity_valid'] = box_velocity(boxes, batch['t'], s)
             tg.update(box_center=boxes['center'][:, s], box_size=boxes['size'][:, s], box_quat=boxes['quaternion'][:, s],
-                      box_class=boxes['category'][:, s],
+                      box_class=boxes['category'][:, s], box_labelled=labelled,
                       box_valid=boxes['mask'][:, s].bool() & (boxes['num_interior_pts'][:, s] >= min_box_points))
         targets.append(tg)
     return steps, targets

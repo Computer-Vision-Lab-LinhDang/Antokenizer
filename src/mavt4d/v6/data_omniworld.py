@@ -20,7 +20,8 @@ max_cameras. The rig is the camera with its axes renamed to the ego convention (
 ponytail: the rig follows the camera's pitch and roll, so world z (up for the BEV scene map) is the first frame's
 camera up, not gravity; a tilted first frame tilts the map. Upgrade: a gravity estimate per clip.
 Dense depth: its valid pixels split 80/20 into input and target, like the LiDAR points. No 3D boxes: an empty table
-of max_boxes rows (mask False), so the box teacher and the slot losses stay off.
+of max_boxes rows (mask False): the box teacher never routes, and the clip counts as unlabelled
+(train.batch_to_sequence box_labelled), so its slots get no spawn or opacity negatives.
 """
 from __future__ import annotations
 

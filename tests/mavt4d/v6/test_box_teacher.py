@@ -1,10 +1,11 @@
 import math
 
+import pytest
 import torch
 
 from mavt4d.v6.config import V6Config
 from mavt4d.v6.contracts import FREE
-from mavt4d.v6.losses import advance, step_terms, teacher_boxes
+from mavt4d.v6.losses import DEFAULT_WEIGHTS, advance, sequence_loss, step_terms, teacher_boxes
 from mavt4d.v6.model import V6Model
 from mavt4d.v6.train import batch_to_sequence, synthetic_batch
 
@@ -85,3 +86,31 @@ def test_points_in_boxes_uses_box_yaw():
     pts = torch.tensor([[[10 + 1.4, 1.4, 0.], [10 + 1.4, -1.4, 0.], [10., 0., 0.]]])
     got = points_in_boxes(pts, boxes, torch.eye(3)[None], torch.zeros(1, 3))
     assert got.tolist() == [[True, False, True]]
+
+
+def test_unlabelled_clips_give_no_spawn_or_opacity_negatives():
+    # a clip with no box at any step (OmniWorld) would only ever say "nothing to spawn, nothing opaque"
+    cfg = V6Config(**TINY)
+    weights = {'spawn': 1., 'recon_occ': 1., 'pred_occ': 1.}
+
+    def run(batch, labelled=None):
+        torch.manual_seed(0)
+        model = V6Model(cfg).train()
+        steps, targets = batch_to_sequence(batch, torch.device('cpu'))
+        if labelled is not None:
+            for tg in targets:
+                tg['box_labelled'] = labelled
+        torch.manual_seed(1)
+        loss, log = sequence_loss(model, steps, targets, seeds=[3, 3], rays_per_camera=16,
+                                  weights={k: weights.get(k, 0.) for k in DEFAULT_WEIGHTS})
+        return float(loss.detach()), targets[0]['box_labelled']
+
+    batch = synthetic_batch(cfg, 2, 3, 2, generator=torch.Generator().manual_seed(0))
+    batch['boxes']['mask'][1] = False
+    other = {**batch, 'images': batch['images'].clone()}
+    other['images'][1] = torch.rand_like(other['images'][1].float())
+    base, labelled = run(batch)
+    assert labelled.tolist() == [True, False]
+    assert run(other)[0] == pytest.approx(base, abs=1e-6)        # clip 1 does not enter these terms
+    forced = torch.tensor([True, True])
+    assert run(other, forced)[0] != pytest.approx(run(batch, forced)[0], abs=1e-6)  # before: it did
