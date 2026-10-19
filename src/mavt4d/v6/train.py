@@ -5,8 +5,9 @@
     PYTHONPATH=src torchrun --nproc_per_node 8 -m mavt4d.v6.train ...
     PYTHONPATH=src python -m mavt4d.v6.train --dry-run --max-steps 2      # synthetic batch, no dataset
 
-Gradients are all-reduced by hand after the truncated-BPTT chunks (each chunk is backpropagated
-right away), so unused modules and multiple backward passes per step need no DDP special cases.
+Gradients are all-reduced by hand once per optimizer step, after the truncated-BPTT chunks of all --accum
+micro-batches (each chunk is backpropagated right away), so unused modules and multiple backward passes per step
+need no DDP special cases.
 """
 from __future__ import annotations
 
@@ -40,9 +41,13 @@ def parse_args(argv=None):
     p.add_argument('--log-fraction', type=float, default=1.0,
                    help='train on this share of the logs (nested: a smaller share is a subset of a larger one)')
     p.add_argument('--split', default='train')
+    p.add_argument('--overfit-clips', type=int, default=0,
+                   help='overfit check: train only on the N clips evaluate.py --clips N scores (same --split, '
+                        '--log-fraction, --steps, --step-dt); 0: all clips')
     p.add_argument('--steps', type=int, default=6, help='time steps per clip')
     p.add_argument('--step-dt', type=float, default=.5, help='seconds between clip steps')
-    p.add_argument('--batch-size', type=int, default=2, help='clips per process')
+    p.add_argument('--batch-size', type=int, default=2, help='clips per process and micro-batch')
+    p.add_argument('--accum', type=int, default=1, help='micro-batches per optimizer step (gradient accumulation)')
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--min-lr-ratio', type=float, default=.1)
     p.add_argument('--warmup', type=int, default=1000)
@@ -91,6 +96,8 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if not args.dry_run and not args.data_root:
         p.error('--data-root is required unless --dry-run')
+    if args.accum < 1:
+        p.error('--accum must be >= 1')
     c = str(args.cameras)
     args.cameras = int(c) if c.isdigit() else c
     return args
@@ -143,13 +150,20 @@ def allreduce_grads(params, world):
             bucket, size = [], 0
 
 
+def average_logs(logs):
+    """Per-key mean over log dicts; a key counts where present."""
+    if len(logs) == 1:
+        return logs[0]
+    keys = set().union(*logs)
+    return {k: sum(g[k] for g in logs if k in g) / sum(k in g for g in logs) for k in sorted(keys)}
+
+
 def mean_logs(log, world):
     if world == 1:
         return log
     gathered = [None] * world
     dist.all_gather_object(gathered, log)
-    keys = set().union(*gathered)
-    return {k: sum(g[k] for g in gathered if k in g) / sum(k in g for g in gathered) for k in sorted(keys)}
+    return average_logs(gathered)
 
 
 # ---------------------------------------------------------------- data
@@ -226,12 +240,13 @@ def box_velocity(boxes, t, s):
     return (boxes['center'][:, s].float() - other) / dt, same.any(-1)
 
 
-def clip_seeds(batch, base_seed, step, rank):
+def clip_seeds(batch, base_seed, step, rank, offset=0):
+    """offset: clips of this rank's earlier micro-batches in the step (synthetic clips are seeded by position)."""
     logs = batch.get('log_id')
     ts = batch.get('timestamp_ns')
     n = batch['t'].shape[0]
     if logs is None or ts is None:
-        return [f'{base_seed}:{step}:{rank}:{i}' for i in range(n)]
+        return [f'{base_seed}:{step}:{rank}:{offset + i}' for i in range(n)]
     return [f'{base_seed}:{step}:{logs[i]}:{int(ts[i, 0])}' for i in range(n)]
 
 
@@ -300,12 +315,15 @@ def batches(args, cfg, rank, world, device, start=0):
         g = torch.Generator().manual_seed(args.seed * 1000 + rank)
         while True:
             yield synthetic_batch(cfg, args.batch_size, args.steps, args.cameras, args.step_dt, generator=g)
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
     from .data_av2 import collate_clips, open_av2
     dataset = open_av2(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps, step_dt=args.step_dt,
                        cameras=args.cameras, seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
-    if len(dataset) == 0:
-        raise RuntimeError(f'no clips under {args.data_root}/{args.split}')
+    if args.overfit_clips > 0:
+        from .evaluate import pick_clips  # evaluate imports this module
+        dataset = Subset(dataset, pick_clips(len(dataset), args.overfit_clips))
+    if len(dataset) < world:  # a rank with no share would wait forever
+        raise RuntimeError(f'{len(dataset)} clips under {args.data_root}/{args.split} for {world} ranks')
     sampler = InfiniteSampler(len(dataset), rank, world, seed=args.seed * 100003 + start)
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers,
                         collate_fn=collate_clips, drop_last=True, pin_memory=device.type == 'cuda',
@@ -447,7 +465,7 @@ def main(argv=None):
 
     def backward(loss):
         if loss.requires_grad:
-            loss.backward()
+            (loss / args.accum).backward()
 
     terminated = []
     on_term = signal.signal(signal.SIGTERM, lambda *_: terminated.append(True))
@@ -458,18 +476,23 @@ def main(argv=None):
     worst_step, worst_save = 0., 60.  # a 4 GB save is assumed to take a minute until one is timed
     while step < args.max_steps:
         t0 = time.time()
-        batch = next(data)
-        t_data = time.time() - t0
-        steps, targets = batch_to_sequence(batch, device, heldout=args.heldout)
-        seeds = clip_seeds(batch, args.seed, step, rank)
         lr = lr_at(step, args)
         for group in opt.param_groups:
             group['lr'] = lr * group.get('lr_mult', 1.)
         opt.zero_grad(set_to_none=True)
-        _, log = sequence_loss(model, steps, targets, seeds=seeds, weights=weights,
-                               rays_per_camera=args.rays_per_camera, bptt=args.bptt, backward=backward,
-                               autocast=autocast, gate=args.match_gate, box_teacher=args.box_teacher,
-                               teacher_p=teacher_at(step, args))
+        t_data, logs = 0., []
+        for micro in range(args.accum):  # gradients add up; backward() scales each loss by 1 / accum
+            t1 = time.time()
+            batch = next(data)
+            t_data += time.time() - t1
+            steps, targets = batch_to_sequence(batch, device, heldout=args.heldout)
+            seeds = clip_seeds(batch, args.seed, step, rank, offset=micro * args.batch_size)
+            _, log = sequence_loss(model, steps, targets, seeds=seeds, weights=weights,
+                                   rays_per_camera=args.rays_per_camera, bptt=args.bptt, backward=backward,
+                                   autocast=autocast, gate=args.match_gate, box_teacher=args.box_teacher,
+                                   teacher_p=teacher_at(step, args))
+            logs.append(log)
+        log = average_logs(logs)
         allreduce_grads(params, world)
         gnorm = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
         if math.isfinite(gnorm):

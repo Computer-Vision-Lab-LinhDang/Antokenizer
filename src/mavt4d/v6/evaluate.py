@@ -21,6 +21,13 @@ within 2 m at the last observed step, with no gate, next to the hold-last baseli
 slots. The miss_* metrics say, on observed steps, why GT boxes got no slot within 2 m: no evidence token in the box,
 or the free slot owning most of the box's tokens stayed under the spawn threshold, had too few valid anchors, or
 spawned more than 2 m away.
+
+Sanity baselines on the input cameras' sampled pixels at rolled-out steps (NaN on observed ones): in_*_copy scores the
+last observed frame of the same camera. On the pixels with target LiDAR that land in that frame, in_psnr_warp warps it
+with that depth and the metadata poses (an upper bound for a static scene with perfect depth and known ego motion), next
+to the plain copy (in_psnr_copy_lidar) and the model (in_psnr_lidar). held_seen_now / held_seen_any: share of the
+held-out camera's LiDAR points on its grid inside an input camera's image at the same step / at any observed step so
+far, with no occlusion test (an upper bound on what the input could have shown).
 """
 from __future__ import annotations
 
@@ -46,10 +53,11 @@ from .model import V6Model
 from .train import batch_to_sequence, setup_distributed, synthetic_batch
 
 GATES = (2., 4.)            # m, slot-box match radius for precision / recall; errors use the larger one
-HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'in_psnr', 'held_depth_cov', 'held_absrel',
-            'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50', 'held_absrel50_near',
-            'held_absrel50_mid', 'held_absrel50_far', 'obj_opacity', 'bg_opacity', 'opacity_auc', 'slots', 'boxes',
-            'precision_2m', 'recall_2m', 'precision_4m', 'recall_4m', 'center_err', 'center_err_hold',
+HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'held_seen_now', 'held_seen_any', 'in_psnr', 'in_psnr_copy',
+            'in_l1', 'in_l1_copy', 'in_psnr_lidar', 'in_psnr_copy_lidar', 'in_psnr_warp', 'held_depth_cov',
+            'held_absrel', 'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50',
+            'held_absrel50_near', 'held_absrel50_mid', 'held_absrel50_far', 'obj_opacity', 'bg_opacity', 'opacity_auc',
+            'slots', 'boxes', 'precision_2m', 'recall_2m', 'precision_4m', 'recall_4m', 'center_err', 'center_err_hold',
             'vel_err', 'vel_err_zero', 'fc_err', 'fc_err_hold', 'fc_vel_err', 'fc_vel_zero', 'id_kept', 'class_acc',
             'miss_boxes', 'miss_no_tokens', 'miss_low_p', 'miss_few_anchors', 'miss_spawned_off', 'miss_trash',
             'miss_focus', 'rig_t_err', 'rig_r_deg', 'loss_terms')
@@ -61,6 +69,8 @@ def parse_args(argv=None):
     p.add_argument('--backbone-weights', default=None, help='with no checkpoint: pretrained encoder weights')
     p.add_argument('--data-root', default=None)
     p.add_argument('--split', default='val')
+    p.add_argument('--log-fraction', type=float, default=1.0,
+                   help="this share of the logs, picked as train.py's (e.g. the clips a tiny overfit run trained on)")
     p.add_argument('--clips', type=int, default=256, help='evenly spaced over the split (0: all)')
     p.add_argument('--steps', type=int, default=6)
     p.add_argument('--step-dt', type=float, default=.5)
@@ -115,7 +125,7 @@ def clip_batches(args, cfg, rank, world):
     from torch.utils.data import DataLoader, Subset
     from .data_av2 import collate_clips, open_av2
     ds = open_av2(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps, step_dt=args.step_dt,
-                  cameras='all', seed=args.seed, uint8_images=True)
+                  cameras='all', seed=args.seed, uint8_images=True, log_fraction=args.log_fraction)
     ids = pick_clips(len(ds), args.clips)[rank::world]
     loader = DataLoader(Subset(ds, ids), batch_size=args.batch_size, num_workers=args.num_workers,
                         collate_fn=collate_clips)
@@ -164,18 +174,112 @@ def auc(score, positive, valid):
     return torch.tensor(out, dtype=score.dtype, device=score.device)
 
 
+def _pixels(idx, w):
+    """Flat pixel indices [...] -> (u, v) [..., 2], pixel centres at integers."""
+    return torch.stack(((idx % w).float(), torch.div(idx, w, rounding_mode='floor').float()), -1)
+
+
+def _rgb_at(images, idx):
+    """images [B,V,3,H,W] at flat pixels idx [B,V,R] -> [B,V,R,3]."""
+    b, v = idx.shape[:2]
+    return images.flatten(-2).gather(-1, idx[:, :, None].expand(b, v, 3, idx.shape[-1])).permute(0, 1, 3, 2)
+
+
+def camera_matrices(cams):
+    """Intrinsics [B,V,3,3] and cam_to_rig [B,V,4,4] of cams, identity for invalid cameras."""
+    ok = cams['camera_valid'].bool()[..., None, None]
+    return (torch.where(ok, cams['intrinsics'].float(), torch.eye(3, device=ok.device)),
+            torch.where(ok, cams['cam_to_rig'].float(), torch.eye(4, device=ok.device)))
+
+
+def unproject(pixels, z, k, c2r, rig=None):
+    """Pixels [B,V,N,2] at camera z [B,V,N] -> points [B,V,N,3] in the rig frame, or in the world with rig
+    (rig_to_world: R [B,3,3], t [B,3]). The inverse of project."""
+    with torch.autocast(device_type=pixels.device.type, enabled=False):
+        uv1 = torch.cat((pixels, torch.ones_like(pixels[..., :1])), -1)
+        p = uv1 @ torch.linalg.inv(k).transpose(-1, -2) * z[..., None]
+        p = p @ c2r[..., :3, :3].transpose(-1, -2) + c2r[..., None, :3, 3]
+        return p if rig is None else p @ rig[0][:, None].transpose(-1, -2) + rig[1][:, None, None]
+
+
+def project(points, k, c2r, rig):
+    """World points [B,V|1,N,3] -> pixels [B,V,N,2] and camera z [B,V,N] in each camera (model.camera_rays
+    conventions; rig: rig_to_world)."""
+    with torch.autocast(device_type=points.device.type, enabled=False):
+        p = (points - rig[1][:, None, None]) @ rig[0][:, None]
+        p = (p - c2r[..., None, :3, 3]) @ c2r[..., :3, :3] @ k.transpose(-1, -2)
+        return p[..., :2] / p[..., 2:].clamp_min(1e-6), p[..., 2]
+
+
+def inside(uv, h, w):
+    """Pixels uv [..., 2] that land on an h x w image (pixel centres at integers, half a pixel of border)."""
+    return ((uv >= -.5) & (uv <= uv.new_tensor([w - .5, h - .5]))).all(-1)
+
+
+def lidar_points(cams, idx, rig):
+    """Pixels idx [B,V,R] of cams with LiDAR depth, lifted to the world (rig: rig_to_world): [B,V,R,3], ok [B,V,R]."""
+    z = cams['depth'].float().flatten(-2).gather(-1, idx)
+    ok = cams['depth_valid'].bool().flatten(-2).gather(-1, idx) & (z > 0) & cams['camera_valid'].bool()[..., None]
+    return unproject(_pixels(idx, cams['depth'].shape[-1]), z, *camera_matrices(cams), rig), ok
+
+
+def warp_last(last, cams, idx, rig):
+    """Oracle-depth warp of the last observed frame to pixels idx [B,V,R] of the same cameras: each pixel with target
+    LiDAR depth is lifted with the target step's camera and rig pose (rig), projected into the camera at the last
+    observed step (last: images, intrinsics, cam_to_rig, camera_valid, rig) and sampled there bilinearly. An upper
+    bound on copying the past for a static scene with perfect depth and known ego motion.
+    -> rgb [B,V,R,3], ok [B,V,R]: LiDAR pixels of cameras valid at both steps that land on the image in front."""
+    images = last['images'].float()
+    b, v, _, h, w = images.shape
+    points, ok = lidar_points(cams, idx, rig)
+    uv, z = project(points, *camera_matrices(last), last['rig'])
+    ok &= inside(uv, h, w) & (z > 0) & last['camera_valid'].bool()[..., None]
+    grid = torch.where(ok[..., None], uv / uv.new_tensor([w - 1, h - 1]) * 2 - 1, 0.)
+    rgb = F.grid_sample(images.flatten(0, 1), grid.flatten(0, 1)[:, None], padding_mode='border', align_corners=True)
+    return rgb[:, :, 0].transpose(1, 2).reshape(b, v, -1, 3), ok
+
+
+COPY_KEYS = ('psnr_copy', 'l1_copy', 'psnr_warp', 'psnr_copy_lidar', 'psnr_lidar')
+
+
+def copy_metrics(last, cams, idx, rig, rgb):
+    """Rolled-out step, pixels idx [B,V,R] of the input cameras: the last observed frame of the same camera as the
+    prediction on every pixel (copy), and on the pixels warp_last keeps: its warp, the copy and the model's render
+    rgb [B,V*R,3] (warp, copy_lidar, lidar). PSNR per camera valid at both steps, then the mean -> [B] each."""
+    images = cams['images'].float()
+    b, v = images.shape[:2]
+    rgb_t, old = _rgb_at(images, idx), _rgb_at(last['images'].float(), idx)
+    warp, ok = warp_last(last, cams, idx, rig)
+    both = cams['camera_valid'].bool() & last['camera_valid'].bool()
+
+    def on_lidar(x):
+        return cmean(psnr(cmean((x - rgb_t).square().mean(-1), ok)), both)
+    return {'psnr_copy': cmean(psnr((old - rgb_t).square().mean((-1, -2))), both),
+            'l1_copy': cmean((old - rgb_t).abs().mean((-1, -2)), both), 'psnr_warp': on_lidar(warp),
+            'psnr_copy_lidar': on_lidar(old), 'psnr_lidar': on_lidar(rgb.float().clamp(0, 1).view(b, v, -1, 3))}
+
+
+def seen_by(points, views, h, w, near=.1):
+    """World points [B,N,3] -> [B,N] bool: on the h x w image of a valid camera of some view, more than near metres
+    in front of it (views: intrinsics, cam_to_rig, camera_valid, rig). No occlusion test, so an upper bound."""
+    seen = torch.zeros(points.shape[:2], dtype=torch.bool, device=points.device)
+    for view in views:
+        uv, z = project(points[:, None], *camera_matrices(view), view['rig'])
+        seen |= (inside(uv, h, w) & (z > near) & view['camera_valid'].bool()[..., None]).any(1)
+    return seen
+
+
 def render_metrics(model, state, cams, idx, boxes=None, rig=None):
     """Rendering, depth and opacity metrics [B] on pixels idx [B,V,R] of cams (render_loss layout)."""
     images = cams['images'].float()
     b, v, _, h, w = images.shape
     r = idx.shape[-1]
-    pixels = torch.stack(((idx % w).float(), torch.div(idx, w, rounding_mode='floor').float()), -1)
+    pixels = _pixels(idx, w)
     ok_cam = cams['camera_valid'].bool()
-    k = torch.where(ok_cam[..., None, None], cams['intrinsics'].float(), torch.eye(3, device=idx.device))
-    c2r = torch.where(ok_cam[..., None, None], cams['cam_to_rig'].float(), torch.eye(4, device=idx.device))
+    k, c2r = camera_matrices(cams)
     rays, z_scale = model.camera_rays(state, k, c2r, pixels, return_z_scale=True)
     out = model.render(state, rays)
-    rgb_t = images.flatten(-2).gather(-1, idx[:, :, None].expand(b, v, 3, r)).permute(0, 1, 3, 2)   # [B,V,R,3]
+    rgb_t = _rgb_at(images, idx)                                                                     # [B,V,R,3]
     rgb = out.rgb.float().clamp(0, 1).view(b, v, r, 3)
     mse = (rgb - rgb_t).square().mean((-1, -2))
     mse_const = (rgb_t - rgb_t.mean(2, keepdim=True)).square().mean((-1, -2))
@@ -200,9 +304,7 @@ def render_metrics(model, state, cams, idx, boxes=None, rig=None):
              absrel50_near=cmean(rel, cov50 & (zt < 20)), absrel50_mid=cmean(rel, cov50 & (zt >= 20) & (zt < 40)),
              absrel50_far=cmean(rel, cov50 & (zt >= 40)))
     if boxes is not None:
-        uv1 = torch.cat((pixels, torch.ones_like(pixels[..., :1])), -1)
-        p_cam = uv1 @ torch.linalg.inv(k).transpose(-1, -2) * z_t.view(b, v, r, 1)
-        p_rig = (p_cam @ c2r[..., :3, :3].transpose(-1, -2) + c2r[..., None, :3, 3]).reshape(b, v * r, 3)
+        p_rig = unproject(pixels, z_t.view(b, v, r), k, c2r).reshape(b, v * r, 3)
         on = points_in_boxes(p_rig, boxes, *rig)
         p = out.opacity.float()
         m.update(obj_opacity=cmean(p, lidar & on), bg_opacity=cmean(p, lidar & ~on), opacity_auc=auc(p, on, lidar),
@@ -448,6 +550,8 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
     state = model.initial_state(b, device=device, time=steps[0].t)
     prev = [{} for _ in range(b)]
     last_pos, handoff, records, rows = None, None, [[] for _ in range(b)], []
+    last, past = None, []   # input cameras at the last observed step; their geometry at every observed step
+    nan = torch.full((b,), math.nan, device=device)
     for t in range(n):
         observed = torch.full((b,), t < observe, device=device)
         obs, tg = steps[t], targets[t]
@@ -464,16 +568,24 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
             hh, ww = cams['images'].shape[-2:]
             idx = torch.randint(0, hh * ww, (b, cams['images'].shape[1], args.rays_per_camera), device=device)
             view = render_view(state, obs)   # targets are seen from the camera's actual pose
-            got, _, _ = render_metrics(model, view, cams, idx, boxes, rig)
+            got, out, _ = render_metrics(model, view, cams, idx, boxes, rig)
             m.update({f'in_{k}': v for k, v in got.items()
                       if k in ('psnr', 'psnr_const', 'l1', 'depth_cov', 'absrel', 'depth_cov50', 'absrel50')})
+            now = {'intrinsics': obs.intrinsics, 'cam_to_rig': obs.cam_to_rig, 'camera_valid': obs.camera_valid,
+                   'rig': rig}
+            if t < observe:
+                past.append(now)
+            got = copy_metrics(last, cams, idx, rig, out.rgb) if last is not None else {}
+            m.update({f'in_{k}': got.get(k, nan) for k in COPY_KEYS})
             if 'heldout' in tg:
                 held, has = heldout_view(tg['heldout'])
                 ys = torch.arange(0, hh, args.stride, device=device)
                 xs = torch.arange(0, ww, args.stride, device=device)
                 grid = (ys[:, None] * ww + xs[None]).flatten()
+                points, lidar = lidar_points(held, grid[None, None].expand(b, 1, -1), rig)
+                m['held_seen_now'] = cmean(seen_by(points[:, 0], [now], hh, ww).float(), lidar[:, 0])
+                m['held_seen_any'] = cmean(seen_by(points[:, 0], past, hh, ww).float(), lidar[:, 0])
                 got, out, _ = render_metrics(model, view, held, grid[None, None].expand(b, 1, -1), boxes, rig)
-                nan = torch.full((b,), math.nan, device=device)
                 m.update({f'held_{k}': torch.where(has, v, nan) for k, v in got.items()
                           if not k.startswith(('obj_', 'bg_', 'opacity_'))})
                 m.update({k: v for k, v in got.items() if k.startswith(('obj_', 'bg_', 'opacity_'))})
@@ -495,6 +607,7 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
         if t == observe - 1:
             last_pos = state.position.float().cpu().clone()
             handoff = handoff_tracks(state, tg)
+            last = {**now, 'images': cams['images']}
         loss_terms = sum(DEFAULT_WEIGHTS.get(k, 0.) * float(v) for k, v in terms.items())
         for i in range(b):
             rec = {'clip': ids[i], 'step': t, 'observed': t < observe, 'horizon': max(0, t - observe + 1),
@@ -571,8 +684,8 @@ def main(argv=None):
     if rank == 0:
         records = [json.loads(line) for f in sorted(out_dir.glob('records_rank*.jsonl')) for line in open(f)]
         summary = summarize(records, {'checkpoint': args.checkpoint, 'step': step, 'split': args.split,
-                                      'observe': args.observe, 'steps': args.steps, 'stride': args.stride,
-                                      'box_teacher': args.box_teacher, 'seed': args.seed})
+                                      'log_fraction': args.log_fraction, 'observe': args.observe, 'steps': args.steps,
+                                      'stride': args.stride, 'box_teacher': args.box_teacher, 'seed': args.seed})
         (out_dir / 'summary.json').write_text(json.dumps(summary, indent=1))
         (out_dir / 'summary.md').write_text(summary_markdown(summary))
         print(summary_markdown(summary), flush=True)
