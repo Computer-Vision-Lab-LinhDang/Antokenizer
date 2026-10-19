@@ -92,14 +92,19 @@ def clips_mean(per_clip, count, mask):
     return torch.where(ok, per_clip, 0.).sum() / ok.sum().clamp_min(1)
 
 
-def points_in_boxes(points, boxes: dict, r_wr, t_wr, margin=OCC_MARGIN):
+def points_in_each_box(points, boxes: dict, r_wr, t_wr, margin=OCC_MARGIN):
     """points [B,N,3] rig frame, world boxes {center, size, quat, valid}, rig -> world r_wr [B,3,3], t_wr [B,3]
-    -> [B,N] bool: inside any valid box."""
+    -> [B,N,M] bool: inside valid box m."""
     c_rig = torch.einsum('bji,bmj->bmi', r_wr, boxes['center'].float() - t_wr[:, None])
     r_box = r_wr.transpose(-1, -2)[:, None] @ quat_to_matrix(boxes['quat'].float())
     local = torch.einsum('bmji,bnmj->bnmi', r_box, points[:, :, None] - c_rig[:, None])
     inside = (local.abs() <= boxes['size'].float()[:, None] * .5 + margin).all(-1)
-    return (inside & boxes['valid'].bool()[:, None]).any(-1)
+    return inside & boxes['valid'].bool()[:, None]
+
+
+def points_in_boxes(points, boxes: dict, r_wr, t_wr, margin=OCC_MARGIN):
+    """[B,N] bool: inside any valid box (see points_in_each_box)."""
+    return points_in_each_box(points, boxes, r_wr, t_wr, margin).any(-1)
 
 
 def rig_to_world(state: V6State, obs: Observation):

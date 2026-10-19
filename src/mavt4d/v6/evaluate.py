@@ -14,6 +14,13 @@ next to a constant-median baseline, and on rays that end on a solid surface (mas
 GT boxes (Hungarian on centre distance: precision, recall, centre / extent / velocity error, class accuracy,
 track identity kept across steps, hold-last-position baseline on rolled-out steps); rig pose error; and the
 training loss terms.
+
+center_err_hold is scored on the pairs the model's own prediction matched within 4 m, so it favours the model.
+The fc_* metrics are the fair forecast check: on rolled-out steps, each slot is scored against the GT track it held
+within 2 m at the last observed step, with no gate, next to the hold-last baseline and a zero velocity on the same
+slots. The miss_* metrics say, on observed steps, why GT boxes got no slot within 2 m: no evidence token in the box,
+or the free slot owning most of the box's tokens stayed under the spawn threshold, had too few valid anchors, or
+spawned more than 2 m away.
 """
 from __future__ import annotations
 
@@ -33,8 +40,8 @@ import torch.nn.functional as F
 from .config import V6Config
 from .contracts import FREE
 from .geometry import quat_to_matrix
-from .losses import (DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, render_view, rig_to_world, step_terms,
-                     teacher_boxes)
+from .losses import (DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, points_in_each_box, render_view,
+                     rig_to_world, step_terms, teacher_boxes)
 from .model import V6Model
 from .train import batch_to_sequence, setup_distributed, synthetic_batch
 
@@ -43,7 +50,9 @@ HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'in_psnr', 'held_depth_
             'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50', 'held_absrel50_near',
             'held_absrel50_mid', 'held_absrel50_far', 'obj_opacity', 'bg_opacity', 'opacity_auc', 'slots', 'boxes',
             'precision_2m', 'recall_2m', 'precision_4m', 'recall_4m', 'center_err', 'center_err_hold',
-            'vel_err', 'vel_err_zero', 'id_kept', 'class_acc', 'rig_t_err', 'rig_r_deg', 'loss_terms')
+            'vel_err', 'vel_err_zero', 'fc_err', 'fc_err_hold', 'fc_vel_err', 'fc_vel_zero', 'id_kept', 'class_acc',
+            'miss_boxes', 'miss_no_tokens', 'miss_low_p', 'miss_few_anchors', 'miss_spawned_off', 'miss_trash',
+            'miss_focus', 'rig_t_err', 'rig_r_deg', 'loss_terms')
 
 
 def parse_args(argv=None):
@@ -224,7 +233,6 @@ def slot_metrics(model, state, tg, prev, last_pos=None):
             'id_kept') + tuple(f'{n}_{g:g}m' for g in GATES for n in ('precision', 'recall'))
     rec, nxt = {key: [] for key in keys}, []
     nan = math.nan
-    mean = lambda xs: sum(xs) / len(xs) if xs else nan  # noqa: E731
     for i in range(len(d)):
         di = d[i].masked_fill(~alloc[i, :, None] | ~ok[i, None, :], math.inf)
         n_slot, n_box = int(alloc[i].sum()), int(ok[i].sum())
@@ -261,8 +269,103 @@ def slot_metrics(model, state, tg, prev, last_pos=None):
         nxt.append({tr: (c, u, float(t_now[i])) for tr, (c, u) in here.items()})
         for key, xs in (('center_err', cerr), ('center_err_hold', herr), ('extent_err', xerr), ('class_acc', cacc),
                         ('vel_err', verr), ('vel_err_zero', vzero), ('id_kept', kept)):
-            rec[key].append(mean(xs))
+            rec[key].append(_mean(xs))
     return rec, nxt
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else math.nan
+
+
+def _tracked(tg):
+    center, ok, track = tg['box_center'].float().cpu(), tg['box_valid'].bool().cpu(), tg['box_track'].long().cpu()
+    return center, ok, track
+
+
+def handoff_tracks(state, tg, gate=GATES[0]):
+    """Per clip {slot: GT track} for the allocated slots within gate of a tracked box (Hungarian)."""
+    alloc = (state.status > FREE).cpu()
+    center, ok, track = _tracked(tg)
+    d = torch.cdist(state.position.float().cpu(), center)
+    out = []
+    for i in range(len(d)):
+        di = d[i].masked_fill(~alloc[i, :, None] | ~ok[i, None, :], math.inf)
+        out.append({s: int(track[i, c]) for s, c in _assign(di, gate) if int(track[i, c]) >= 0})
+    return out
+
+
+def forecast_metrics(state, tg, handoff, last_pos, prev):
+    """Rolled-out step: each handed-off slot vs its GT track, with no gate, so the model, hold-last and zero
+    velocity are scored on the same slots. prev: per clip {track: (centre, uid, t)} of the previous step."""
+    center, ok, track = _tracked(tg)
+    pos, vel, t_now = state.position.float().cpu(), state.velocity.float().cpu(), state.t.double().cpu()
+    keys = ('fc_err', 'fc_err_hold', 'fc_vel_err', 'fc_vel_zero')
+    rec = {key: [] for key in keys}
+    for i in range(len(pos)):
+        where = {int(track[i, c]): c for c in torch.nonzero(ok[i]).flatten().tolist() if int(track[i, c]) >= 0}
+        xs = {key: [] for key in keys}
+        for s, tr in handoff[i].items():
+            if tr not in where:
+                continue   # the track has no box at this step
+            c = where[tr]
+            xs['fc_err'].append(float((pos[i, s] - center[i, c]).norm()))
+            xs['fc_err_hold'].append(float((last_pos[i, s] - center[i, c]).norm()))
+            if tr in prev[i] and float(t_now[i] - prev[i][tr][2]) > 0:
+                v_gt = (center[i, c] - prev[i][tr][0]) / float(t_now[i] - prev[i][tr][2])
+                xs['fc_vel_err'].append(float((vel[i, s] - v_gt).norm()))
+                xs['fc_vel_zero'].append(float(v_gt.norm()))
+        for key in keys:
+            rec[key].append(_mean(xs[key]))
+    return rec
+
+
+def spawn_misses(free_before, state, meas, token_valid, tg, rig, threshold, min_anchors, gate=GATES[0]):
+    """Observed step: for each GT box with no allocated slot within gate after the step, the slot free before the
+    step that owns most of the box's evidence tokens, and which spawn gate stopped it. -> per clip lists.
+
+    miss_no_tokens: share of missed boxes with no evidence token inside; of the others: miss_low_p (that slot's
+    spawn probability <= threshold), miss_few_anchors (< min_anchors valid anchors), miss_spawned_off (it spawned,
+    but more than gate away), miss_trash (share of the box's token ownership on trash), miss_focus (share of that
+    slot's total ownership that lies in the box)."""
+    boxes = teacher_boxes(tg)
+    keys = ('miss_boxes', 'miss_no_tokens', 'miss_tokens', 'miss_low_p', 'miss_few_anchors', 'miss_spawned_off',
+            'miss_trash', 'miss_focus', 'miss_best_mass', 'miss_anchors')
+    rec = {key: [] for key in keys}
+    k = state.status.shape[1]
+    alloc = (state.status > FREE).cpu()
+    center, ok, _ = _tracked(tg)
+    near = torch.cdist(state.position.float().cpu(), center).masked_fill(~alloc[:, :, None], math.inf)
+    missed = ok & ~(near < gate).any(1)                                               # [B,M]
+    inside = points_in_each_box(meas.points.float(), boxes, *rig).cpu() & token_valid.cpu()[..., None]
+    own = meas.ownership.float().cpu()                                                # [B,Ne,K+1]
+    p_spawn = torch.sigmoid(meas.spawn_logit.float()).cpu()
+    n_valid = meas.anchor_meas_valid.cpu().sum(-1)
+    free_before = free_before.cpu()
+    for i in range(len(missed)):
+        xs = {key: [] for key in keys}
+        total = own[i, :, :k].sum(0)                                                   # [K]
+        for c in torch.nonzero(missed[i]).flatten().tolist():
+            tok = inside[i, :, c]
+            n_tok = int(tok.sum())
+            xs['miss_no_tokens'].append(float(n_tok == 0))
+            if n_tok == 0:
+                continue
+            xs['miss_tokens'].append(float(n_tok))
+            xs['miss_trash'].append(float(own[i, tok, k].sum()) / n_tok)
+            mass = own[i, tok, :k].sum(0).masked_fill(~free_before[i], -1.)
+            s = int(mass.argmax())
+            if float(mass[s]) < 0:
+                continue   # no free slot left
+            xs['miss_best_mass'].append(float(mass[s]))
+            xs['miss_focus'].append(float(mass[s] / total[s].clamp_min(1e-6)))
+            xs['miss_anchors'].append(float(n_valid[i, s]))
+            xs['miss_low_p'].append(float(p_spawn[i, s] <= threshold))
+            xs['miss_few_anchors'].append(float(n_valid[i, s] < min_anchors))
+            xs['miss_spawned_off'].append(float(alloc[i, s]))
+        rec['miss_boxes'].append(float(missed[i].sum()))
+        for key in keys[1:]:
+            rec[key].append(_mean(xs[key]))
+    return rec
 
 
 def rig_metrics(state, obs):
@@ -344,13 +447,14 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
     observe = min(args.observe, n)
     state = model.initial_state(b, device=device, time=steps[0].t)
     prev = [{} for _ in range(b)]
-    last_pos, records, rows = None, [[] for _ in range(b)], []
+    last_pos, handoff, records, rows = None, None, [[] for _ in range(b)], []
     for t in range(n):
         observed = torch.full((b,), t < observe, device=device)
         obs, tg = steps[t], targets[t]
         torch.manual_seed(args.seed * 104729 + ids[0] * 31 + t)   # sampled rays repeat across checkpoints
         with autocast():
             boxes = teacher_boxes(tg) if args.box_teacher else None
+            free_before = state.status == FREE
             state, aux = advance(model, state, obs, observed, boxes=boxes)
             terms, _ = step_terms(model, state, obs, tg, observed, aux=aux, rays_per_camera=256)
             boxes, rig = teacher_boxes(tg), rig_to_world(state, obs)
@@ -380,9 +484,17 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None):
                 if vis_dir is not None and bool(has[0]):
                     rows.append(picture_row(model, state, held, tg, obs))
             m.update(rig_metrics(state, obs))
+        extra = {}
+        if aux is not None and boxes is not None:
+            extra = spawn_misses(free_before, state, aux['meas'], aux['enc'].valid.flatten(1), tg, rig,
+                                 model.cfg.spawn_threshold, model.lifecycle.spawn_anchors)
+        if t >= observe and handoff is not None:
+            extra = forecast_metrics(state, tg, handoff, last_pos, prev)
         slot, prev = slot_metrics(model, state, tg, prev, last_pos=None if t < observe else last_pos)
+        slot.update(extra)
         if t == observe - 1:
             last_pos = state.position.float().cpu().clone()
+            handoff = handoff_tracks(state, tg)
         loss_terms = sum(DEFAULT_WEIGHTS.get(k, 0.) * float(v) for k, v in terms.items())
         for i in range(b):
             rec = {'clip': ids[i], 'step': t, 'observed': t < observe, 'horizon': max(0, t - observe + 1),
