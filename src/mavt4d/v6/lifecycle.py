@@ -58,16 +58,17 @@ class V6Lifecycle(nn.Module):
         pos_std = st.cov_pv[..., :3, :3].diagonal(dim1=-2, dim2=-1).amax(-1).clamp_min(0).sqrt()
         tent, act = status == TENTATIVE, status == ACTIVE
         promote = tent & seen & (st.seen_streak >= cfg.tentative_steps)
-        drop = (tent & ~seen) | (act & ((miss >= cfg.miss_steps) | (pos_std > self.max_position_std)))
+        # A tentative slot dies on its first miss; out of view or occluded it waits like an active one.
+        drop = (tent & missed) | (act & (miss >= cfg.miss_steps)) | (alloc & (pos_std > self.max_position_std))
         status = torch.where(promote, torch.full_like(status, ACTIVE), status)
         status = torch.where(drop, torch.full_like(status, FREE), status)
         miss = torch.where(drop, torch.zeros_like(miss), miss)
         streak = torch.where(drop, torch.zeros_like(st.seen_streak), st.seen_streak)
 
-        # Spawn: slots free at entry, existence > 0.5 (or routed to a box by the training teacher) and enough
-        # measured anchors.
+        # Spawn: slots free at entry, existence > spawn_threshold (or routed to a box by the training teacher)
+        # and enough measured anchors.
         valid = meas.anchor_meas_valid
-        want = torch.sigmoid(meas.spawn_logit.float()) > .5
+        want = torch.sigmoid(meas.spawn_logit.float()) > cfg.spawn_threshold
         if meas.spawn_forced is not None:
             want = want | meas.spawn_forced
         spawn = (st.status == FREE) & want & (valid.sum(-1) >= self.spawn_anchors)

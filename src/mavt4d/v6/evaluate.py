@@ -63,7 +63,7 @@ def parse_args(argv=None):
     p.add_argument('--threads', type=int, default=0, help='CPU threads (0: torch default)')
     p.add_argument('--seed', type=int, default=17)
     p.add_argument('--device', default=None)
-    p.add_argument('--config', default='{}', help='JSON V6Config overrides when no checkpoint is given')
+    p.add_argument('--config', default='{}', help='JSON V6Config overrides (on top of the checkpoint config)')
     p.add_argument('--dry-run', action='store_true', help='synthetic clips, no dataset')
     p.add_argument('--out', required=True)
     args = p.parse_args(argv)
@@ -75,7 +75,7 @@ def parse_args(argv=None):
 def load_model(args, device):
     if args.checkpoint:
         saved = torch.load(Path(args.checkpoint).expanduser(), map_location='cpu', weights_only=False)
-        model = V6Model(V6Config(**saved['config']))
+        model = V6Model(V6Config(**{**saved['config'], **json.loads(args.config)}))  # e.g. spawn_threshold
         model.load_state_dict(saved['model'])
         return model.to(device).eval(), int(saved.get('step', -1))
     model = V6Model(V6Config(**json.loads(args.config)))

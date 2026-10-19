@@ -149,7 +149,7 @@ class V6Decoder(nn.Module):
             # position std along object axes: diag(R^T Sigma_p R); sampling choice only, no gradient
             cov = state.cov_pv[..., :3, :3].float().detach()
             var = torch.einsum('bkji,bkjl,bkli->bki', rot.detach(), cov, rot.detach())
-            half = half + cfg.box_sigma_inflation * var.clamp_min(0).sqrt()
+            half = half + cfg.box_sigma_inflation * var.clamp_min(0).sqrt().clamp_max(cfg.box_sigma_max)
             return dict(rot=rot, pos=state.position.float(), anchors=anchors, offset=state.offset.float(),
                         centre=(lo + hi) / 2, half=half, alloc=state.allocated)
 

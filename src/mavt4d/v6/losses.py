@@ -27,7 +27,8 @@ DEFAULT_WEIGHTS = {
     'recon_rgb': 1., 'recon_depth': .5, 'recon_occ': .5,
     'pred_rgb': 1., 'pred_depth': .5, 'pred_occ': .5,
     'enc_depth': .1,
-    'slot_pos': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05, 'own_box': .1, 'assign_box': .1,
+    'slot_pos': .1, 'slot_vel': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05,
+    'own_box': .1, 'assign_box': .1,
     'rig': .1,
 }
 BOX_KEYS = ('box_center', 'box_size', 'box_class', 'box_valid')
@@ -236,7 +237,7 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
        ownership layer); anchor CE pulls each onto its box-grid anchor.
     """
     zero = _zero(state.position)
-    terms = {'slot_pos': zero, 'slot_extent': zero, 'slot_class': zero, 'spawn': zero, 'proposal': zero,
+    terms = {'slot_pos': zero, 'slot_vel': zero, 'slot_extent': zero, 'slot_class': zero, 'spawn': zero, 'proposal': zero,
              'own_box': zero, 'assign_box': zero}
     if any(key not in targets for key in BOX_KEYS):
         return terms, {}
@@ -259,6 +260,10 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
         box_s = size.gather(1, idx[..., None].expand(-1, -1, 3))
         box_k = cls.gather(1, idx)
         terms['slot_pos'] = masked_mean((state.position.float() - box_c).abs().sum(-1), hit)
+        if 'box_velocity' in targets:  # world velocity of the box's track from neighbouring steps
+            box_v = targets['box_velocity'].float().gather(1, idx[..., None].expand(-1, -1, 3))
+            v_ok = hit & targets['box_velocity_valid'].bool().gather(1, idx)
+            terms['slot_vel'] = masked_mean((state.velocity.float() - box_v).abs().sum(-1), v_ok)
         canon = state.anchor_canon.float()
         terms['slot_extent'] = masked_mean(((canon.amax(2) - canon.amin(2)) - box_s).abs().sum(-1), hit)
         frozen = replace(state, c_obj=state.c_obj.detach(), anchor_canon=state.anchor_canon.detach())
@@ -365,13 +370,14 @@ def advance(model, state, obs, observed, boxes=None):
 
 
 def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera=256, bptt=3,
-                  backward=None, autocast=None, gate=4., box_teacher=True):
+                  backward=None, autocast=None, gate=4., box_teacher=True, teacher_p=1.):
     """Run one batch of clips. steps: list[Observation] (T), targets: list[dict] (T).
 
     Clip b observes its first S_b steps (S_b from seeds[b]) and is rolled out with predict() after.
     The state is detached every ``bptt`` steps; with ``backward`` (callable on a chunk loss) each chunk
     is backpropagated right away to free its graph. Returns (total loss: tensor if backward is None,
-    else detached), log dict of floats. box_teacher: in training, GT boxes route evidence to free slots.
+    else detached), log dict of floats. box_teacher: in training, GT boxes route evidence to free slots,
+    for each clip with probability teacher_p (drawn from its seed); the other clips spawn on their own.
     """
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
     ctx = autocast or contextlib.nullcontext
@@ -379,11 +385,14 @@ def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera
     device = steps[0].t.device
     counts = observed_counts(seeds, n)
     observed = torch.tensor([[t < s for t in range(n)] for s in counts], device=device)
+    taught = torch.tensor([random.Random(f'v6-teacher:{s}').random() < teacher_p for s in seeds], device=device)
     state = model.initial_state(steps[0].t.shape[0], device=device, time=steps[0].t)
     total, chunk, sums, hits = 0., 0., {}, {}
     for t in range(n):
         with ctx():
-            boxes = teacher_boxes(targets[t]) if box_teacher and model.training else None
+            boxes = teacher_boxes(targets[t]) if box_teacher and model.training and bool(taught.any()) else None
+            if boxes is not None:
+                boxes = {**boxes, 'valid': boxes['valid'].bool() & taught[:, None]}
             state, aux = advance(model, state, steps[t], observed[:, t], boxes=boxes)
             terms, logs = step_terms(model, state, steps[t], targets[t], observed[:, t], aux=aux,
                                      rays_per_camera=rays_per_camera, gate=gate)
@@ -405,4 +414,5 @@ def sequence_loss(model, steps, targets, *, seeds, weights=None, rays_per_camera
     log = dict(zip(keys, values))
     log['loss'] = float(total.detach())
     log['observed_steps'] = sum(counts) / len(counts)
+    log['taught_clips'] = float(taught.float().mean())
     return total, log

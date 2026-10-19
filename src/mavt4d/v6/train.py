@@ -44,6 +44,10 @@ def parse_args(argv=None):
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--min-lr-ratio', type=float, default=.1)
     p.add_argument('--warmup', type=int, default=1000)
+    p.add_argument('--schedule-from', type=int, default=0,
+                   help='step where warmup and cosine start (finetune: the resumed step)')
+    p.add_argument('--backbone-lr-mult', type=float, default=1.,
+                   help='lr factor for the pretrained encoder (patch embed, blocks, norm, prefix tokens)')
     p.add_argument('--weight-decay', type=float, default=.05)
     p.add_argument('--grad-clip', type=float, default=1.)
     p.add_argument('--max-steps', type=int, default=100_000)
@@ -74,6 +78,10 @@ def parse_args(argv=None):
     p.add_argument('--dry-run', action='store_true', help='synthetic random batches, no dataset')
     p.add_argument('--no-box-teacher', dest='box_teacher', action='store_false',
                    help='no GT-box routing of evidence to free slots (default: on while training)')
+    p.add_argument('--teacher-p', type=float, default=1.,
+                   help='share of clips the box teacher routes, reached after --teacher-anneal-steps')
+    p.add_argument('--teacher-anneal-steps', type=int, default=0,
+                   help='steps from --schedule-from over which the teacher share falls from 1 to --teacher-p')
     p.add_argument('--no-heldout', dest='heldout', action='store_false',
                    help='feed every camera (default: hold one camera per clip out as a render target)')
     args = p.parse_args(argv)
@@ -192,11 +200,26 @@ def batch_to_sequence(batch, device, min_box_points=MIN_BOX_POINTS, heldout=Fals
             obs = dataclasses.replace(obs, camera_valid=cam_ok & ~held)
         steps.append(obs)
         if boxes is not None:
+            if 'track' in boxes:
+                tg['box_velocity'], tg['box_velocity_valid'] = box_velocity(boxes, batch['t'], s)
             tg.update(box_center=boxes['center'][:, s], box_size=boxes['size'][:, s], box_quat=boxes['quaternion'][:, s],
                       box_class=boxes['category'][:, s],
                       box_valid=boxes['mask'][:, s].bool() & (boxes['num_interior_pts'][:, s] >= min_box_points))
         targets.append(tg)
     return steps, targets
+
+
+def box_velocity(boxes, t, s):
+    """World velocity [B,M,3] of the boxes at step s from the same track one step back (forward at s=0)."""
+    o = s - 1 if s > 0 else s + 1
+    if o >= t.shape[1]:
+        m = boxes['center'].shape[2]
+        return boxes['center'].new_zeros(t.shape[0], m, 3), torch.zeros(t.shape[0], m, dtype=torch.bool, device=t.device)
+    track, ok = boxes['track'].long(), boxes['mask'].bool() & (boxes['track'] >= 0)
+    same = (track[:, s, :, None] == track[:, o, None, :]) & ok[:, s, :, None] & ok[:, o, None, :]   # [B,M,M]
+    other = same.float() @ boxes['center'][:, o].float()
+    dt = (t[:, s] - t[:, o]).float()[:, None, None]
+    return (boxes['center'][:, s].float() - other) / dt, same.any(-1)
 
 
 def clip_seeds(batch, base_seed, step, rank):
@@ -252,50 +275,74 @@ def synthetic_batch(cfg, batch_size, steps, cameras, step_dt=.5, generator=None,
                 has_metric_depth=torch.ones(b, t, dtype=torch.bool), t=time_s, boxes=boxes)
 
 
-def batches(args, cfg, rank, world, device):
-    """Infinite batch iterator."""
+class InfiniteSampler(torch.utils.data.Sampler):
+    """This rank's share of a fresh permutation per pass, without end: one DataLoader iterator for the whole
+    run, so the prefetch queue never drains at an epoch boundary."""
+
+    def __init__(self, n, rank=0, world=1, seed=0):
+        self.n, self.rank, self.world, self.seed = n, rank, world, seed
+
+    def __iter__(self):
+        per, epoch = self.n // self.world, 0
+        while True:
+            order = torch.randperm(self.n, generator=torch.Generator().manual_seed(self.seed + epoch))
+            yield from order[self.rank * per:(self.rank + 1) * per].tolist()
+            epoch += 1
+
+
+def batches(args, cfg, rank, world, device, start=0):
+    """Infinite batch iterator; start (the resumed step) reseeds the order so a resume sees new clips."""
     if args.dry_run:
         g = torch.Generator().manual_seed(args.seed * 1000 + rank)
         while True:
             yield synthetic_batch(cfg, args.batch_size, args.steps, args.cameras, args.step_dt, generator=g)
-    from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
+    from torch.utils.data import DataLoader
     from .data_av2 import Av2ClipDataset, collate_clips
     dataset = Av2ClipDataset(Path(args.data_root).expanduser(), args.split, cfg, steps=args.steps,
                              step_dt=args.step_dt, cameras=args.cameras, seed=args.seed, uint8_images=True)
     if len(dataset) == 0:
         raise RuntimeError(f'no clips under {args.data_root}/{args.split}')
-    if world > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=args.seed, drop_last=True)
-    else:
-        sampler = RandomSampler(dataset, generator=torch.Generator().manual_seed(args.seed))
+    sampler = InfiniteSampler(len(dataset), rank, world, seed=args.seed * 100003 + start)
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers,
                         collate_fn=collate_clips, drop_last=True, pin_memory=device.type == 'cuda',
                         persistent_workers=args.num_workers > 0,
                         prefetch_factor=2 if args.num_workers > 0 else None)
-    epoch = 0
-    while True:
-        if hasattr(sampler, 'set_epoch'):
-            sampler.set_epoch(epoch)
-        yield from loader
-        epoch += 1
+    yield from loader
 
 
 # ---------------------------------------------------------------- optimisation
 
+PRETRAINED = ('encoder.patch_embed.', 'encoder.blocks.', 'encoder.norm.', 'encoder.cls_token',
+              'encoder.register_tokens', 'encoder.pos_embed')
+NO_DECAY = ('cls_token', 'register_tokens', 'pos_embed')
+
+
 def make_optimizer(model, args):
-    decay, no_decay = [], []
-    for p in model.parameters():
+    """AdamW; the pretrained encoder trains at lr x --backbone-lr-mult; no decay on vectors and prefix tokens."""
+    groups = {}
+    for name, p in model.named_parameters():
         if p.requires_grad:
-            (decay if p.ndim >= 2 else no_decay).append(p)
-    return torch.optim.AdamW([{'params': decay, 'weight_decay': args.weight_decay},
-                              {'params': no_decay, 'weight_decay': 0.}], lr=args.lr, betas=(.9, .95))
+            mult = args.backbone_lr_mult if name.startswith(PRETRAINED) else 1.
+            decay = p.ndim >= 2 and not name.endswith(NO_DECAY)
+            groups.setdefault((mult, decay), []).append(p)
+    return torch.optim.AdamW([{'params': ps, 'lr_mult': mult, 'weight_decay': args.weight_decay if decay else 0.}
+                              for (mult, decay), ps in groups.items()], lr=args.lr, betas=(.9, .95))
 
 
 def lr_at(step, args):
+    step -= args.schedule_from
     if step < args.warmup:
         return args.lr * (step + 1) / args.warmup
-    frac = min(1., (step - args.warmup) / max(1, args.max_steps - args.warmup))
+    frac = min(1., (step - args.warmup) / max(1, args.max_steps - args.schedule_from - args.warmup))
     return args.lr * (args.min_lr_ratio + (1 - args.min_lr_ratio) * .5 * (1 + math.cos(math.pi * frac)))
+
+
+def teacher_at(step, args):
+    """Share of clips the box teacher routes: 1 until --schedule-from, then linear down to --teacher-p."""
+    if not args.teacher_anneal_steps:
+        return args.teacher_p
+    frac = max(0., step - args.schedule_from) / args.teacher_anneal_steps
+    return args.teacher_p if frac >= 1 else 1. + (args.teacher_p - 1.) * frac
 
 
 def save_checkpoint(path, model, opt, step, cfg, args):
@@ -368,7 +415,10 @@ def main(argv=None):
     if resume:
         state = torch.load(Path(resume).expanduser(), map_location='cpu', weights_only=False)
         model.load_state_dict(state['model'])
-        opt.load_state_dict(state['optimizer'])
+        try:
+            opt.load_state_dict(state['optimizer'])
+        except ValueError as err:  # other parameter groups (e.g. new --backbone-lr-mult): fresh moments
+            emit({'event': 'optimizer_reset', 'reason': str(err)})
         step = int(state['step'])
         emit({'event': 'resume', 'path': str(resume), 'step': step})
     broadcast_model(model, world)
@@ -384,7 +434,7 @@ def main(argv=None):
 
     terminated = []
     on_term = signal.signal(signal.SIGTERM, lambda *_: terminated.append(True))
-    data = batches(args, cfg, rank, world, device)
+    data = batches(args, cfg, rank, world, device, start=step)
     model.train()
     skipped = 0
     t_last = time.time()
@@ -397,11 +447,12 @@ def main(argv=None):
         seeds = clip_seeds(batch, args.seed, step, rank)
         lr = lr_at(step, args)
         for group in opt.param_groups:
-            group['lr'] = lr
+            group['lr'] = lr * group.get('lr_mult', 1.)
         opt.zero_grad(set_to_none=True)
         _, log = sequence_loss(model, steps, targets, seeds=seeds, weights=weights,
                                rays_per_camera=args.rays_per_camera, bptt=args.bptt, backward=backward,
-                               autocast=autocast, gate=args.match_gate, box_teacher=args.box_teacher)
+                               autocast=autocast, gate=args.match_gate, box_teacher=args.box_teacher,
+                               teacher_p=teacher_at(step, args))
         allreduce_grads(params, world)
         gnorm = float(torch.nn.utils.clip_grad_norm_(params, args.grad_clip))
         if math.isfinite(gnorm):

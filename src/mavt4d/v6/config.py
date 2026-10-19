@@ -53,10 +53,12 @@ class V6Config:
     event_chi2_99: float = 11.34      # chi2_3 at 0.99, per 3-axis group
     tentative_steps: int = 2
     miss_steps: int = 2
+    spawn_threshold: float = 0.5      # sigmoid(spawn_logit) above this spawns a free slot
     # Decoder
     samples_per_segment: int = 8
     max_slots_per_ray: int = 2
     box_sigma_inflation: float = 2.0
+    box_sigma_max: float = 1.0        # m, cap on the position std that inflates a slot box
     box_soft_margin: float = 0.25
     decoder_width: int = 256
     schema_version: int = 6
