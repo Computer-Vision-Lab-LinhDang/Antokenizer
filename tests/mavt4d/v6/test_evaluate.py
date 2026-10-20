@@ -8,8 +8,8 @@ import torch
 from mavt4d.v6.config import V6Config
 from mavt4d.v6.contracts import ACTIVE, FREE
 from mavt4d.v6.dense import DenseTeacher, sample_features, teacher_features
-from mavt4d.v6.evaluate import (auc, dense_copy_metrics, forecast_metrics, handoff_tracks, main, seen_by, spawn_misses,
-                                warp_last)
+from mavt4d.v6.evaluate import (auc, dense_copy_metrics, forecast_metrics, handoff_tracks, main, masked_psnr, seen_by,
+                                spawn_misses, warp_last)
 from mavt4d.v6.train import main as train_main
 
 TINY = dict(slots=3, trunk_layers=1, encoder_layers=2, image_height=64, image_width=64, anchors=8)
@@ -22,6 +22,15 @@ def test_auc_counts_ties_half():
     pos = torch.tensor([[True, False, True, False], [True, False, False, False]])
     got = auc(score, pos, torch.ones_like(pos))
     assert got.tolist() == [.875, .5]
+
+
+def test_masked_psnr_scores_each_region_and_is_nan_when_empty():
+    target = torch.zeros(1, 4, 3)
+    rgb = torch.tensor([[[.1] * 3, [.1] * 3, [.01] * 3, [.01] * 3]])
+    first = torch.tensor([[True, True, False, False]])
+    got = [masked_psnr(rgb, target, m).item() for m in (first, ~first)]
+    assert got == pytest.approx([20., 40.], abs=1e-4)
+    assert math.isnan(masked_psnr(rgb, target, torch.zeros_like(first)).item())
 
 
 def test_evaluate_checkpoint_dry_run(tmp_path):
@@ -48,6 +57,10 @@ def test_evaluate_checkpoint_dry_run(tmp_path):
     assert all(math.isfinite(r['in_l1_copy']) for r in lines if not r['observed'])
     for key in ('held_seen_now', 'held_seen_any'):
         assert 0 <= groups['observed'][key]['mean'] <= 1 and 0 <= groups['rolled_out'][key]['mean'] <= 1, key
+    # held-out PSNR split by what the input showed and by GT boxes (NaN when a split has no LiDAR pixel)
+    for key in ('held_psnr_seen', 'held_psnr_unseen', 'held_psnr_obj', 'held_psnr_static'):
+        assert all(key in r for r in lines), key
+    assert any(math.isfinite(r['held_psnr_seen']) or math.isfinite(r['held_psnr_unseen']) for r in lines)
 
 
 def _boxes(centers, tracks):

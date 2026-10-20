@@ -27,7 +27,9 @@ last observed frame of the same camera. On the pixels with target LiDAR that lan
 with that depth and the metadata poses (an upper bound for a static scene with perfect depth and known ego motion), next
 to the plain copy (in_psnr_copy_lidar) and the model (in_psnr_lidar). held_seen_now / held_seen_any: share of the
 held-out camera's LiDAR points on its grid inside an input camera's image at the same step / at any observed step so
-far, with no occlusion test (an upper bound on what the input could have shown).
+far, with no occlusion test (an upper bound on what the input could have shown). held_psnr_seen / held_psnr_unseen:
+PSNR pooled over the held-out LiDAR pixels that held_seen_any counts / does not count (what the model could have kept
+vs had to invent); held_psnr_obj / held_psnr_static: over its LiDAR pixels inside / outside a GT box.
 
 Dense features (G3), with a frozen DINOv3 teacher (--dense-teacher; default the checkpoint's when it renders dense
 features): in_dense_cos / held_dense_cos is the cosine of the model's decoded features to the teacher's patch features
@@ -59,7 +61,8 @@ from .model import V6Model, drop_retired
 from .train import batch_to_sequence, setup_distributed, synthetic_batch
 
 GATES = (2., 4.)            # m, slot-box match radius for precision / recall; errors use the larger one
-HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'held_dense_cos', 'held_seen_now', 'held_seen_any', 'in_psnr',
+HEADLINE = ('held_psnr', 'held_psnr_const', 'held_ssim', 'held_dense_cos', 'held_seen_now', 'held_seen_any',
+            'held_psnr_seen', 'held_psnr_unseen', 'held_psnr_obj', 'held_psnr_static', 'in_psnr',
             'in_psnr_copy', 'in_l1', 'in_l1_copy', 'in_psnr_lidar', 'in_psnr_copy_lidar', 'in_psnr_warp',
             'in_dense_cos', 'in_dense_cos_copy', 'in_dense_cos_lidar', 'in_dense_cos_copy_lidar', 'in_dense_cos_warp',
             'held_depth_cov', 'held_absrel', 'held_absrel_const', 'held_delta1', 'held_depth_cov50', 'held_absrel50',
@@ -173,6 +176,11 @@ def cmean(x, m):
 
 def psnr(mse):
     return -10 * torch.log10(mse.clamp_min(1e-10))
+
+
+def masked_psnr(rgb, target, mask):
+    """PSNR [B] of rgb vs target [B,R,3] over the pixels in mask [B,R] pooled per clip (nan where it is empty)."""
+    return psnr(cmean((rgb.float() - target.float()).square().mean(-1), mask))
 
 
 def ssim(x, y):
@@ -375,7 +383,9 @@ def render_metrics(model, state, cams, idx, boxes=None, rig=None):
         on = points_in_boxes(p_rig, boxes, *rig)
         p = out.opacity.float()
         m.update(obj_opacity=cmean(p, lidar & on), bg_opacity=cmean(p, lidar & ~on), opacity_auc=auc(p, on, lidar),
-                 obj_points=(lidar & on).sum(-1).float())
+                 obj_points=(lidar & on).sum(-1).float(),
+                 psnr_obj=masked_psnr(rgb.reshape(b, v * r, 3), rgb_t.reshape(b, v * r, 3), lidar & on),
+                 psnr_static=masked_psnr(rgb.reshape(b, v * r, 3), rgb_t.reshape(b, v * r, 3), lidar & ~on))
     return m, out, z
 
 
@@ -670,8 +680,12 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None, dens
                 grid = (ys[:, None] * ww + xs[None]).flatten()
                 points, lidar = lidar_points(held, grid[None, None].expand(b, 1, -1), rig)
                 m['held_seen_now'] = cmean(seen_by(points[:, 0], [now], hh, ww).float(), lidar[:, 0])
-                m['held_seen_any'] = cmean(seen_by(points[:, 0], past, hh, ww).float(), lidar[:, 0])
+                seen = seen_by(points[:, 0], past, hh, ww)
+                m['held_seen_any'] = cmean(seen.float(), lidar[:, 0])
                 got, out, _ = render_metrics(model, view, held, grid[None, None].expand(b, 1, -1), boxes, rig)
+                rgb_held = _rgb_at(held['images'].float(), grid[None, None].expand(b, 1, -1))[:, 0]
+                for name, mask in (('seen', lidar[:, 0] & seen), ('unseen', lidar[:, 0] & ~seen)):
+                    m[f'held_psnr_{name}'] = torch.where(has, masked_psnr(out.rgb.clamp(0, 1), rgb_held, mask), nan)
                 m.update({f'held_{k}': torch.where(has, v, nan) for k, v in got.items()
                           if not k.startswith(('obj_', 'bg_', 'opacity_'))})
                 if model_dense:
