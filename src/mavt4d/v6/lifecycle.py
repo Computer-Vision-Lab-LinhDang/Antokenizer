@@ -1,5 +1,8 @@
 """Slot lifecycle: spawn into free slots, TENTATIVE -> ACTIVE, retire on expected-visible misses.
 
+Soft slots (cfg.soft_slots): every allocated slot takes the trunk's new existence logit each step; a slot is
+retired when its existence falls below cfg.exist_drop (no miss rule), and free slots spawn above it.
+
 Merge is not implemented yet (chot: merge only when both slots are seen and compete >= 2 steps).
 """
 from dataclasses import replace
@@ -58,8 +61,17 @@ class V6Lifecycle(nn.Module):
         pos_std = st.cov_pv[..., :3, :3].diagonal(dim1=-2, dim2=-1).amax(-1).clamp_min(0).sqrt()
         tent, act = status == TENTATIVE, status == ACTIVE
         promote = tent & seen & (st.seen_streak >= cfg.tentative_steps)
-        # A tentative slot dies on its first miss; out of view or occluded it waits like an active one.
-        drop = (tent & missed) | (act & (miss >= cfg.miss_steps)) | (alloc & (pos_std > self.max_position_std))
+        exist = st.exist_logit
+        if cfg.soft_slots:
+            # existence is the model's call each step (it sees time since last seen); retire below exist_drop
+            exist = torch.where(alloc, meas.spawn_logit.float(), exist)
+            faded = torch.sigmoid(exist) < cfg.exist_drop
+            if meas.spawn_box is not None:  # training: a slot the box teacher holds on a box stays
+                faded = faded & (meas.spawn_box < 0)
+            drop = alloc & (faded | (pos_std > self.max_position_std))
+        else:
+            # A tentative slot dies on its first miss; out of view or occluded it waits like an active one.
+            drop = (tent & missed) | (act & (miss >= cfg.miss_steps)) | (alloc & (pos_std > self.max_position_std))
         status = torch.where(promote, torch.full_like(status, ACTIVE), status)
         status = torch.where(drop, torch.full_like(status, FREE), status)
         miss = torch.where(drop, torch.zeros_like(miss), miss)
@@ -68,11 +80,11 @@ class V6Lifecycle(nn.Module):
         # Spawn: slots free at entry, existence > spawn_threshold (or routed to a box by the training teacher)
         # and enough measured anchors.
         valid = meas.anchor_meas_valid
-        want = torch.sigmoid(meas.spawn_logit.float()) > cfg.spawn_threshold
+        want = torch.sigmoid(meas.spawn_logit.float()) > (cfg.exist_drop if cfg.soft_slots else cfg.spawn_threshold)
         if meas.spawn_forced is not None:
             want = want | meas.spawn_forced
         spawn = (st.status == FREE) & want & (valid.sum(-1) >= self.spawn_anchors)
-        st = replace(st, status=status, miss_streak=miss, seen_streak=streak)
+        st = replace(st, status=status, miss_streak=miss, seen_streak=streak, exist_logit=exist)
         if not bool(spawn.any()):
             return st
         return self._spawn(st, meas, obs, spawn)

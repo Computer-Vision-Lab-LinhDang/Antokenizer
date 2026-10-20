@@ -231,13 +231,13 @@ class V6Trunk(nn.Module):
         return TokenPoints(p_rig, log_z, log_sigma, prob, valid, feats)
 
     @staticmethod
-    def measure_anchors(points: Tensor, weight: Tensor):
+    def measure_anchors(points: Tensor, weight: Tensor, mass_min: float = MEAS_MASS_MIN):
         """points [B,Ne,3] (evidence only), weight [B,Ne,K,A] routing. -> anchor_meas [B,K,A,3], valid, mass."""
         with no_autocast(points):
             w = weight.float()
             mass = w.sum(1)
             meas = torch.einsum('bnka,bnc->bkac', w, points.float()) / mass.clamp_min(1e-6)[..., None]
-            valid = mass >= MEAS_MASS_MIN
+            valid = mass >= mass_min
             return torch.where(valid[..., None], meas, 0.), valid, mass
 
     # ---- token assembly ------------------------------------------------------------------------------------
@@ -539,13 +539,17 @@ class V6Trunk(nn.Module):
             weight = torch.where((spawn_box >= 0)[:, None, :, None], mine[..., None] * hot[:, :, None], weight)
             picked = assign.gather(2, token_slot.clamp_min(0)[:, :, None, None].expand(-1, -1, 1, a)).squeeze(2)
             assign_nll = -picked.gather(-1, token_anchor[..., None]).squeeze(-1).clamp_min(1e-6).log()
-        anchor_meas, meas_valid, mass = self.measure_anchors(points, weight)
+        anchor_meas, meas_valid, mass = self.measure_anchors(points, weight,
+                                                             cfg.soft_mass_min if cfg.soft_slots else MEAS_MASS_MIN)
 
         with no_autocast(points):
             wn = weight / mass.clamp_min(1e-6)[:, None]
             stats = torch.stack((torch.log(mass + 1e-3), torch.einsum('bnka,bn->bka', wn, tp.log_sigma.flatten(1)),
                                  torch.einsum('bnka,bn->bka', wn, enc.measured_valid.flatten(1).float())), -1)
         head = self.anchor_out(F.gelu(self.anchor_tok(neo).view(b, k, a, 32) + self.anchor_stats(stats))).float()
+        log_r = head[..., :3]
+        if cfg.soft_slots:  # an anchor owned by less than one token's mass is a proportionally weaker measurement
+            log_r = log_r - mass.clamp(1e-3, 1).log()[..., None]
         pooled = torch.einsum('bnka,bnc->bkac', wn.to(xe.dtype), xe)
         desc_prop = self.desc_tok(neo).view(b, k, a, -1) + self.desc_ev(pooled)
         aq = self.aff_q(xs[:, :, :c])
@@ -565,7 +569,7 @@ class V6Trunk(nn.Module):
         return TrunkOutput(
             ownership=own, ownership_by_layer=tuple(owns),
             anchor_meas=anchor_meas, anchor_meas_valid=meas_valid,
-            anchor_log_r=_soft_floor(head[..., :3], cfg.log_r_floor),
+            anchor_log_r=_soft_floor(log_r, cfg.log_r_floor),
             visibility=torch.sigmoid(head[..., 3]), depth_conf=torch.sigmoid(head[..., 4]),
             c_obj_prop=self.cobj_out(xs[:, :, :c]).float(), desc_prop=desc_prop.float(),
             h_prop=self.h_out(xs[:, :, -1]).float(), anchor_affinity=affinity,
@@ -574,4 +578,5 @@ class V6Trunk(nn.Module):
             spawn_logit=self.spawn_head(xs[:, :, dp]).float().squeeze(-1),
             spawn_canon=self.canon_head(neo).view(b, k, a, 3).float(),
             camera_rows=rows, spawn_forced=forced, forced_slot=token_slot, spawn_box=spawn_box,
-            assign_nll=assign_nll, points=points.float(), point_log_sigma=tp.log_sigma.flatten(1).float())
+            assign_nll=assign_nll, points=points.float(), point_log_sigma=tp.log_sigma.flatten(1).float(),
+            anchor_mass=mass)

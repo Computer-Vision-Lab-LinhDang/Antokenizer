@@ -166,8 +166,10 @@ class V6Decoder(nn.Module):
             cov = state.cov_pv[..., :3, :3].float().detach()
             var = torch.einsum('bkji,bkjl,bkli->bki', rot.detach(), cov, rot.detach())
             half = half + cfg.box_sigma_inflation * var.clamp_min(0).sqrt().clamp_max(cfg.box_sigma_max)
+            # soft slots: density scales with the slot's existence, so rendering teaches whether it is an object
+            exist = torch.sigmoid(state.exist_logit.float()) if cfg.soft_slots else torch.ones_like(state.exist_logit)
             return dict(rot=rot, pos=state.position.float(), anchors=anchors, offset=state.offset.float(),
-                        centre=(lo + hi) / 2, half=half, alloc=state.allocated)
+                        centre=(lo + hi) / 2, half=half, alloc=state.allocated, exist=exist.float())
 
     def _to_object(self, geo: dict, origin: Tensor, direction: Tensor):
         o = torch.einsum('brkj,bkji->brki', origin[:, :, None] - geo['pos'][:, None], geo['rot'])
@@ -310,7 +312,7 @@ class V6Decoder(nn.Module):
                                  [gather_slots(x_, idx).flatten(0, 2) for x_ in kv])
         bg = self.background(bg_kv, dir_rig)
         with _no_autocast(origin):
-            sigma = sigma.float().reshape(b, r, m, s) * occ * ok[..., None]
+            sigma = sigma.float().reshape(b, r, m, s) * occ * (ok * gather_slots(geo['exist'], idx))[..., None]
             rgb, bg = rgb.float().reshape(b, r, m, s, -1), bg.float()                # colour (+ dense) channels
             t, delta, sigma = t.flatten(-2), delta.flatten(-2), sigma.flatten(-2)
             slot_id = idx[..., None].expand(-1, -1, -1, s).flatten(-2)

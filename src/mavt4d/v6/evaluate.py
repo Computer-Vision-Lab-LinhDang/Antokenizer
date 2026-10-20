@@ -50,7 +50,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .config import V6Config
-from .contracts import FREE
+from .contracts import FREE, present_slots
 from .dense import DenseTeacher, cosine, load_teacher, sample_features, teacher_features
 from .geometry import quat_to_matrix
 from .losses import (DEFAULT_WEIGHTS, _assign, advance, points_in_boxes, points_in_each_box, render_view,
@@ -388,9 +388,14 @@ def heldout_view(cams):
     return {key: pick(val) for key, val in cams.items()}, held.any(1)
 
 
+def _alloc(state, cfg):
+    """[B,K] CPU slots that count: allocated (and, with soft slots, existence >= 0.5)."""
+    return (state.status > FREE if cfg is None else present_slots(state, cfg)).cpu()
+
+
 def slot_metrics(model, state, tg, prev, last_pos=None):
     """Slots vs GT boxes [per clip lists]. prev: per clip {track: (centre, uid, t)} of the previous step."""
-    alloc = (state.status > FREE).cpu()
+    alloc = _alloc(state, model.cfg)
     center, size = tg['box_center'].float().cpu(), tg['box_size'].float().cpu()
     ok, cls, track = tg['box_valid'].bool().cpu(), tg['box_class'].long().cpu(), tg['box_track'].long().cpu()
     pos, vel, uid = state.position.float().cpu(), state.velocity.float().cpu(), state.uid.cpu()
@@ -452,9 +457,9 @@ def _tracked(tg):
     return center, ok, track
 
 
-def handoff_tracks(state, tg, gate=GATES[0]):
+def handoff_tracks(state, tg, gate=GATES[0], cfg=None):
     """Per clip {slot: GT track} for the allocated slots within gate of a tracked box (Hungarian)."""
-    alloc = (state.status > FREE).cpu()
+    alloc = _alloc(state, cfg)
     center, ok, track = _tracked(tg)
     d = torch.cdist(state.position.float().cpu(), center)
     out = []
@@ -489,7 +494,7 @@ def forecast_metrics(state, tg, handoff, last_pos, prev):
     return rec
 
 
-def spawn_misses(free_before, state, meas, token_valid, tg, rig, threshold, min_anchors, gate=GATES[0]):
+def spawn_misses(free_before, state, meas, token_valid, tg, rig, threshold, min_anchors, gate=GATES[0], cfg=None):
     """Observed step: for each GT box with no allocated slot within gate after the step, the slot free before the
     step that owns most of the box's evidence tokens, and which spawn gate stopped it. -> per clip lists.
 
@@ -502,7 +507,7 @@ def spawn_misses(free_before, state, meas, token_valid, tg, rig, threshold, min_
             'miss_trash', 'miss_focus', 'miss_best_mass', 'miss_anchors')
     rec = {key: [] for key in keys}
     k = state.status.shape[1]
-    alloc = (state.status > FREE).cpu()
+    alloc = _alloc(state, cfg)
     center, ok, _ = _tracked(tg)
     near = torch.cdist(state.position.float().cpu(), center).masked_fill(~alloc[:, :, None], math.inf)
     missed = ok & ~(near < gate).any(1)                                               # [B,M]
@@ -554,7 +559,7 @@ def _gray(x, lo, hi):
     return ((x - lo) / (hi - lo)).clamp(0, 1)[None].expand(3, -1, -1)
 
 
-def _bev(state, tg, obs, size=(192, 256), metres_per_px=.25):
+def _bev(state, tg, obs, size=(192, 256), metres_per_px=.25, cfg=None):
     """Top view in the rig frame (forward up): GT boxes green, allocated slots red, ego blue."""
     from PIL import Image, ImageDraw
     h, w = size
@@ -572,7 +577,7 @@ def _bev(state, tg, obs, size=(192, 256), metres_per_px=.25):
         mid = rig(tg['box_center'][0, c].float().cpu())
         corners = [mid + rot @ torch.tensor([sx * half[0], sy * half[1], 0.]) for sx, sy in ((1, 1), (1, -1), (-1, -1), (-1, 1))]
         draw.polygon([to_px(p) for p in corners], outline=(60, 220, 60))
-    alloc = (state.status[0] > FREE).cpu()
+    alloc = _alloc(state, cfg)[0]
     for s in torch.nonzero(alloc).flatten().tolist():
         x, y = to_px(rig(state.position[0, s].float().cpu()))
         draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(230, 60, 60))
@@ -597,7 +602,8 @@ def picture_row(model, state, held, tg, obs):
     rgb = out.rgb[0].float().clamp(0, 1).view(h, w, 3).permute(2, 0, 1).cpu()
     inv = torch.where(z[0] > 0, 1 / z[0].clamp_min(1.), 0.).view(h, w).cpu()
     op = out.opacity[0].float().view(h, w).cpu()
-    bev = _bev(_slice(state, 1), {k: v[:1] for k, v in tg.items() if torch.is_tensor(v)}, _slice(obs, 1), (h, w))
+    bev = _bev(_slice(state, 1), {k: v[:1] for k, v in tg.items() if torch.is_tensor(v)}, _slice(obs, 1), (h, w),
+               cfg=model.cfg)
     return [gt, rgb, _gray(inv, 0., .5), _gray(op, 0., 1.), bev]
 
 
@@ -683,15 +689,17 @@ def evaluate_batch(model, batch, ids, args, device, autocast, vis_dir=None, dens
             m.update(rig_metrics(state, obs))
         extra = {}
         if aux is not None and boxes is not None:
+            cfg = model.cfg
             extra = spawn_misses(free_before, state, aux['meas'], aux['enc'].valid.flatten(1), tg, rig,
-                                 model.cfg.spawn_threshold, model.lifecycle.spawn_anchors)
+                                 cfg.exist_drop if cfg.soft_slots else cfg.spawn_threshold,
+                                 model.lifecycle.spawn_anchors, cfg=cfg)
         if t >= observe and handoff is not None:
             extra = forecast_metrics(state, tg, handoff, last_pos, prev)
         slot, prev = slot_metrics(model, state, tg, prev, last_pos=None if t < observe else last_pos)
         slot.update(extra)
         if t == observe - 1:
             last_pos = state.position.float().cpu().clone()
-            handoff = handoff_tracks(state, tg)
+            handoff = handoff_tracks(state, tg, cfg=model.cfg)
             last = {**now, 'images': cams['images'], 'dense': feats}
         loss_terms = sum(DEFAULT_WEIGHTS.get(k, 0.) * float(v) for k, v in terms.items())
         for i in range(b):

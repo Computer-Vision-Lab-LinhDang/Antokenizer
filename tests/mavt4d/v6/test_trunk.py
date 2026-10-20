@@ -195,9 +195,9 @@ def test_measurements_do_not_depend_on_prior_values():
         captured.append(('points', token_points(*args)))
         return captured[-1][1]
 
-    def meas_hook(points, weight):
+    def meas_hook(points, weight, *rest):
         captured.append(('weight', weight))
-        return measure(points, weight)
+        return measure(points, weight, *rest)
 
     trunk.token_points, trunk.measure_anchors = tp_hook, meas_hook
     # autograd: token points have no path from any state tensor

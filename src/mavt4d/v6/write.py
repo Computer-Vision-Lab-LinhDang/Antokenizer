@@ -4,7 +4,8 @@ D: joint EKF (Joseph form, fp64 core) per slot over [rig pose (6), slot (p, v, t
 cross block; measurements are the weighted anchor centroid (rig frame) and, with >= 3 anchors, the Procrustes
 rotation. The rig itself is updated only from meas.rig_meas and the metadata pose (obs.rig_pose), never from
 slot measurements (no K-fold double counting); its cross terms come from the per-slot joint posterior.
-C_obj: gain lambda/Lambda with a hard evidence mask (no innovation gate). C_evt: phi(nu~) - phi(0). h: mean
+C_obj: gain lambda/Lambda with a hard evidence mask (with soft slots: lambda scaled by ownership mass instead;
+no innovation gate). C_evt: phi(nu~) - phi(0). h: mean
 visibility gain. Unseen slots keep C, Lambda, h, desc and atlas bit-identical. Scene map: same gain rule per
 cell (scene.py), written by write_scene after the lifecycle from token points no allocated slot holds.
 """
@@ -286,7 +287,12 @@ class V6Writer(nn.Module):
         s_vis, rho = meas.visibility.float(), meas.depth_conf.float()
         trusted = (valid & (s_vis >= cfg.visibility_min) & (rho >= cfg.depth_conf_min)
                    & (n_valid >= cfg.min_anchors_for_shape)[..., None])
-        lam = torch.where(trusted, s_vis * rho, 0.)
+        if cfg.soft_slots and meas.anchor_mass is not None:
+            # no visibility / confidence / anchor-count floors: weak, lightly owned evidence writes weakly
+            trusted = valid
+            lam = torch.where(trusted, s_vis * rho * meas.anchor_mass.float().clamp_max(1), 0.)
+        else:
+            lam = torch.where(trusted, s_vis * rho, 0.)
         lam = torch.where(obs.has_metric_depth[:, None, None], lam, lam.clamp_max(cfg.rgb_only_lambda_cap))
         wrote = lam > 0
         evidence = torch.where(wrote, (st.evidence + lam).clamp_max(cfg.lambda_max), st.evidence)

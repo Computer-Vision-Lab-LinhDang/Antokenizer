@@ -32,12 +32,14 @@ DEFAULT_WEIGHTS = {
     'recon_dense': .5, 'pred_dense': .5,
     'enc_depth': .1,
     'slot_pos': .1, 'slot_vel': .1, 'slot_extent': .1, 'slot_class': .1, 'spawn': .1, 'proposal': .05,
+    'exist': .1, 'exist_sparse': .01,
     'own_box': .1, 'assign_box': .1,
     'rig': .1,
 }
 BOX_KEYS = ('box_center', 'box_size', 'box_class', 'box_valid')
 OCC_MARGIN = .05   # m, box pad when testing whether a LiDAR target point is on an object
 LOS_RATIO = 1.12   # line of sight: no mass before z / ratio, the rest in [z / ratio, z * ratio] (ray depth z)
+UNMATCHED_EXIST_WEIGHT = .1   # soft slots: weight of "no object" on allocated slots no box matched (DETR's eos_coef)
 
 
 def masked_mean(value, mask):
@@ -291,24 +293,29 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
     to it, else 0. A clip without box labels would only ever say 0.
     3. Box teacher: ownership CE pulls the tokens of each box onto the slot holding or given it (every
        ownership layer); anchor CE pulls each onto its box-grid anchor.
+    Soft slots (model.cfg.soft_slots): step 1 matches without a gate (Hungarian, as in DETR), so every box has a
+    slot while there are enough; existence BCE on allocated slots of labelled clips: 1 when matched, else 0 at
+    weight UNMATCHED_EXIST_WEIGHT. Clips without box labels get only a light sparsity term on existence.
     """
     zero = _zero(state.position)
     terms = {'slot_pos': zero, 'slot_vel': zero, 'slot_extent': zero, 'slot_class': zero, 'spawn': zero, 'proposal': zero,
-             'own_box': zero, 'assign_box': zero}
+             'own_box': zero, 'assign_box': zero, 'exist': zero, 'exist_sparse': zero}
+    soft = model.cfg.soft_slots
     if any(key not in targets for key in BOX_KEYS):
         return terms, {}
     with torch.autocast(device_type=state.position.device.type, enabled=False):
         center, size = targets['box_center'].float(), targets['box_size'].float()
         cls, box_ok = targets['box_class'].long(), targets['box_valid'].bool()
         allocated = state.status > FREE
+        reach = math.inf if soft else gate
         paired = None if meas is None or meas.spawn_box is None else torch.where(allocated, meas.spawn_box, -1)
         if paired is None:
-            match, taken = match_slots(state.position, allocated, center, box_ok, gate)
+            match, taken = match_slots(state.position, allocated, center, box_ok, reach)
         else:
             m = center.shape[1]
             taken = torch.zeros(paired.shape[0], m + 1, dtype=torch.bool, device=paired.device)
             taken = taken.scatter(1, torch.where(paired >= 0, paired, m), True)[:, :m].cpu()
-            match, taken = match_slots(state.position, allocated & (paired < 0), center, box_ok, gate, taken=taken)
+            match, taken = match_slots(state.position, allocated & (paired < 0), center, box_ok, reach, taken=taken)
             match = torch.where(paired >= 0, paired, match)
         hit = match >= 0
         idx = match.clamp_min(0)
@@ -331,6 +338,19 @@ def slot_losses(model, state: V6State, targets: dict, *, spawn_mask=None, prior=
         logs = {'slots_allocated': allocated.float().sum(-1).mean(), 'boxes': box_ok.float().sum(-1).mean(),
                 'slots_matched': hit.float().sum(-1).mean(),
                 'class_acc': masked_mean((logits.argmax(-1) == box_k).float(), cls_ok)}
+        if soft:
+            labelled = targets.get('box_labelled')
+            labelled = torch.ones_like(allocated[:, 0]) if labelled is None else labelled.to(allocated.device).bool()
+            exist = state.exist_logit.float()
+            bce = F.binary_cross_entropy_with_logits(exist, hit.float(), reduction='none')
+            bce = bce * torch.where(hit, 1., UNMATCHED_EXIST_WEIGHT)
+            terms['exist'] = masked_mean(bce, allocated & labelled[:, None])
+            terms['exist_sparse'] = masked_mean(torch.sigmoid(exist), allocated & ~labelled[:, None])
+            near = hit & ((state.position.float() - box_c).detach().norm(dim=-1) < gate)
+            logs.update(slots_present=(allocated & (exist >= 0)).float().sum(-1).mean(),
+                        slots_near=near.float().sum(-1).mean(),
+                        exist_matched=masked_mean(torch.sigmoid(exist), hit),
+                        exist_unmatched=masked_mean(torch.sigmoid(exist), allocated & ~hit))
         if meas is not None and prior is not None:
             free = prior.status == FREE
             clips = torch.ones_like(free[:, 0]) if spawn_mask is None else spawn_mask.to(free.device).bool()

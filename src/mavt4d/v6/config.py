@@ -54,6 +54,12 @@ class V6Config:
     tentative_steps: int = 2
     miss_steps: int = 2
     spawn_threshold: float = 0.5      # sigmoid(spawn_logit) above this spawns a free slot
+    # Soft slots (v6.1): the trunk re-estimates every slot's existence each step and the decoder scales its density by
+    # it, so images and boxes teach "is there an object"; no miss rules, and a lightly owned anchor is a weak
+    # measurement rather than none. Free slots spawn above exist_drop; a slot is freed when its existence falls below.
+    soft_slots: bool = False
+    exist_drop: float = 0.05
+    soft_mass_min: float = 0.05       # ownership mass for a (weak) anchor measurement with soft slots
     # Decoder
     samples_per_segment: int = 8
     max_slots_per_ray: int = 2
@@ -93,6 +99,8 @@ class V6Config:
         if self.dense_dim < 0 or (self.dense_dim and not (self.dense_teacher in BACKBONES
                                                          and self.dense_teacher.startswith('dinov3'))):
             raise ValueError('dense_dim must be >= 0 and dense_teacher a DINOv3 layout')
+        if self.soft_slots and not 0 < self.exist_drop < 1:
+            raise ValueError('exist_drop must be in (0, 1)')
         if self.schema_version != 6:
             raise ValueError('v6 config requires schema_version 6')
 

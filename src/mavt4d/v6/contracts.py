@@ -191,6 +191,12 @@ class V6State:
             raise ValueError('invalid slot status')
 
 
+def present_slots(state: V6State, cfg) -> Tensor:
+    """[B,K] slots that count as objects: allocated, and with soft slots also existence >= 0.5."""
+    alloc = state.status > FREE
+    return alloc & (state.exist_logit >= 0) if cfg.soft_slots else alloc
+
+
 @dataclass(frozen=True)
 class TrunkOutput:
     """What the trunk hands to the write rules. Measurements never depend on the prior's values."""
@@ -220,6 +226,7 @@ class TrunkOutput:
     # Evidence-only token points, for the scene map write.
     points: Tensor | None = None        # [B,Ne,3] rig frame, from the selected depth hypothesis
     point_log_sigma: Tensor | None = None  # [B,Ne] log std of that hypothesis' log z
+    anchor_mass: Tensor | None = None   # [B,K,A] ownership mass behind each anchor measurement
 
 
 @dataclass(frozen=True)

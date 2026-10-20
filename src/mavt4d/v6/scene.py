@@ -20,6 +20,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .contracts import present_slots
 from .geometry import quat_to_matrix
 
 POINT_SIGMA = 0.2      # std of log z at which a token point's depth confidence halves
@@ -80,14 +81,15 @@ def rig_to_world(state, obs):
     return r, torch.where(known[:, None], pose[:, :3, 3], state.rig_position.float())
 
 
-def inside_slots(state, points: Tensor, margin: float = BOX_MARGIN) -> Tensor:
-    """World points [B,P,3] -> [B,P] bool: inside an allocated slot's anchor box (padded by margin)."""
+def inside_slots(state, points: Tensor, margin: float = BOX_MARGIN, slots: Tensor | None = None) -> Tensor:
+    """World points [B,P,3] -> [B,P] bool: inside the anchor box (padded by margin) of an allocated slot, or of
+    the slots [B,K] given."""
     rot = quat_to_matrix(state.orientation.float())                                    # object -> world
     anchors = state.anchor_canon.float() + state.offset.float()
     lo, hi = anchors.amin(-2), anchors.amax(-2)
     local = torch.einsum('bpkj,bkji->bpki', points[:, :, None] - state.position.float()[:, None], rot)
     inside = ((local - ((lo + hi) / 2)[:, None]).abs() <= ((hi - lo) / 2)[:, None] + margin).all(-1)
-    return (inside & state.allocated[:, None]).any(-1)
+    return (inside & (state.allocated if slots is None else slots)[:, None]).any(-1)
 
 
 def patch_colours(images: Tensor, cfg) -> Tensor:
@@ -128,9 +130,13 @@ class SceneMeasure(nn.Module):
             tagged = enc.measured_valid.flatten(1) | ~obs.has_metric_depth[:, None]
             # routing and confidence decide how much a point writes; neither learns from the scene
             own = meas.ownership[..., :k].float().detach()
-            scene_mass = (1 - (own * state.allocated[:, None].float()).sum(-1)).clamp(0, 1)
+            held = state.allocated.float()
+            if cfg.soft_slots:  # a slot holds its tokens as much as it exists
+                held = held * torch.sigmoid(state.exist_logit.float()).detach()
+            scene_mass = (1 - (own * held[:, None]).sum(-1)).clamp(0, 1)
             conf = 1 / (1 + (log_sigma.detach().exp() / POINT_SIGMA) ** 2)
-            ok = valid & tagged & (conf >= cfg.depth_conf_min) & ~inside_slots(state, world.detach())
+            ok = valid & tagged & (conf >= cfg.depth_conf_min) & ~inside_slots(state, world.detach(),
+                                                                               slots=present_slots(state, cfg))
             if meas.forced_slot is not None:  # training: the box teacher routes this token to a slot
                 ok = ok & (meas.forced_slot < 0)
             weight = torch.where(ok, scene_mass * conf, 0.)
