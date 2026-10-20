@@ -153,7 +153,7 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     ok_cam = cams['camera_valid'].bool()
     k = torch.where(ok_cam[..., None, None], cams['intrinsics'].float(), torch.eye(3, device=idx.device))
     c2r = torch.where(ok_cam[..., None, None], cams['cam_to_rig'].float(), torch.eye(4, device=idx.device))
-    out, rays, z_scale = model.render_pixels(state, k, c2r, pixels, (h, w))
+    out, rays, z_scale = model.render_pixels(state, k, c2r, pixels, (h, w), ok_cam)
     rgb_t = images.float().flatten(-2).gather(-1, idx[:, :, None].expand(b, v, 3, r))  # [B,V,3,R]
     rgb_t = rgb_t.permute(0, 1, 3, 2).reshape(b, v * r, 3)
     z_t = cams['depth'].float().flatten(-2).gather(-1, idx).reshape(b, v * r)

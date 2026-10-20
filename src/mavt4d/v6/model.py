@@ -112,14 +112,15 @@ class V6Model(nn.Module):
     def render(self, state: V6State, rays: RayBatch, chunk: int = 4096):
         return self.decoder(state, rays, chunk=chunk)
 
-    def render_pixels(self, state: V6State, intrinsics, cam_to_rig, pixels, size):
+    def render_pixels(self, state: V6State, intrinsics, cam_to_rig, pixels, size, camera_valid=None):
         """Pixels [B,V,R,2] (u, v) of cameras of size (H, W) -> (RenderOutput over the V*R rays, rays, z_scale):
-        the field decoder on the rays, or the state's Gaussians with cfg.gaussians."""
+        the field decoder on the rays, or the state's Gaussians with cfg.gaussians (drawn only into camera_valid
+        [B,V] cameras when given)."""
         rays, z_scale = self.camera_rays(state, intrinsics, cam_to_rig, pixels, return_z_scale=True)
         if self.splats is None:
             return self.render(state, rays), rays, z_scale
         out = self.splats(state, intrinsics, cam_to_rig, pixels, size, rays, z_scale,
-                          lambda dirs: self.decoder.sky(state, dirs))
+                          lambda dirs: self.decoder.sky(state, dirs), camera_valid)
         return out, rays, z_scale
 
     def camera_rays(self, state: V6State, intrinsics, cam_to_rig=None, pixels=None, *,

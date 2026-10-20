@@ -345,7 +345,7 @@ def render_metrics(model, state, cams, idx, boxes=None, rig=None):
     pixels = _pixels(idx, w)
     ok_cam = cams['camera_valid'].bool()
     k, c2r = camera_matrices(cams)
-    out, rays, z_scale = model.render_pixels(state, k, c2r, pixels, (h, w))
+    out, rays, z_scale = model.render_pixels(state, k, c2r, pixels, (h, w), ok_cam)
     rgb_t = _rgb_at(images, idx)                                                                     # [B,V,R,3]
     rgb = out.rgb.float().clamp(0, 1).view(b, v, r, 3)
     mse = (rgb - rgb_t).square().mean((-1, -2))

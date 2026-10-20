@@ -39,7 +39,9 @@ HIT_OPACITY = 1e-3      # accumulated alpha below this: the pixel has no surface
 LOG_Z_CLAMP = (math.log(.5), math.log(250.))
 LOG_DEPTH_STEP = 2.     # learned log-depth factor in [-2, 2]
 LOG_SCALE_STEP = 3.     # learned log-size factor in [-3, 3]
-PAIR_BUDGET = 1 << 24   # pixels x Gaussians per chunk in the torch backend
+PAIR_BUDGET = 1 << 24   # candidate (pixel, Gaussian) pairs per chunk in the torch backend
+FOOTPRINT_BUDGET = 1 << 22  # camera x Gaussian projections per chunk when pairing (no grad)
+TILE = 16               # px: the torch backend bins Gaussians into tiles before pairing them with pixels
 PARAMS = 14             # log depth, shift (2), log scale (3), quaternion (4), opacity, colour (3)
 
 
@@ -172,68 +174,134 @@ def write_ring(state: V6State, splats: dict, cfg) -> V6State:
 # ---------------------------------------------------------------- rasterization
 
 def project(mean, log_scale, quat, w2c, k):
-    """Gaussians [N,...] into one camera (w2c [4,4], k [3,3]) -> centre [N,2] px, camera z [N], conic [N,2,2]
-    (inverse 2D covariance), radius [N] px (3 sigma). Pixel centres at integers."""
-    p = mean @ w2c[:3, :3].T + w2c[:3, 3]
-    z = p[:, 2].clamp_min(1e-6)
-    fx, fy, cx, cy, s = k[0, 0], k[1, 1], k[0, 2], k[1, 2], k[0, 1]
-    centre = torch.stack((fx * p[:, 0] / z + s * p[:, 1] / z + cx, fy * p[:, 1] / z + cy), -1)
+    """Gaussians [...,N,3] into cameras (w2c [...,4,4], k [...,3,3], broadcast against the Gaussians' leading
+    dims) -> centre [...,2] px, camera z [...], conic [...,2,2] (inverse 2D covariance), radius [...] px (3 sigma).
+    Pixel centres at integers."""
+    rot_w = w2c[..., :3, :3]
+    p = (rot_w @ mean[..., None])[..., 0] + w2c[..., :3, 3]
+    z = p[..., 2].clamp_min(1e-6)
+    fx, fy, cx, cy, s = k[..., 0, 0], k[..., 1, 1], k[..., 0, 2], k[..., 1, 2], k[..., 0, 1]
+    centre = torch.stack((fx * p[..., 0] / z + s * p[..., 1] / z + cx, fy * p[..., 1] / z + cy), -1)
     rot = quat_to_matrix(F.normalize(quat, dim=-1))
     cov = rot @ torch.diag_embed(torch.exp(2 * log_scale)) @ rot.transpose(-1, -2)
-    cov = w2c[:3, :3] @ cov @ w2c[:3, :3].T
-    jac = torch.zeros(p.shape[0], 2, 3, device=p.device, dtype=p.dtype)
-    jac[:, 0, 0], jac[:, 0, 1], jac[:, 0, 2] = fx / z, s / z, -(fx * p[:, 0] + s * p[:, 1]) / z ** 2
-    jac[:, 1, 1], jac[:, 1, 2] = fy / z, -fy * p[:, 1] / z ** 2
+    cov = rot_w @ cov @ rot_w.transpose(-1, -2)
+    zero = torch.zeros_like(z)
+    jac = torch.stack((torch.stack((fx / z, s / z, -(fx * p[..., 0] + s * p[..., 1]) / z ** 2), -1),
+                       torch.stack((zero, fy / z, -fy * p[..., 1] / z ** 2), -1)), -2)
     cov2 = jac @ cov @ jac.transpose(-1, -2) + EPS2D * torch.eye(2, device=p.device)
-    det = (cov2[:, 0, 0] * cov2[:, 1, 1] - cov2[:, 0, 1] * cov2[:, 1, 0]).clamp_min(1e-12)
-    conic = torch.stack((torch.stack((cov2[:, 1, 1], -cov2[:, 0, 1]), -1),
-                         torch.stack((-cov2[:, 1, 0], cov2[:, 0, 0]), -1)), -2) / det[:, None, None]
+    det = (cov2[..., 0, 0] * cov2[..., 1, 1] - cov2[..., 0, 1] * cov2[..., 1, 0]).clamp_min(1e-12)
+    conic = torch.stack((torch.stack((cov2[..., 1, 1], -cov2[..., 0, 1]), -1),
+                         torch.stack((-cov2[..., 1, 0], cov2[..., 0, 0]), -1)), -2) / det[..., None, None]
     with torch.no_grad():  # culling only (sqrt has no finite gradient at round Gaussians)
-        half = .5 * (cov2[:, 0, 0] + cov2[:, 1, 1])
+        half = .5 * (cov2[..., 0, 0] + cov2[..., 1, 1])
         radius = 3 * (half + (half.square() - det).clamp_min(0).sqrt()).sqrt()
-    return centre, p[:, 2], conic, radius
+    return centre, p[..., 2], conic, radius
 
 
-def composite_torch(mean, log_scale, quat, opacity, color, valid, w2c, k, pixels, dense: int):
-    """One camera, the reference rasterizer on pixels [R,2] -> rgb [R,3], alpha [R], camera z [R] (expected depth
-    of the drawn mass, 0 without a surface), dense [R,dense] (detached weights). Only (pixel, Gaussian) pairs within
-    the Gaussian's 3-sigma box are composited, so memory follows the overlap, not pixels x Gaussians."""
-    r = pixels.shape[0]
-    with torch.no_grad():  # only what is drawn enters the graph (0 * inf gradients from the rest would be NaN)
-        idx = (valid & (mean @ w2c[2, :3] + w2c[2, 3] > NEAR)).nonzero()[:, 0]
-    centre, z, conic, radius = project(mean[idx], log_scale[idx], quat[idx], w2c, k)
-    order = z.detach().argsort()                                                 # front to back
-    centre, z, conic, radius, idx = centre[order], z[order], conic[order], radius[order], idx[order]
-    with torch.no_grad():  # pairs in pixel-major, then depth order
+def _segments(count: Tensor) -> tuple:
+    """Run lengths [M] -> (owner [sum], offset within its run [sum])."""
+    owner = torch.repeat_interleave(torch.arange(len(count), device=count.device), count)
+    return owner, torch.arange(len(owner), device=count.device) - (count.cumsum(0) - count)[owner]
+
+
+def _pairs(centre, radius, alive, pixels, size) -> tuple:
+    """No grad. Cameras C with centres [C,N,2], radii [C,N], alive [C,N] and pixels [C,R,2] in images of size
+    (H, W) -> (pixel index into C*R, Gaussian index into C*N) for every pixel inside a Gaussian's 3-sigma box.
+    Gaussians list the TILE px tiles their box touches; a pixel only tests the Gaussians of its own tile."""
+    c, n = radius.shape
+    r = pixels.shape[1]
+    h, w = size
+    nx, ny = -(-w // TILE), -(-h // TILE)
+    lo, hi = centre - radius[..., None], centre + radius[..., None]
+    alive = alive & (hi[..., 0] >= 0) & (lo[..., 0] < w) & (hi[..., 1] >= 0) & (lo[..., 1] < h)
+    g = alive.flatten().nonzero()[:, 0]
+    top = torch.tensor([nx - 1, ny - 1], device=g.device)
+    t0 = (lo.flatten(0, 1)[g] / TILE).floor().long().clamp_min(0).minimum(top)
+    t1 = (hi.flatten(0, 1)[g] / TILE).floor().long().clamp_min(0).minimum(top)
+    span = t1 - t0 + 1
+    gi, o = _segments(span[:, 0] * span[:, 1])
+    tile = (t0[gi, 1] + o // span[gi, 0]) * nx + t0[gi, 0] + o % span[gi, 0]
+    key, order = ((g[gi] // n) * (nx * ny) + tile).sort()
+    owner = g[gi[order]]                                                     # Gaussian of each sorted entry
+    px = pixels.flatten(0, 1)
+    pt = (px / TILE).floor().long().clamp_min(0).minimum(top)
+    pkey = torch.arange(c, device=g.device).repeat_interleave(r) * (nx * ny) + pt[:, 1] * nx + pt[:, 0]
+    first = torch.searchsorted(key, pkey)
+    count = torch.searchsorted(key, pkey, right=True) - first
+    total = count.cumsum(0)
+    cuts = torch.searchsorted(total, torch.arange(1, int(total[-1]) // PAIR_BUDGET + 1, device=g.device)
+                              * PAIR_BUDGET).tolist() if len(total) else []
+    pix, gs = [], []
+    for a, z in zip([0] + cuts, cuts + [len(count)]):  # pixel ranges of ~PAIR_BUDGET candidates
+        pi, o = _segments(count[a:z])
+        pi = pi + a
+        cand = owner[first[pi] + o]
+        hit = ((px[pi] - centre.flatten(0, 1)[cand]).abs() <= radius.flatten()[cand][:, None]).all(-1)
+        pix.append(pi[hit]), gs.append(cand[hit])
+    return torch.cat(pix), torch.cat(gs)
+
+
+def composite_batch(mean, log_scale, quat, opacity, color, valid, w2c, k, pixels, size, dense: int,
+                    camera_valid=None):
+    """Clips B with Gaussians [B,N,...] (world) seen by cameras w2c [B,V,4,4], k [B,V,3,3] at pixels [B,V,R,2] of
+    images of size (H, W) -> rgb [B,V,R,3], alpha [B,V,R], camera z [B,V,R] (expected depth of the drawn mass, 0
+    without a surface), dense [B,V,R,dense] (detached weights). Each pixel takes the Gaussians whose 3-sigma box
+    holds it, front to back; only those pairs, and the Gaussians in them, enter the graph."""
+    b, v, r, _ = pixels.shape
+    n = mean.shape[1]
+    c = b * v
+    w2c, k = w2c.reshape(c, 4, 4), k.reshape(c, 3, 3)
+    with torch.no_grad():
         pix, gs = [], []
-        chunk = max(1, PAIR_BUDGET // max(1, idx.numel()))
-        for start in range(0, r, chunk):
-            hit = ((pixels[start:start + chunk, None] - centre[None]).abs() <= radius[None, :, None]).all(-1)
-            p, g = hit.nonzero(as_tuple=True)
-            pix.append(p + start), gs.append(g)
+        step = max(1, FOOTPRINT_BUDGET // max(1, n))
+        for c0 in range(0, c, step):
+            cams = torch.arange(c0, min(c, c0 + step), device=mean.device)
+            clip = cams // v
+            centre, z, _, radius = project(mean[clip], log_scale[clip], quat[clip], w2c[cams, None], k[cams, None])
+            alive = valid[clip] & (z > NEAR)
+            if camera_valid is not None:
+                alive = alive & camera_valid.reshape(c)[cams, None]
+            p, g = _pairs(centre, radius, alive, pixels.reshape(c, r, 2)[cams], size)
+            pix.append(p + c0 * r), gs.append(g + c0 * n)
         pix, gs = torch.cat(pix), torch.cat(gs)
-    d = pixels[pix] - centre[gs]                                                  # [P,2]
-    q = conic[gs]
+        drawn, which = torch.unique(gs, return_inverse=True)                       # (camera, Gaussian) pairs
+    cam, gi = drawn // n, drawn % n
+    clip = cam // v
+    centre, z, conic, _ = project(mean[clip, gi], log_scale[clip, gi], quat[clip, gi], w2c[cam], k[cam])
+    with torch.no_grad():  # pixel by pixel, front to back
+        order = z[which].argsort(stable=True)
+        order = order[pix[order].argsort(stable=True)]
+    pix, which = pix[order], which[order]
+    d = pixels.reshape(c * r, 2)[pix] - centre[which]
+    q = conic[which]
     power = -.5 * (q[:, 0, 0] * d[:, 0] ** 2 + q[:, 1, 1] * d[:, 1] ** 2) - q[:, 0, 1] * d[:, 0] * d[:, 1]
-    alpha = (torch.sigmoid(opacity[idx[gs]]) * torch.exp(power.clamp_max(0))).clamp_max(ALPHA_MAX)
+    alpha = (torch.sigmoid(opacity[clip, gi])[which] * torch.exp(power.clamp_max(0))).clamp_max(ALPHA_MAX)
     alpha = torch.where((alpha >= ALPHA_MIN) & (power <= 0), alpha, 0.)
     # transmittance before each pair: a running sum of log(1 - alpha) restarted per pixel (f64 over all pairs)
     log_keep = torch.log1p(-alpha).double()
     before = log_keep.cumsum(0) - log_keep
-    count = torch.bincount(pix, minlength=r)
-    first = count.cumsum(0) - count
-    weight = alpha * torch.exp(before - before[first[pix]]).float()
-    col = color[idx[gs]]
+    count = torch.bincount(pix, minlength=c * r)
+    weight = alpha * torch.exp(before - before[(count.cumsum(0) - count)[pix]]).float()
+    col = color[clip, gi][which]
 
     def total(x):
-        return x.new_zeros(r, *x.shape[1:]).index_add(0, pix, x)
+        return x.new_zeros(c * r, *x.shape[1:]).index_add(0, pix, x).view(b, v, r, *x.shape[1:])
 
     acc = total(weight)
     rgb = total(weight[:, None] * col[:, :3])
-    depth = total(weight * z[gs])
+    depth = total(weight * z[which])
     depth = torch.where(acc > HIT_OPACITY, depth / acc.clamp_min(HIT_OPACITY), 0.)
     feat = total(weight.detach()[:, None] * col[:, 3:]) if dense else None
     return rgb, acc, depth, feat
+
+
+def composite_torch(mean, log_scale, quat, opacity, color, valid, w2c, k, pixels, dense: int):
+    """One camera (w2c [4,4], k [3,3]) on pixels [R,2]: composite_batch with one clip and one camera -> rgb [R,3],
+    alpha [R], camera z [R], dense [R,dense]."""
+    size = (int(pixels[:, 1].max()) + 1, int(pixels[:, 0].max()) + 1) if len(pixels) else (1, 1)
+    out = composite_batch(*(x[None] for x in (mean, log_scale, quat, opacity, color, valid)), w2c[None, None],
+                          k[None, None], pixels[None, None], size, dense)
+    return tuple(None if x is None else x[0, 0] for x in out)
 
 
 def composite_gsplat(mean, log_scale, quat, opacity, color, valid, w2c, k, height, width, dense: int):
@@ -274,10 +342,11 @@ class SplatRenderer(nn.Module):
         return write_ring(state, self.head(state, obs, enc), self.cfg)
 
     def forward(self, state: V6State, intrinsics: Tensor, cam_to_rig: Tensor, pixels: Tensor, size, rays,
-                z_scale: Tensor, background) -> RenderOutput:
+                z_scale: Tensor, background, camera_valid=None) -> RenderOutput:
         """pixels [B,V,R,2] (integer pixel centres) of cameras intrinsics [B,V,3,3], cam_to_rig [B,V,4,4] at the
         state's rig pose; size (H, W); rays, z_scale from model.camera_rays for the same pixels; background(dirs)
-        -> sky colour (+ dense) for world directions [B,R,3]. RenderOutput over the flattened V*R pixels."""
+        -> sky colour (+ dense) for world directions [B,R,3]; camera_valid [B,V] (None: all), the rest draw no
+        Gaussians. RenderOutput over the flattened V*R pixels."""
         cfg = self.cfg
         b, v, r, _ = pixels.shape
         dense = cfg.dense_dim
@@ -287,33 +356,30 @@ class SplatRenderer(nn.Module):
             rig[:, :3, 3] = state.rig_position.float()
             w2c = torch.linalg.inv(rig[:, None] @ cam_to_rig.float())                   # [B,V,4,4]
             k = intrinsics.float()
-            mode = backend(cfg, pixels.device)
-            rgb, acc, z, feat = [], [], [], []
-            for i in range(b):
-                g = (state.gs_mean[i].float(), state.gs_log_scale[i].float(), state.gs_quat[i].float(),
-                     state.gs_opacity[i].float(), state.gs_color[i].float(), state.gs_valid[i])
-                if mode == 'gsplat':
-                    h, w = size
-                    img, a, zz, f = composite_gsplat(*g, w2c[i], k[i], h, w, dense)
+            g = (state.gs_mean.float(), state.gs_log_scale.float(), state.gs_quat.float(), state.gs_opacity.float(),
+                 state.gs_color.float(), state.gs_valid)
+            if backend(cfg, pixels.device) == 'gsplat':
+                h, w = size
+                rgb, acc, z, feat = [], [], [], []
+                for i in range(b):
+                    img, a, zz, f = composite_gsplat(*(x[i] for x in g), w2c[i], k[i], h, w, dense)
                     flat = (pixels[i, ..., 1].round().long().clamp(0, h - 1) * w
                             + pixels[i, ..., 0].round().long().clamp(0, w - 1))             # [V,R]
                     take = lambda x: x.flatten(1, 2).gather(1, flat.view(v, r, *([1] * (x.dim() - 3)))
                                                              .expand(v, r, *x.shape[3:]))
                     rgb.append(take(img)), acc.append(take(a)), z.append(take(zz))
                     feat.append(take(f) if dense else None)
-                else:
-                    parts = [composite_torch(*g, w2c[i, j], k[i, j], pixels[i, j], dense) for j in range(v)]
-                    rgb.append(torch.stack([p[0] for p in parts])), acc.append(torch.stack([p[1] for p in parts]))
-                    z.append(torch.stack([p[2] for p in parts]))
-                    feat.append(torch.stack([p[3] for p in parts]) if dense else None)
-            rgb, acc, z = torch.stack(rgb).reshape(b, v * r, 3), torch.stack(acc).reshape(b, v * r), \
-                torch.stack(z).reshape(b, v * r)
+                rgb, acc, z = torch.stack(rgb), torch.stack(acc), torch.stack(z)
+                feat = torch.stack(feat) if dense else None
+            else:
+                rgb, acc, z, feat = composite_batch(*g, w2c, k, pixels, size, dense, camera_valid)
+            rgb, acc, z = rgb.reshape(b, v * r, 3), acc.reshape(b, v * r), z.reshape(b, v * r)
             sky = background(rays.direction.float()).float()                             # [B,V*R,3 (+ dense)]
             empty = (1 - acc).clamp(0, 1)
             color = rgb + empty[..., None] * sky[..., :3]
             feature = None
             if dense:
-                feature = torch.stack(feat).reshape(b, v * r, dense) + empty.detach()[..., None] * sky[..., 3:]
+                feature = feat.reshape(b, v * r, dense) + empty.detach()[..., None] * sky[..., 3:]
             depth = torch.where(acc > HIT_OPACITY, z / z_scale.clamp_min(1e-6), 0.)     # along the ray
         k_slots = state.status.shape[1]
         weights = torch.cat((acc.new_zeros(b, v * r, k_slots), acc.new_ones(b, v * r, 1)), -1)
