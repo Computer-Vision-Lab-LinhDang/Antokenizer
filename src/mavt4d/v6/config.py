@@ -85,7 +85,7 @@ class V6Config:
     # place of the scene map (gaussians 0: off, no modules, 1-element state fields)
     gaussians: int = 0
     gaussian_steps: int = 4
-    gaussian_backend: str = 'auto'    # gsplat (GPU), torch (reference: tests, CPU), auto: gsplat when importable
+    gaussian_backend: str = 'auto'    # gsplat (GPU), torch (pure PyTorch, any device), auto: gsplat when importable
     schema_version: int = 6
 
     def __post_init__(self):

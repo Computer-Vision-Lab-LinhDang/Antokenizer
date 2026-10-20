@@ -12,8 +12,8 @@ from mavt4d.v6.dense import DenseTeacher
 from mavt4d.v6.evaluate import main as evaluate_main
 from mavt4d.v6.losses import advance, step_terms, where_state
 from mavt4d.v6.model import V6Model
-from mavt4d.v6.splats import (ALPHA_MAX, camera_to_world, composite_gsplat, composite_torch, project, subcell_colours,
-                              subcell_pixels)
+from mavt4d.v6.splats import (ALPHA_MAX, ALPHA_MIN, NEAR, camera_to_world, composite_gsplat, composite_torch, project,
+                              subcell_colours, subcell_pixels)
 from mavt4d.v6.train import batch_to_sequence, init_weights, main as train_main, synthetic_batch
 
 TINY = dict(slots=3, trunk_layers=1, encoder_layers=2, image_height=64, image_width=64, anchors=8)
@@ -65,6 +65,33 @@ def test_front_gaussian_wins_whatever_the_order():
     torch.testing.assert_close(rgb, rgb2)
     torch.testing.assert_close(z, z2)
     assert rgb[0, 0] > .98 and rgb[0, 1] < .01 and z[0] < 4.05
+
+
+def test_reference_matches_compositing_pixel_by_pixel():
+    torch.manual_seed(1)
+    n = 300
+    mean = torch.randn(n, 3) * torch.tensor([3., 3., 2.]) + torch.tensor([0., 0., 9.])
+    g = (mean, torch.full((n, 3), -1.2) + .4 * torch.randn(n, 3), torch.nn.functional.normalize(torch.randn(n, 4), dim=-1),
+         torch.randn(n), torch.rand(n, 5), torch.rand(n) < .9)
+    pixels = torch.rand(40, 2) * 64
+    rgb, alpha, z, feat = composite_torch(*g, torch.eye(4), K, pixels, 2)
+    keep = g[5] & (mean[:, 2] > NEAR)
+    centre, depth, conic, radius = project(mean[keep], g[1][keep], g[2][keep], torch.eye(4), K)
+    order = depth.argsort()
+    for i, px in enumerate(pixels):
+        t, want = 1., torch.zeros(5)
+        for j in order:
+            d = px - centre[j]
+            if (d.abs() > radius[j]).any():
+                continue
+            power = -.5 * d @ conic[j] @ d
+            a = min(torch.sigmoid(g[3][keep][j]) * torch.exp(power), ALPHA_MAX)
+            if a < ALPHA_MIN:
+                continue
+            want += t * a * g[4][keep][j]
+            t *= 1 - a
+        torch.testing.assert_close(torch.cat((rgb[i], feat[i])), want, atol=1e-5, rtol=1e-4)
+        torch.testing.assert_close(alpha[i], torch.as_tensor(1 - t, dtype=torch.float32), atol=1e-5, rtol=1e-4)
 
 
 def _observed(cfg, steps=1, seed=0, batch=None):

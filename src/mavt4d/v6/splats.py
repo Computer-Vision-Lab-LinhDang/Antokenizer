@@ -196,36 +196,44 @@ def project(mean, log_scale, quat, w2c, k):
 
 def composite_torch(mean, log_scale, quat, opacity, color, valid, w2c, k, pixels, dense: int):
     """One camera, the reference rasterizer on pixels [R,2] -> rgb [R,3], alpha [R], camera z [R] (expected depth
-    of the drawn mass, 0 without a surface), dense [R,dense] (detached weights)."""
+    of the drawn mass, 0 without a surface), dense [R,dense] (detached weights). Only (pixel, Gaussian) pairs within
+    the Gaussian's 3-sigma box are composited, so memory follows the overlap, not pixels x Gaussians."""
     r = pixels.shape[0]
     with torch.no_grad():  # only what is drawn enters the graph (0 * inf gradients from the rest would be NaN)
         idx = (valid & (mean @ w2c[2, :3] + w2c[2, 3] > NEAR)).nonzero()[:, 0]
     centre, z, conic, radius = project(mean[idx], log_scale[idx], quat[idx], w2c, k)
     order = z.detach().argsort()                                                 # front to back
     centre, z, conic, radius, idx = centre[order], z[order], conic[order], radius[order], idx[order]
-    opac, col = torch.sigmoid(opacity[idx]), color[idx]
-    out_rgb, out_a, out_z = [], [], []
-    out_f = []
-    chunk = max(1, PAIR_BUDGET // max(1, idx.numel()))
-    for start in range(0, r, chunk):
-        px = pixels[start:start + chunk]
-        lo, hi = px.amin(0), px.amax(0)
-        near = ((centre + radius[:, None] >= lo) & (centre - radius[:, None] <= hi)).all(-1).nonzero()[:, 0]
-        d = px[:, None] - centre[near][None]                                     # [r,n,2]
-        q = conic[near]
-        power = -.5 * (q[:, 0, 0] * d[..., 0] ** 2 + q[:, 1, 1] * d[..., 1] ** 2) - q[:, 0, 1] * d[..., 0] * d[..., 1]
-        alpha = (opac[near] * torch.exp(power.clamp_max(0))).clamp_max(ALPHA_MAX)
-        alpha = torch.where((alpha >= ALPHA_MIN) & (power <= 0), alpha, 0.)
-        log_t = torch.log1p(-alpha).cumsum(-1)
-        weight = alpha * torch.exp(log_t - torch.log1p(-alpha))                 # alpha * transmittance before it
-        acc = weight.sum(-1)
-        out_rgb.append(weight @ col[near, :3])
-        out_a.append(acc)
-        out_z.append(torch.where(acc > HIT_OPACITY, (weight @ z[near]) / acc.clamp_min(HIT_OPACITY), 0.))
-        if dense:
-            out_f.append(weight.detach() @ col[near, 3:])
-    feat = torch.cat(out_f) if dense else None
-    return torch.cat(out_rgb), torch.cat(out_a), torch.cat(out_z), feat
+    with torch.no_grad():  # pairs in pixel-major, then depth order
+        pix, gs = [], []
+        chunk = max(1, PAIR_BUDGET // max(1, idx.numel()))
+        for start in range(0, r, chunk):
+            hit = ((pixels[start:start + chunk, None] - centre[None]).abs() <= radius[None, :, None]).all(-1)
+            p, g = hit.nonzero(as_tuple=True)
+            pix.append(p + start), gs.append(g)
+        pix, gs = torch.cat(pix), torch.cat(gs)
+    d = pixels[pix] - centre[gs]                                                  # [P,2]
+    q = conic[gs]
+    power = -.5 * (q[:, 0, 0] * d[:, 0] ** 2 + q[:, 1, 1] * d[:, 1] ** 2) - q[:, 0, 1] * d[:, 0] * d[:, 1]
+    alpha = (torch.sigmoid(opacity[idx[gs]]) * torch.exp(power.clamp_max(0))).clamp_max(ALPHA_MAX)
+    alpha = torch.where((alpha >= ALPHA_MIN) & (power <= 0), alpha, 0.)
+    # transmittance before each pair: a running sum of log(1 - alpha) restarted per pixel (f64 over all pairs)
+    log_keep = torch.log1p(-alpha).double()
+    before = log_keep.cumsum(0) - log_keep
+    count = torch.bincount(pix, minlength=r)
+    first = count.cumsum(0) - count
+    weight = alpha * torch.exp(before - before[first[pix]]).float()
+    col = color[idx[gs]]
+
+    def total(x):
+        return x.new_zeros(r, *x.shape[1:]).index_add(0, pix, x)
+
+    acc = total(weight)
+    rgb = total(weight[:, None] * col[:, :3])
+    depth = total(weight * z[gs])
+    depth = torch.where(acc > HIT_OPACITY, depth / acc.clamp_min(HIT_OPACITY), 0.)
+    feat = total(weight.detach()[:, None] * col[:, 3:]) if dense else None
+    return rgb, acc, depth, feat
 
 
 def composite_gsplat(mean, log_scale, quat, opacity, color, valid, w2c, k, height, width, dense: int):
