@@ -198,7 +198,10 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     z_pred = (out.depth.float() * z_scale).clamp_min(1e-2)
     depth, depth_n = _clip_mean((z_pred.log() - z_t.clamp_min(1e-2).log()).abs(), target_depth)
     logs.update(depth_rays=target.sum().detach().float(), depth_rays_on_surface=(target & surf).sum().detach().float(),
-                opacity=masked_mean(out.opacity.float().detach(), ray_ok))
+                opacity=masked_mean(out.opacity.float().detach(), ray_ok),
+                # how depth fails: drawn at under half the LiDAR depth (floaters) or past twice it
+                depth_near=masked_mean((z_pred.detach() < z_t / 2).float(), target_depth),
+                depth_far=masked_mean((z_pred.detach() > 2 * z_t).float(), target_depth))
     occ, occ_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
     if boxes is not None and model.splats is None:  # Gaussians do not render slots yet (v7a)
         with torch.autocast(device_type=idx.device.type, enabled=False):
