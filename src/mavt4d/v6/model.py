@@ -13,6 +13,7 @@ from .dynamics import V6Dynamics
 from .encoder import V6Encoder
 from .geometry import quat_to_matrix
 from .lifecycle import V6Lifecycle
+from .splats import SplatRenderer
 from .trunk import V6Trunk
 from .understanding import V6Understanding
 from .write import V6Writer
@@ -69,6 +70,7 @@ class V6Model(nn.Module):
         self.lifecycle = V6Lifecycle(cfg)
         self.decoder = V6Decoder(cfg)
         self.understanding = V6Understanding(cfg, num_classes=num_classes, text_dim=text_dim)
+        self.splats = SplatRenderer(cfg) if cfg.gaussians else None
 
     @property
     def device(self):
@@ -97,6 +99,8 @@ class V6Model(nn.Module):
         post = self.writer(prior, meas, obs)
         post = self.lifecycle(post, meas, obs)
         post = self.writer.write_scene(post, meas, obs, enc)
+        if self.splats is not None:
+            post = self.splats.write(post, obs, enc)
         return post, {'enc': enc, 'meas': meas, 'prior': prior}
 
     def predict(self, state: V6State, dt) -> V6State:
@@ -107,6 +111,16 @@ class V6Model(nn.Module):
 
     def render(self, state: V6State, rays: RayBatch, chunk: int = 4096):
         return self.decoder(state, rays, chunk=chunk)
+
+    def render_pixels(self, state: V6State, intrinsics, cam_to_rig, pixels, size):
+        """Pixels [B,V,R,2] (u, v) of cameras of size (H, W) -> (RenderOutput over the V*R rays, rays, z_scale):
+        the field decoder on the rays, or the state's Gaussians with cfg.gaussians."""
+        rays, z_scale = self.camera_rays(state, intrinsics, cam_to_rig, pixels, return_z_scale=True)
+        if self.splats is None:
+            return self.render(state, rays), rays, z_scale
+        out = self.splats(state, intrinsics, cam_to_rig, pixels, size, rays, z_scale,
+                          lambda dirs: self.decoder.sky(state, dirs))
+        return out, rays, z_scale
 
     def camera_rays(self, state: V6State, intrinsics, cam_to_rig=None, pixels=None, *,
                     near: float = .1, far: float = 120., return_z_scale: bool = False):

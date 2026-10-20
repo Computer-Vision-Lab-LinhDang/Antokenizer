@@ -105,6 +105,15 @@ class V6State:
     scene: Tensor            # [B,NY,NX,Cs] f16 static scene map, world-frame BEV cells (cfg.scene_shape)
     scene_evidence: Tensor   # [B,NY,NX] f32 accumulated Lambda per cell
     global_token: Tensor     # [B,W] f32
+    # Pixel-aligned Gaussians (cfg.gaussians, splats.py): a ring over the last cfg.gaussian_steps observed steps,
+    # Ng = steps x cameras x patches x gaussians^2 (cfg.gaussian_shape; 1 when off). World frame.
+    gs_mean: Tensor          # [B,Ng,3] f32
+    gs_log_scale: Tensor     # [B,Ng,3] f32 log std per axis, metres
+    gs_quat: Tensor          # [B,Ng,4] f32 unit, Gaussian -> world
+    gs_opacity: Tensor       # [B,Ng] f32 logit
+    gs_color: Tensor         # [B,Ng,3 + dense_dim] f32 rgb in [0,1], then dense channels
+    gs_valid: Tensor         # [B,Ng] bool
+    gs_count: Tensor         # [B] int64 observed steps written so far (ring position)
     metric_scale: Tensor     # [B] f32 depth scale for sources without metric depth
     metric_valid: Tensor     # [B] bool
     t: Tensor                # [B] f64
@@ -128,6 +137,9 @@ class V6State:
         rig_q[:, 0] = 1
         camera = zeros(b, cfg.max_cameras, cfg.camera_rows)
         camera[..., :12] = torch.eye(4, device=device)[:3].reshape(12)
+        ng, gc = cfg.gaussian_shape
+        gs_quat = zeros(b, ng, 4)
+        gs_quat[..., 0] = 1
         t = torch.as_tensor(time, device=device, dtype=torch.float64).expand(b).clone()
         digest = hashlib.sha256(json.dumps(cfg.to_dict(), sort_keys=True).encode()).digest()
         return cls(
@@ -151,6 +163,9 @@ class V6State:
             background_evidence=zeros(b, cfg.background_tokens),
             scene=zeros(b, *cfg.scene_shape, dtype=torch.float16), scene_evidence=zeros(b, *cfg.scene_shape[:2]),
             global_token=zeros(b, w),
+            gs_mean=zeros(b, ng, 3), gs_log_scale=zeros(b, ng, 3), gs_quat=gs_quat, gs_opacity=zeros(b, ng),
+            gs_color=zeros(b, ng, gc), gs_valid=zeros(b, ng, dtype=torch.bool),
+            gs_count=zeros(b, dtype=torch.int64),
             metric_scale=torch.ones(b, device=device), metric_valid=zeros(b, dtype=torch.bool), t=t,
             config_digest=torch.tensor(list(digest), device=device, dtype=torch.uint8).expand(b, 32).clone())
 

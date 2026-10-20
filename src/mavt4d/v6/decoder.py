@@ -238,10 +238,14 @@ class V6Decoder(nn.Module):
 
     def background_rgb(self, state: V6State, direction: Tensor) -> Tensor:
         """Background colour for world directions [B,R,3]; direction is read in the rig frame."""
+        return self.sky(state, direction)[..., :3]
+
+    def sky(self, state: V6State, direction: Tensor) -> Tensor:
+        """Background colour (+ dense channels) for world directions [B,R,3], read in the rig frame."""
         with _no_autocast(direction):
             rig = quat_to_matrix(state.rig_orientation.float())
             dirs = torch.einsum('brj,bji->bri', direction.float(), rig)
-        return self.background(self.background.tokens(state.background), dirs)[..., :3].float()
+        return self.background(self.background.tokens(state.background), dirs).float()
 
     # ---- render ----
     def forward(self, state: V6State, rays: RayBatch, chunk: int = 4096) -> RenderOutput:

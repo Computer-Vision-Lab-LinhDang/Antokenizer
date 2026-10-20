@@ -80,6 +80,12 @@ class V6Config:
     # dense_teacher (DINOv3) on the target frame (dense_dim 0: off, no modules)
     dense_dim: int = 0
     dense_teacher: str = 'dinov3_vitl16'
+    # Pixel-aligned Gaussians (v7a, splats.py): every patch token of an input camera writes gaussians x gaussians
+    # Gaussians per observed step, kept in the state for the last gaussian_steps observed steps and rasterized in
+    # place of the scene map (gaussians 0: off, no modules, 1-element state fields)
+    gaussians: int = 0
+    gaussian_steps: int = 4
+    gaussian_backend: str = 'auto'    # gsplat (GPU), torch (reference: tests, CPU), auto: gsplat when importable
     schema_version: int = 6
 
     def __post_init__(self):
@@ -99,6 +105,11 @@ class V6Config:
         if self.dense_dim < 0 or (self.dense_dim and not (self.dense_teacher in BACKBONES
                                                          and self.dense_teacher.startswith('dinov3'))):
             raise ValueError('dense_dim must be >= 0 and dense_teacher a DINOv3 layout')
+        if self.gaussians < 0 or (self.gaussians and (self.patch_size % self.gaussians or self.gaussian_steps < 1
+                                                      or self.scene_samples)):
+            raise ValueError('gaussians must divide the patch size, with gaussian_steps >= 1 and the scene map off')
+        if self.gaussian_backend not in ('auto', 'gsplat', 'torch'):
+            raise ValueError(f'unknown gaussian_backend {self.gaussian_backend!r}')
         if self.soft_slots and not 0 < self.exist_drop < 1:
             raise ValueError('exist_drop must be in (0, 1)')
         if self.schema_version != 6:
@@ -129,6 +140,14 @@ class V6Config:
     def scene_shape(self):
         """(NY, NX, channels) of the scene map; (1, 1, 1) when it is off."""
         return (self.scene_cells_y, self.scene_cells_x, self.scene_width) if self.scene_samples else (1, 1, 1)
+
+    @property
+    def gaussian_shape(self):
+        """(Gaussians kept, colour + dense channels) in the state; (1, 1) when they are off."""
+        if not self.gaussians:
+            return (1, 1)
+        return (self.gaussian_steps * self.max_cameras * self.patches_per_camera * self.gaussians ** 2,
+                3 + self.dense_dim)
 
     @property
     def dense_target_dim(self):

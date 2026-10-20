@@ -153,8 +153,7 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     ok_cam = cams['camera_valid'].bool()
     k = torch.where(ok_cam[..., None, None], cams['intrinsics'].float(), torch.eye(3, device=idx.device))
     c2r = torch.where(ok_cam[..., None, None], cams['cam_to_rig'].float(), torch.eye(4, device=idx.device))
-    rays, z_scale = model.camera_rays(state, k, c2r, pixels, return_z_scale=True)
-    out = model.render(state, rays)
+    out, rays, z_scale = model.render_pixels(state, k, c2r, pixels, (h, w))
     rgb_t = images.float().flatten(-2).gather(-1, idx[:, :, None].expand(b, v, 3, r))  # [B,V,3,R]
     rgb_t = rgb_t.permute(0, 1, 3, 2).reshape(b, v * r, 3)
     z_t = cams['depth'].float().flatten(-2).gather(-1, idx).reshape(b, v * r)
@@ -201,7 +200,7 @@ def render_loss(model, state: V6State, cams: dict, rays_per_camera: int, boxes=N
     logs.update(depth_rays=target.sum().detach().float(), depth_rays_on_surface=(target & surf).sum().detach().float(),
                 opacity=masked_mean(out.opacity.float().detach(), ray_ok))
     occ, occ_n = torch.zeros_like(rgb), torch.zeros_like(rgb_n)
-    if boxes is not None:
+    if boxes is not None and model.splats is None:  # Gaussians do not render slots yet (v7a)
         with torch.autocast(device_type=idx.device.type, enabled=False):
             ok = target & model.decoder.slot_hits(state, rays).any(-1) & boxes['labelled'][:, None]
             p = out.opacity.float().clamp(1e-4, 1 - 1e-4)

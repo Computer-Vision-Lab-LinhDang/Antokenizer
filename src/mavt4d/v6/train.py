@@ -349,10 +349,16 @@ PRETRAINED = ('encoder.patch_embed.', 'encoder.blocks.', 'encoder.norm.', 'encod
 NO_DECAY = ('cls_token', 'register_tokens', 'pos_embed')
 
 
+REPLACED_BY_GAUSSIANS = ('decoder.scene.', 'writer.scene.')
+
+
 def init_weights(model, path):
     """Load a checkpoint's model weights; keys the model lacks are an error, keys the checkpoint lacks keep their init."""
     src = torch.load(Path(path).expanduser(), map_location='cpu', weights_only=False)
-    missing, unexpected = model.load_state_dict(drop_retired(src.get('model', src)), strict=False)
+    weights = drop_retired(src.get('model', src))
+    if model.cfg.gaussians:  # the Gaussians replace the scene map: its weights have nowhere to go
+        weights = {k: v for k, v in weights.items() if not k.startswith(REPLACED_BY_GAUSSIANS)}
+    missing, unexpected = model.load_state_dict(weights, strict=False)
     if unexpected:
         raise SystemExit(f'--init {path}: {len(unexpected)} keys the model does not have, e.g. {unexpected[:3]}')
     return missing, unexpected
