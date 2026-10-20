@@ -68,9 +68,8 @@ def _table(path, cols):
     feather.write_feather(pa.table(cols), str(path))
 
 
-@pytest.fixture(scope='module')
-def av2_root(tmp_path_factory):
-    root = tmp_path_factory.mktemp('av2')
+def _write_root(root, cam_ts):
+    """One AV2-layout log under root/train; cam_ts: camera name -> its frame timestamps."""
     log = root / 'train' / 'log_a'
     (log / 'calibration').mkdir(parents=True)
     (log / 'sensors' / 'lidar').mkdir(parents=True)
@@ -94,7 +93,7 @@ def av2_root(tmp_path_factory):
         uv, _ = _project_original(n, CAMS[n][8])
         img = Image.new('RGB', (w, h))
         ImageDraw.Draw(img).ellipse([uv[0] - 8, uv[1] - 8, uv[0] + 8, uv[1] + 8], fill=(255, 255, 255))
-        for ts in CAMS_TS:
+        for ts in cam_ts[n]:
             img.save(log / 'sensors' / 'cameras' / n / f'{ts}.jpg', quality=95)
     rng = np.random.default_rng(0)
     for ts in LIDAR:
@@ -123,6 +122,11 @@ def av2_root(tmp_path_factory):
         **{c: [r[2][i] for r in rows] for i, c in enumerate(['tx_m', 'ty_m', 'tz_m'])},
         num_interior_pts=pa.array([r[4] for r in rows], pa.uint32())))
     return root
+
+
+@pytest.fixture(scope='module')
+def av2_root(tmp_path_factory):
+    return _write_root(tmp_path_factory.mktemp('av2'), {n: CAMS_TS for n in CAMS})
 
 
 CFG = V6Config(slots=3, trunk_layers=1, encoder_layers=2, image_height=H, image_width=W, max_cameras=4)
@@ -154,6 +158,24 @@ def test_shapes_padding_collate(av2_root):
     obs = to_observation(b, 1)
     assert obs.images.shape == (2, V, 2, 3, H, W) and obs.t.shape == (2,) and obs.rig_pose.shape == (2, 4, 4)
     assert torch.equal(obs.depth, b['depth'][:, 1])
+
+
+def test_tube_frame_must_sit_near_its_target(av2_root):
+    ds = _ds(av2_root)
+    ms = 1_000_000
+    gap = {'cam_ts': {'c': np.array([T0, T0 + 50 * ms, T0 + 150 * ms, T0 + 200 * ms])}}   # frame at -100 ms dropped
+    assert ds._camera_frames(gap, 'c', T0 + 200 * ms) is None
+    jitter = {'cam_ts': {'c': np.array([T0, T0 + 105 * ms, T0 + 150 * ms, T0 + 200 * ms])}}
+    assert ds._camera_frames(jitter, 'c', T0 + 200 * ms) == [T0 + 105 * ms, T0 + 200 * ms]
+
+
+def test_clips_start_once_every_camera_has_its_tube(tmp_path):
+    late = {**{n: CAMS_TS for n in CAMS}, 'ring_side_left': CAMS_TS[3:]}   # starts 50 ms after sweep 0
+    ds = _ds(_write_root(tmp_path, late))
+    assert len(ds) == 3   # sweep 1 has no side_left frame 0.1 s back: starts at sweeps 3, 5, 7
+    for x in ds:
+        assert torch.allclose(x['tube_dt'], torch.full((3,), .1))
+        assert x['camera_valid'][:, :2].all()
 
 
 def _centroid(g):

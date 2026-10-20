@@ -18,7 +18,9 @@ src/av2/geometry/camera/pinhole_camera.py):
 Camera frame (pinhole_camera.py): +z out of the camera, +y down, +x across the imager (right).
 Ego frame: +x forward, +y left, +z up. Pixel centres at integer coordinates.
 
-Clip: `steps` lidar sweeps ~`step_dt` apart. World = ego frame at the clip's first sweep.
+Clip: `steps` lidar sweeps ~`step_dt` apart. World = ego frame at the clip's first sweep. Each camera's tube is
+`tubelet` frames ~`tube_dt` apart; a camera with no frame near one of those times is invalid at that step, and a log's
+first clip starts at the first sweep where every camera has its whole tube.
 Every random decision has its own stream: Generator(PCG64(SeedSequence([seed, index, PURPOSE, ...]))).
 """
 from __future__ import annotations
@@ -54,6 +56,7 @@ INPUT_DEPTH_FRACTION = 0.8
 PACK_INFO = 'pack.json'  # written by pack_av2.py at the root of a packed split
 MIN_DEPTH = 0.1          # m, camera z
 MAX_SYNC_DT = 0.06       # s, frame-t image vs lidar sweep
+MAX_TUBE_ERR = 0.25      # x tube_dt, an earlier tube frame vs its target time
 _POSE_COLS = ['qw', 'qx', 'qy', 'qz', 'tx_m', 'ty_m', 'tz_m']
 _BOX_COLS = ['timestamp_ns', 'track_uuid', 'category', 'length_m', 'width_m', 'height_m', *_POSE_COLS,
              'num_interior_pts']
@@ -233,7 +236,11 @@ class Av2ClipDataset(torch.utils.data.Dataset):
             period = float(np.median(np.diff(ts)))
             stride = clip_stride or max(1, round(self.step_dt * 1e9 / period))
             first_ok = ts[0] + (self.frames - 1) * self.tube_dt * 1e9   # tube frames exist before the clip
-            for i in range(int(np.searchsorted(ts, first_ok - 0.25 * period)), len(ts), stride):
+            start = int(np.searchsorted(ts, first_ok - 0.25 * period))
+            cams = self._log_cam_ts(self.dir / log_id)
+            while start < len(ts) and not all(self._camera_frames(cams, c, ts[start]) for c in cams['cam_ts']):
+                start += 1                                                # a camera starts late: no history yet
+            for i in range(start, len(ts), stride):
                 target = ts[i] + np.arange(self.steps) * self.step_dt * 1e9
                 if target[-1] > ts[-1] + 0.5 * period:
                     break
@@ -258,6 +265,11 @@ class Av2ClipDataset(torch.utils.data.Dataset):
     def _has_camera(self, log, cam):
         return (log / 'sensors' / 'cameras' / cam).is_dir()
 
+    def _log_cam_ts(self, log):
+        """{'cam_ts': {cam: timestamps}} for the ring cameras that have frames (enough meta for _camera_frames)."""
+        cam_ts = {c: self._camera_times(log, c) for c in RING_CAMERAS if self._has_camera(log, c)}
+        return {'cam_ts': {c: t for c, t in cam_ts.items() if len(t)}}
+
     def _table(self, path, columns=None):
         """A .feather table as {column: numpy array}, or None when the file is absent."""
         return _read(path, columns) if path.exists() else None
@@ -279,7 +291,8 @@ class Av2ClipDataset(torch.utils.data.Dataset):
 
     def _camera_frames(self, meta, cam, lidar_t):
         """Camera timestamps of the tube for sweep lidar_t, oldest first (the last one is nearest the sweep),
-        or None when no frame is within MAX_SYNC_DT."""
+        or None when no frame is within MAX_SYNC_DT of the sweep, or no strictly older frame is within
+        MAX_TUBE_ERR * tube_dt of an earlier tube time."""
         cts = meta['cam_ts'][cam]
         if not len(cts):
             return None
@@ -288,9 +301,11 @@ class Av2ClipDataset(torch.utils.data.Dataset):
             return None
         idx = [cur]
         for f in range(1, self.frames):                               # earlier tube frames, strictly older
-            j = int(_nearest(cts, np.array([cts[cur] - f * self.tube_dt * 1e9]))[0]) if len(cts) > 1 else 0
-            j = min(j, idx[-1] - 1)
-            idx.append(j if j >= 0 else idx[-1])
+            want = cts[cur] - f * self.tube_dt * 1e9
+            j = min(int(_nearest(cts, np.array([want]))[0]), idx[-1] - 1)
+            if j < 0 or abs(cts[j] - want) > MAX_TUBE_ERR * self.tube_dt * 1e9:
+                return None
+            idx.append(j)
         return [int(cts[j]) for j in idx[::-1]]
 
     def _cam_T_lidar(self, meta, cam, cam_t, city_T_ego):
