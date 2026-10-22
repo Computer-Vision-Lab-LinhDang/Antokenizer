@@ -212,7 +212,10 @@ class CDState(nn.Module):
         D_prev = None
         for t in range(T):
             C_k = Cs[t // K]
-            D_hat = self.d_state.predict(D_prev, C_k)
+            # the prediction is made before X_t arrives, so it uses the C of frame t-1's segment;
+            # at a keyframe that is the previous segment's C, never the C built from X_t
+            D_hat = (self.d_state.init(B, X.dtype) if t == 0
+                     else self.d_state.predict(D_prev, Cs[(t - 1) // K]))
             D_t = self.d_state.correct(D_hat, X[:, t], C_k)
             D_nexts.append(self.d_state.predict(D_t, C_k))
             D_hats.append(D_hat)

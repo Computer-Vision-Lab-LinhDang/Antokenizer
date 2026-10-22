@@ -73,18 +73,12 @@ def test_mask_by_autograd():
         assert g[t] > 0
         assert torch.all(g[t + 1:] == 0), t
 
-    # D_hat_t is made before seeing X_t (at a keyframe it reads X_t only through C_k = f(X_k))
-    seg = out["seg"].tolist()
-    for t in range(6):
+    # D_hat_t is made before X_t arrives: no grad from X_t or later, even at a keyframe
+    # (the keyframe prediction reads the previous segment's C, not the C built from X_t)
+    for t in range(1, 6):
         g = _grad_frames(out["D_hat"][:, t], X)
-        assert torch.all(g[t + 1:] == 0)
-        if t % cfg.keyframe_every != 0:
-            assert g[t] == 0, t
-    # at a keyframe D_hat reads X_k only through C_k: with C detached, no grad to X_t
-    for t in (0, 4):
-        D_prev = None if t == 0 else out["D"][:, t - 1]
-        D_hat = m.d_state.predict(D_prev, out["C"][:, seg[t]].detach())
-        assert _grad_frames(D_hat, X)[t] == 0
+        assert torch.all(g[t:] == 0), t
+    assert not out["D_hat"][:, 0].requires_grad or torch.all(_grad_frames(out["D_hat"][:, 0], X) == 0)
 
     # D_next_t reads up to X_t only
     for t in range(6):
