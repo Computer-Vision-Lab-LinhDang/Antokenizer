@@ -144,7 +144,6 @@ def test_mixed_loaders(tmp_path):
     _write_video(tmp_path / "a.mp4")
     man = tmp_path / "m.jsonl"
     man.write_text(json.dumps(dict(path="a.mp4", n_frames=30, fps=24)) + "\n")
-    (tmp_path / "copy").mkdir()
     from mavt.dino_v0.data import infinite, mixed_loaders
     lds = mixed_loaders(str(tmp_path / "in"), str(man), batch_image=4, batch_video=1, size=32,
                         n_frames=4, num_workers=0)

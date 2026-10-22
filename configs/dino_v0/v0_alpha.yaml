@@ -1,0 +1,79 @@
+# MAVT on DINOv3 v0 -- training on "alpha" (AMD / ROCm, GPUs 1,2,3).
+#
+# Top-level keys are DinoV0Config fields (src/mavt/dino_v0/config.py); `train:` holds
+# defaults for scripts/train_dino_v0.py flags (anything on the command line wins).
+#
+# 0) one-off: a video decoder in the env      pip install av
+# 1) loader throughput check (no model, ~1 min):
+#    python scripts/train_dino_v0.py --config configs/dino_v0/v0_alpha.yaml \
+#      --out /scratch/vunguyen13/mavt/runs/muse-spark-mavt --bench-data 50
+# 2) launch inside tmux (auto-resumes from <out>/last.pt; SIGTERM / Ctrl-C saves last.pt):
+#    tmux new -s mavt
+#    cd ~/Antokenizer && CUDA_VISIBLE_DEVICES=1,2,3 torchrun --standalone --nproc_per_node 3 \
+#      scripts/train_dino_v0.py --config configs/dino_v0/v0_alpha.yaml \
+#      --out /scratch/vunguyen13/mavt/runs/muse-spark-mavt 2>&1 | tee -a /scratch/vunguyen13/mavt/runs/muse-spark-mavt.log
+#    (out of memory -> lower batch_video / batch_image, or add --use-checkpoint)
+# Logs: <out>/log.jsonl (one json per --log-every steps); checkpoints <out>/last.pt + step_XXXXXXX.pt.
+
+# ---- input
+image_size: 256
+patch: 16
+# ---- tier A: frozen DINOv3 ViT-L/16 (local HF dir) + pixel stem
+dino_repo: /scratch/vunguyen13/mavt/weights/dinov3-vitl16
+dino_dim: 1024
+dino_registers: 4
+pix_dim: 256
+# ---- tier B: trunk
+dim: 1024
+heads: 16
+trunk_layers: 8
+mlp_ratio: 4.0
+temporal_window: 1
+# ---- tier C: C at keyframes / D every frame
+keyframe_every: 4
+c_blocks: 2
+d_tokens: 16
+d_dim: 128
+d_blocks: 2
+use_track: false
+use_event_memory: false
+# ---- tier D: latent (budget 12 288 per image / per 4-frame segment)
+zr_c_image: 48
+zr_c_video: 40
+zr_d: 32
+zs_dim: 1024
+# ---- tier E: query decoder
+dec_dim: 768
+dec_heads: 12
+dec_blocks: 4
+read_window: 2
+gate_init_bias: 4.0
+train_queries_per_frame: 64
+# ---- loss weights
+w_rgb: 1.0
+w_lpips: 0.0
+w_feat: 1.0
+w_fut: 0.5
+w_var: 0.1
+w_kl: 1.0e-6
+w_sem: 0.5
+w_gate: 0.01
+
+train:
+  imagenet: /scratch/vunguyen13/data/imagenet-1k
+  openvid: /scratch/vunguyen13/data/dino_v0_data/openvid1m/manifest.jsonl
+  steps: 200000
+  lr: 2.0e-4
+  wd: 0.05
+  warmup: 2000
+  batch_image: 32          # per GPU
+  batch_video: 4           # per GPU, 8 frames each (2 segments of K=4)
+  n_frames: 8
+  frame_stride: 2
+  video_every: 2           # alternate image / video steps
+  grad_accum: 1
+  bf16: true
+  grad_clip: 1.0
+  ckpt_every: 1000
+  log_every: 20
+  num_workers: 8

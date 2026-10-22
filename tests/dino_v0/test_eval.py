@@ -93,19 +93,61 @@ def test_full_eval_path(tmp_path):
     assert "Understanding" in open(mp).read()
 
 
+def test_grouped_batches_and_balanced_selection():
+    groups = [i // 10 for i in range(40)]
+    b = E.grouped_batches(list(range(40)), groups, batch_size=4, num_workers=2)
+    assert sorted(i for x in b for i in x) == list(range(40))
+    # worker w gets batches w, w+2, ...: each group must be touched by one worker only
+    owner = {}
+    for k, batch in enumerate(b):
+        for i in batch:
+            assert owner.setdefault(groups[i], k % 2) == k % 2
+    lab = torch.arange(200) % 5
+    idx = E.balanced_by_groups(lab, torch.arange(200) // 20, per_class=6)
+    assert torch.bincount(lab[idx]).tolist() == [6] * 5
+    assert len(set((idx // 20).tolist())) <= 2            # 20-row groups hold 4 per class: 2 groups suffice
+
+
+def _write_imagenet(root, n=24, classes=3, size=72):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import io
+    import numpy as np
+    from PIL import Image
+    (root / "data").mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    for split in ("train", "validation"):
+        imgs, labs = [], []
+        for i in range(n):
+            buf = io.BytesIO()
+            Image.fromarray(rng.integers(0, 255, (size, size + 8, 3), dtype=np.uint8)).save(buf, "PNG")
+            imgs.append({"bytes": buf.getvalue(), "path": f"{i}.png"})
+            labs.append(i % classes)
+        t = pa.table({"image": imgs, "label": labs})
+        pq.write_table(t, root / "data" / f"{split}-00000-of-00001.parquet", row_group_size=8)
+
+
 def test_script_end_to_end(tmp_path):
-    """The CLI loads a trainer-style checkpoint; with no datasets it still writes JSON."""
+    """The CLI loads a trainer-style checkpoint and runs on a synthetic ImageNet parquet."""
+    pytest.importorskip("mavt.dino_v0.data")
     torch.manual_seed(0)
     cfg = tiny_config()
     ck = tmp_path / "ck.pt"
     torch.save({"model": MAVTDinoV0(cfg).state_dict(), "cfg": cfg.__dict__, "step": 7}, ck)
+    _write_imagenet(tmp_path / "imagenet")
     out = tmp_path / "out"
     r = subprocess.run([sys.executable, str(ROOT / "scripts/eval_dino_v0.py"), "--ckpt", str(ck), "--device", "cpu",
-                        "--out", str(out), "--workers", "0"], capture_output=True, text=True,
-                       env={"PYTHONPATH": str(ROOT / "src"), "PATH": "/usr/bin:/bin"})
-    assert r.returncode == 0, r.stderr
+                        "--out", str(out), "--workers", "2", "--batch-size", "4", "--limit", "16",
+                        "--imagenet-root", str(tmp_path / "imagenet"), "--knn-train", "4", "--knn-k", "3",
+                        "--probe-epochs", "1", "--probe-lrs", "1e-2"],
+                       capture_output=True, text=True, env={"PYTHONPATH": str(ROOT / "src"), "PATH": "/usr/bin:/bin"})
+    assert r.returncode == 0, r.stderr[-3000:]
     res = json.load(open(out / "eval.json"))
     assert res["meta"]["step"] == 7 and res["budget"]["image"] == cfg.budget("image")
+    assert res["image_recon"]["n"] == 16
+    assert res["understanding"]["n_train"] == 12 and res["understanding"]["n_val"] == 16
+    assert any("ssv2" in n for n in res["notes"])
+    assert (out / "eval.md").exists()
 
 
 @pytest.mark.skipif(importlib.util.find_spec("lpips") is None, reason="lpips not installed")
