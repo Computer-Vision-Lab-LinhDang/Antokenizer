@@ -80,14 +80,11 @@ def test_mask_by_autograd():
         assert torch.all(g[t + 1:] == 0)
         if t % cfg.keyframe_every != 0:
             assert g[t] == 0, t
-    # ... and at a keyframe D_hat reads X_k only via C (zero grad through the correct path)
+    # at a keyframe D_hat reads X_k only through C_k: with C detached, no grad to X_t
     for t in (0, 4):
-        C_k = out["C"][:, seg[t]].detach()
-        D_prev = None if t == 0 else out["D"][:, t - 1].detach()
-        X_t = X[:, t].detach().requires_grad_(True)
-        D_hat = m.d_state.predict(D_prev, C_k)
-        assert not D_hat.requires_grad or torch.autograd.grad(
-            D_hat.sum(), X_t, allow_unused=True)[0] is None
+        D_prev = None if t == 0 else out["D"][:, t - 1]
+        D_hat = m.d_state.predict(D_prev, out["C"][:, seg[t]].detach())
+        assert _grad_frames(D_hat, X)[t] == 0
 
     # D_next_t reads up to X_t only
     for t in range(6):
