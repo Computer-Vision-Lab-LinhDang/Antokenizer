@@ -78,8 +78,23 @@ def seeded_clips(manifest, args, size):
     return ds
 
 
-def openvid_heldout(manifest: str, n_tail: int, out_dir: str) -> str:
-    """The last n_tail lines of the OpenVid manifest (dir -> its last *.jsonl by name) as a new jsonl."""
+def openvid_heldout(manifest: str, n_tail: int, out_dir: str, run_list: str = "") -> str:
+    """OpenVid clips held out from training, as a new jsonl.
+
+    If the training run wrote its hold-out list (<run>/openvid_heldout.txt), those exact clips are used:
+    the manifest keeps growing while the run trains, so its current tail is not what was held out.
+    Otherwise falls back to the last n_tail lines of the manifest (dir -> its last *.jsonl by name)."""
+    if run_list and os.path.exists(run_list):
+        import json
+        from mavt.dino_v0.data import read_manifest
+        keep = {l.strip() for l in open(run_list) if l.strip()}
+        rows = [r for r in read_manifest(manifest) if r["path"] in keep]
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "openvid_heldout.jsonl")
+        with open(path, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+        print(f"[data] OpenVid held-out: {len(rows)} clips from the run's list {run_list} -> {path}", flush=True)
+        return path
     if os.path.isdir(manifest):
         files = sorted(glob.glob(os.path.join(manifest, "*.jsonl")))
         if not files:
@@ -160,7 +175,8 @@ def main():
         print("[data] --imagenet-root not given: image reconstruction and understanding skipped", flush=True)
     if args.openvid_manifest:
         _need_data()
-        held = openvid_heldout(args.openvid_manifest, args.video_tail, args.out)
+        held = openvid_heldout(args.openvid_manifest, args.video_tail, args.out,
+                               os.path.join(os.path.dirname(os.path.abspath(args.ckpt)), "openvid_heldout.txt"))
         video = seeded_clips(held, args, size)
     for name, path in (("ssv2", args.ssv2), ("kinetics", args.kinetics)):
         if path:
