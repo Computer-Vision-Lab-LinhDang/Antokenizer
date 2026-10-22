@@ -1,7 +1,7 @@
 """Data for MAVT on DINOv3 v0: ImageNet-1k (HF parquet) images and OpenVid-1M clips.
 
-Both datasets return dicts with 'data' in [-1, 1] and 'modality'; layouts follow the model:
-image [3, H, W], video [3, T, H, W].
+All datasets return dicts with 'data' in [-1, 1] and 'modality'; layouts follow the model:
+image [3, H, W], video and posed 3D views [3, T, H, W] (threed adds 'c2w' [T,4,4] and 'K' [T,3,3]).
 
 ImageNet parquet shards hold ~100 rows per row group, so random row access would re-read a row
 group per sample. `ParquetGroupBatchSampler` instead gives each DataLoader worker its own stream
@@ -184,8 +184,23 @@ class ParquetGroupBatchSampler(Sampler):
 
 
 # ---------------------------------------------------------------------------- OpenVid clips
-def read_manifest(manifest: str) -> list[dict]:
-    """Read a (possibly still growing) jsonl manifest; relative paths resolve against its dir."""
+def read_manifest(manifest: str, path_key: Optional[str] = "path") -> list[dict]:
+    """Read a (possibly still growing) jsonl manifest; relative paths resolve against its dir.
+    A directory means its manifest.jsonl, or else all its *.jsonl files in name order."""
+    if os.path.isdir(manifest):
+        cand = os.path.join(manifest, "manifest.jsonl")
+        files = [cand] if os.path.exists(cand) else sorted(glob.glob(os.path.join(manifest, "*.jsonl")))
+        if not files:
+            raise FileNotFoundError(f"no *.jsonl manifest in {manifest}")
+    else:
+        files = [manifest]
+    out = []
+    for mf in files:
+        out.extend(_read_jsonl(mf, path_key))
+    return out
+
+
+def _read_jsonl(manifest: str, path_key: Optional[str]) -> list[dict]:
     base = os.path.dirname(os.path.abspath(manifest))
     out = []
     with open(manifest) as f:
@@ -197,12 +212,11 @@ def read_manifest(manifest: str) -> list[dict]:
                 r = json.loads(line)
             except json.JSONDecodeError:                           # partial last line while writing
                 continue
-            p = r.get("path")
-            if not p:
-                continue
-            if not os.path.isabs(p):
-                p = os.path.join(base, p)
-            r["path"] = p
+            if path_key is not None:
+                p = r.get(path_key)
+                if not p:
+                    continue
+                r[path_key] = p if os.path.isabs(p) else os.path.join(base, p)
             out.append(r)
     return out
 
@@ -297,15 +311,29 @@ def _pick_decoder():
                       "torchvision.io.read_video is used only as a fallback when it is available.")
 
 
+def split_tail(items: list, tail: int, split: str) -> list:
+    """split 'train' drops the last `tail` items (held out for eval), 'heldout' keeps only them."""
+    if split == "all" or tail <= 0:
+        return items
+    if split == "heldout":
+        return items[-tail:]
+    if split == "train":
+        return items[:-tail] if len(items) > tail else []
+    raise ValueError(f"split must be train | heldout | all, got {split}")
+
+
 class OpenVidClips(Dataset):
     """Random n_frames clips (every `frame_stride`-th frame) from OpenVid-1M at original resolution.
 
     Returns {'data': [3, T, size, size] in [-1, 1], 'modality': 'video'}. Broken files are replaced
-    by another random index (each failing path is logged once)."""
+    by another random index (each failing path is logged once). The last `tail` manifest lines (as
+    read at init) are the eval hold-out: split='train' excludes them, split='heldout' is only them."""
 
     def __init__(self, manifest: str, n_frames: int = 8, frame_stride: int = 2, size: int = 256,
-                 train: bool = True, max_retries: int = 20, decoder=None):
-        self.items = read_manifest(manifest)
+                 train: bool = True, max_retries: int = 20, decoder=None, tail: int = 0,
+                 split: Optional[str] = None):
+        split = split or ("train" if train else "heldout")
+        self.items = split_tail(read_manifest(manifest), tail, split)
         if not self.items:
             raise RuntimeError(f"empty manifest {manifest}")
         self.n_frames, self.stride, self.size, self.train = n_frames, frame_stride, size, train
@@ -342,15 +370,121 @@ class OpenVidClips(Dataset):
         raise RuntimeError(f"OpenVidClips: {self.max_retries} consecutive broken files")
 
 
+# ---------------------------------------------------------------------------- Objaverse posed views
+def objaverse_camera(cam: dict, size: int, render_size: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
+    """Render json -> (c2w [4,4] OpenCV, K [3,3] at `size`). The json axes are already OpenCV:
+    c2w columns = x, y, z, origin. fx = (W/2) / tan(x_fov/2) at render resolution, scaled to `size`."""
+    c2w = torch.eye(4)
+    for j, k in enumerate(("x", "y", "z", "origin")):
+        c2w[:3, j] = torch.tensor(cam[k], dtype=torch.float32)
+    half = render_size / 2
+    fx = half / math.tan(cam["x_fov"] / 2)
+    fy = half / math.tan(cam.get("y_fov", cam["x_fov"]) / 2)
+    s = size / render_size
+    K = torch.tensor([[fx * s, 0.0, half * s], [0.0, fy * s, half * s], [0.0, 0.0, 1.0]])
+    return c2w, K
+
+
+class ObjaverseViews(Dataset):
+    """n_views random distinct posed renders of one Objaverse object (view 0 = keyframe).
+
+    root/manifest.lvis_full.jsonl rows (uid, category, blank, ...); blank objects are skipped.
+    root/renders/<uid>/NNNNN.png (RGBA, transparent bg) + NNNNN.json camera. RGBA is composited
+    over a background (train: one random gray level per object, eval: white) and resized to `size`
+    (no crop). The last `holdout` non-blank uids are the eval split ('heldout'); 'train' excludes them.
+    Returns {'data': [3,T,H,W], 'modality': 'threed', 'c2w': [T,4,4], 'K': [T,3,3], 'label': category}."""
+
+    MANIFEST = "manifest.lvis_full.jsonl"
+
+    def __init__(self, root: str, n_views: int = 4, size: int = 256, train: bool = True, bg: str = "random",
+                 holdout: int = 500, split: Optional[str] = None, manifest: Optional[str] = None,
+                 max_retries: int = 20):
+        self.root, self.n_views, self.size, self.train = root, n_views, size, train
+        self.bg = bg if train else ("white" if bg == "random" else bg)
+        split = split or ("train" if train else "heldout")
+        rows = read_manifest(manifest or os.path.join(root, self.MANIFEST), path_key=None)
+        rows = [r for r in rows if r.get("uid") and not r.get("blank", False)]
+        self.items = split_tail(rows, holdout, split)
+        if not self.items:
+            raise RuntimeError(f"no objects for split={split} under {root}")
+        self.max_retries = max_retries
+        self._bad: set = set()
+        self._rng = random.Random()
+
+    @staticmethod
+    def heldout_uids(root: str, holdout: int = 500, manifest: Optional[str] = None) -> list[str]:
+        rows = read_manifest(manifest or os.path.join(root, ObjaverseViews.MANIFEST), path_key=None)
+        return [r["uid"] for r in rows if r.get("uid") and not r.get("blank", False)][-holdout:] if holdout > 0 else []
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _views(self, d: str) -> list[str]:
+        return sorted(f[:-4] for f in os.listdir(d)
+                      if f.endswith(".png") and not f.endswith("_depth.png")
+                      and os.path.exists(os.path.join(d, f[:-4] + ".json")))
+
+    def _load(self, i: int, rng: random.Random) -> dict:
+        from PIL import Image
+        r = self.items[i]
+        d = os.path.join(self.root, "renders", r["uid"])
+        names = self._views(d)
+        if not names:
+            raise RuntimeError("no views")
+        if self.train:
+            pick = rng.sample(names, self.n_views) if len(names) >= self.n_views else \
+                [rng.choice(names) for _ in range(self.n_views)]
+        else:                                                       # eval: fixed, spread-out views
+            pick = [names[(k * len(names)) // self.n_views] for k in range(self.n_views)]
+        level = rng.randint(0, 255) if self.bg == "random" else (0 if self.bg == "black" else 255)
+        frames, c2ws, Ks = [], [], []
+        for n in pick:
+            im = Image.open(os.path.join(d, n + ".png")).convert("RGBA")
+            rw = im.size[0]
+            bgim = Image.new("RGBA", im.size, (level, level, level, 255))
+            im = Image.alpha_composite(bgim, im).convert("RGB")
+            if im.size != (self.size, self.size):
+                im = im.resize((self.size, self.size), Image.BICUBIC)
+            frames.append(np.asarray(im))
+            with open(os.path.join(d, n + ".json")) as f:
+                c2w, K = objaverse_camera(json.load(f), self.size, render_size=rw)
+            c2ws.append(c2w)
+            Ks.append(K)
+        return dict(data=_to_tensor(np.stack(frames)), modality="threed", c2w=torch.stack(c2ws),
+                    K=torch.stack(Ks), label=r.get("category", ""))
+
+    def __getitem__(self, i: int) -> dict:
+        rng = self._rng if self.train else random.Random(i)
+        for _ in range(self.max_retries):
+            try:
+                return self._load(i, rng)
+            except Exception as ex:
+                uid = self.items[i]["uid"]
+                if uid not in self._bad:
+                    self._bad.add(uid)
+                    log.warning("ObjaverseViews: skipping %s (%s: %s)", uid, type(ex).__name__, ex)
+                i = self._rng.randrange(len(self.items))
+        raise RuntimeError(f"ObjaverseViews: {self.max_retries} consecutive broken objects")
+
+
 # ---------------------------------------------------------------------------- loaders
 def collate(batch: list[dict]) -> dict:
     out = dict(data=torch.stack([b["data"] for b in batch]), modality=batch[0]["modality"])
+    for k in ("c2w", "K"):
+        if k in batch[0]:
+            out[k] = torch.stack([b[k] for b in batch])
     if "label" in batch[0]:
-        out["label"] = torch.tensor([b["label"] for b in batch])
+        labs = [b["label"] for b in batch]
+        out["label"] = torch.tensor(labs) if all(isinstance(l, int) for l in labs) else labs
     return out
 
 
 def _worker_init(wid: int) -> None:
+    import signal
+    # SIGTERM/SIGINT go to the whole process group (torchrun, tmux Ctrl-C); workers ignore them so the
+    # trainer can finish its step and save. They still exit when the main process goes away.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     info = torch.utils.data.get_worker_info()
     seed = info.seed % (2 ** 32)
     random.seed(seed)
@@ -360,13 +494,16 @@ def _worker_init(wid: int) -> None:
         ds._rng = random.Random(seed)
 
 
-def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None, *,
-                  batch_image: int = 32, batch_video: int = 4, size: int = 256, n_frames: int = 8,
-                  frame_stride: int = 2, num_workers: int = 8, rank: int = 0, world: int = 1,
-                  seed: int = 0, split: str = "train") -> dict:
-    """{'image': (loader, sampler), 'video': (loader, sampler)} for whichever sources are given.
-    Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video uses
-    DistributedSampler."""
+def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
+                  objaverse: Optional[str] = None, *, batch_image: int = 32, batch_video: int = 4,
+                  batch_3d: int = 4, size: int = 256, n_frames: int = 8, frame_stride: int = 2,
+                  n_views: int = 4, video_tail: int = 1000, objaverse_holdout: int = 500,
+                  num_workers: int = 8, rank: int = 0, world: int = 1, seed: int = 0,
+                  split: str = "train") -> dict:
+    """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
+    Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
+    DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
+    are excluded."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -379,9 +516,14 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
         bs = ParquetGroupBatchSampler(ds, batch_image, num_workers, rank, world, seed, shuffle=train)
         out["image"] = (DataLoader(ds, batch_sampler=bs, **common), bs)
     if openvid:
-        ds = OpenVidClips(openvid, n_frames=n_frames, frame_stride=frame_stride, size=size, train=train)
+        ds = OpenVidClips(openvid, n_frames=n_frames, frame_stride=frame_stride, size=size, train=train,
+                          tail=video_tail)
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
         out["video"] = (DataLoader(ds, batch_size=batch_video, sampler=smp, drop_last=True, **common), smp)
+    if objaverse:
+        ds = ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout)
+        smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
+        out["threed"] = (DataLoader(ds, batch_size=batch_3d, sampler=smp, drop_last=True, **common), smp)
     return out
 
 

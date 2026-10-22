@@ -27,9 +27,9 @@ def test_dry_run_writes_ckpt_and_log(tmp_path):
     assert (out / "last.pt").exists() and (out / "log.jsonl").exists()
     recs = [json.loads(l) for l in (out / "log.jsonl").read_text().splitlines()]
     assert [r["step"] for r in recs] == [1, 2, 3]
-    assert [r["modality"] for r in recs] == ["image", "video", "image"]
+    assert [r["modality"] for r in recs] == ["image", "video", "threed"]
     assert all(np.isfinite(r["loss"]) and "lr" in r and "it_s" in r for r in recs)
-    assert "loss_fut" in recs[1] and "loss_rgb" in recs[0]
+    assert "loss_fut" in recs[1] and "loss_rgb" in recs[0] and "loss_rgb" in recs[2]
     ck = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
     assert ck["step"] == 3 and {"model", "optim", "sched", "cfg"} <= set(ck)
     assert not any(k.startswith("encoder.dino.model.") for k in ck["model"])   # frozen DINO not saved
@@ -45,7 +45,8 @@ def test_yaml_config_parses(tmp_path):
     cfg = tr.make_config(mcfg, dry=False)
     assert cfg.image_size == 256 and cfg.keyframe_every == 4 and cfg.train_queries_per_frame == 64
     assert cfg.dino_repo.endswith("dinov3-vitl16")
-    assert args.lr == 1e-4 and args.bf16
+    assert args.lr == 1e-4 and args.bf16 and args.objaverse and args.video_tail == 1000
+    assert tr.parse_weights(args.modality_weights) == dict(image=0.4, video=0.4, threed=0.2)
 
 
 # ---------------------------------------------------------------------------- data
@@ -145,11 +146,81 @@ def test_mixed_loaders(tmp_path):
     man = tmp_path / "m.jsonl"
     man.write_text(json.dumps(dict(path="a.mp4", n_frames=30, fps=24)) + "\n")
     from mavt.dino_v0.data import infinite, mixed_loaders
-    lds = mixed_loaders(str(tmp_path / "in"), str(man), batch_image=4, batch_video=1, size=32,
-                        n_frames=4, num_workers=0)
+    _write_objaverse(tmp_path / "obj", n_obj=4)
+    lds = mixed_loaders(str(tmp_path / "in"), str(man), str(tmp_path / "obj"), batch_image=4, batch_video=1,
+                        batch_3d=2, size=32, n_frames=4, n_views=3, video_tail=0, objaverse_holdout=1,
+                        num_workers=0)
     it = infinite(*lds["image"])
     for _ in range(7):                                                  # crosses an epoch boundary
         b = next(it)
         assert b["data"].shape == (4, 3, 32, 32) and b["modality"] == "image"
     vb = next(infinite(*lds["video"]))
     assert vb["data"].shape == (1, 3, 4, 32, 32)
+    tb = next(infinite(*lds["threed"]))
+    assert tb["data"].shape == (2, 3, 3, 32, 32) and tb["c2w"].shape == (2, 3, 4, 4) and tb["K"].shape == (2, 3, 3, 3)
+    assert tb["modality"] == "threed" and isinstance(tb["label"], list)
+
+
+def test_openvid_tail_holdout(tmp_path):
+    from mavt.dino_v0.data import OpenVidClips
+    man = tmp_path / "m.jsonl"
+    man.write_text("".join(json.dumps(dict(path=f"v{i}.mp4")) + "\n" for i in range(10)))
+    tr = OpenVidClips(str(man), tail=3, decoder=lambda *a, **k: None)
+    ho = OpenVidClips(str(man), tail=3, train=False, decoder=lambda *a, **k: None)
+    assert len(tr) == 7 and len(ho) == 3 and ho.items[0]["path"].endswith("v7.mp4")
+    assert len(OpenVidClips(str(tmp_path), tail=0, decoder=lambda *a, **k: None)) == 10   # dir -> *.jsonl
+
+
+# ---------------------------------------------------------------------------- objaverse
+def _write_objaverse(root, n_obj=5, n_views=6, res=64):
+    from PIL import Image
+    import math
+    (root / "renders").mkdir(parents=True)
+    rows = []
+    for k in range(n_obj):
+        uid = f"uid{k:03d}"
+        blank = k == 1
+        rows.append(dict(uid=uid, category=f"cat{k % 2}", n_views=n_views, blank=blank, alpha_mean=0.2))
+        d = root / "renders" / uid
+        d.mkdir()
+        for v in range(n_views):
+            a = np.zeros((res, res, 4), np.uint8)
+            a[res // 4: 3 * res // 4, res // 4: 3 * res // 4] = (200, 30, 30, 255)   # opaque red square
+            Image.fromarray(a, "RGBA").save(d / f"{v:05d}.png")
+            Image.fromarray(np.zeros((res, res), np.uint16)).save(d / f"{v:05d}_depth.png")
+            ang = 2 * math.pi * v / n_views
+            o = [2 * math.cos(ang), 2 * math.sin(ang), 0.0]
+            z = [-o[0] / 2, -o[1] / 2, 0.0]
+            x = [-z[1], z[0], 0.0]
+            cam = dict(max_depth=5.0, origin=o, x_fov=0.6911, y_fov=0.6911, x=x, y=[0.0, 0.0, -1.0], z=z)
+            (d / f"{v:05d}.json").write_text(json.dumps(cam))
+    (root / "manifest.lvis_full.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return rows
+
+
+def test_objaverse_views(tmp_path):
+    pytest.importorskip("PIL")
+    import math
+    _write_objaverse(tmp_path, n_obj=5)
+    from mavt.dino_v0.data import ObjaverseViews
+    tr = ObjaverseViews(str(tmp_path), n_views=4, size=32, train=True, holdout=2)
+    ho = ObjaverseViews(str(tmp_path), n_views=4, size=32, train=False, holdout=2)
+    assert [r["uid"] for r in tr.items] == ["uid000", "uid002"]           # blank uid001 skipped
+    assert [r["uid"] for r in ho.items] == ["uid003", "uid004"]
+    assert ObjaverseViews.heldout_uids(str(tmp_path), 2) == ["uid003", "uid004"]
+    s = tr[0]
+    assert s["data"].shape == (3, 4, 32, 32) and s["modality"] == "threed" and s["label"] == "cat0"
+    assert s["c2w"].shape == (4, 4, 4) and s["K"].shape == (4, 3, 3)
+    # distinct views; c2w columns = x, y, z, origin; rotation orthonormal
+    origins = s["c2w"][:, :3, 3]
+    assert len({tuple(o.round(decimals=4).tolist()) for o in origins}) == 4
+    R = s["c2w"][:, :3, :3]
+    assert torch.allclose(R.transpose(-1, -2) @ R, torch.eye(3).expand(4, 3, 3), atol=1e-3)
+    f = 32 / 2 / math.tan(0.6911 / 2)                                     # K scaled from render res to size
+    assert torch.allclose(s["K"][0], torch.tensor([[f, 0, 16.0], [0, f, 16.0], [0, 0, 1.0]]), atol=1e-3)
+    # eval background is white, train background is one gray level per object
+    e = ho[0]["data"]
+    assert torch.allclose(e[:, :, 0, 0], torch.ones(3, 4))
+    corners = s["data"][:, :, 0, 0]
+    assert torch.allclose(corners, corners[0, 0].expand_as(corners))
+    assert torch.equal(ho[1]["data"], ho[1]["data"])                       # eval is deterministic

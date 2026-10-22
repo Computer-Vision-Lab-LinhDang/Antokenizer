@@ -61,16 +61,21 @@ w_gate: 0.01
 
 train:
   imagenet: /scratch/vunguyen13/data/imagenet-1k
-  openvid: /scratch/vunguyen13/data/dino_v0_data/openvid1m/manifest.jsonl
+  openvid: /scratch/vunguyen13/data/dino_v0_data/openvid1m   # dir -> its manifest.jsonl or all *.jsonl
+  objaverse: /scratch/vunguyen13/data/objaverse-lvis-subset-v1
+  video_tail: 1000         # last 1000 OpenVid manifest lines -> eval only (<out>/openvid_heldout.txt)
+  objaverse_holdout: 500   # last 500 non-blank uids -> eval only (<out>/objaverse_heldout.txt)
   steps: 200000
   lr: 2.0e-4
   wd: 0.05
   warmup: 2000
   batch_image: 32          # per GPU
   batch_video: 4           # per GPU, 8 frames each (2 segments of K=4)
+  batch_3d: 4              # per GPU, objects of n_views posed views
+  n_views: 4
   n_frames: 8
   frame_stride: 2
-  video_every: 2           # alternate image / video steps
+  modality_weights: image:0.4,video:0.4,threed:0.2   # one modality per step, same draw on all ranks
   grad_accum: 1
   bf16: true
   grad_clip: 1.0

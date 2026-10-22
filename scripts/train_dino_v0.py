@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train MAVT on DINOv3 v0 (torchrun DDP; image + video steps alternate).
+"""Train MAVT on DINOv3 v0 (torchrun DDP; image / video / posed-3D-view steps, one modality per step).
 
   CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node 3 scripts/train_dino_v0.py \
       --config configs/dino_v0/v0_alpha.yaml --out /scratch/.../runs/muse-spark-mavt
@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=False, default=None)
     p.add_argument("--imagenet", default=None, help="ImageNet-1k HF parquet root")
     p.add_argument("--openvid", default=None, help="OpenVid jsonl manifest")
+    p.add_argument("--objaverse", default=None, help="Objaverse render root (manifest.lvis_full.jsonl + renders/)")
     p.add_argument("--steps", type=int, default=200_000)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.05, help="cosine floor as a fraction of --lr")
@@ -44,9 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=2000)
     p.add_argument("--batch-image", type=int, default=32, help="per GPU")
     p.add_argument("--batch-video", type=int, default=4, help="per GPU")
+    p.add_argument("--batch-3d", type=int, default=4, help="per GPU, objects of --n-views views")
+    p.add_argument("--n-views", type=int, default=4)
+    p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
+    p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
     p.add_argument("--n-frames", type=int, default=8)
     p.add_argument("--frame-stride", type=int, default=2)
-    p.add_argument("--video-every", type=int, default=2, help="1 video step every N steps (0: never)")
+    p.add_argument("--modality-weights", default=None,
+                   help="e.g. image:0.4,video:0.4,threed:0.2 (seeded per step, same on all ranks); "
+                        "default: --video-every alternation, or 0.4/0.4/0.2 when --objaverse is given")
+    p.add_argument("--video-every", type=int, default=2, help="1 video step every N steps (0: never); "
+                   "used only without --modality-weights and --objaverse")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -167,20 +176,67 @@ def load_ckpt(path: str, model, opt, sched) -> int:
 
 
 # ---------------------------------------------------------------------------- data
+def orbit_cams(B: int, T: int, size: int) -> dict:
+    """Synthetic OpenCV cameras on a circle of radius 2 looking at the origin (dry-run)."""
+    c2w = torch.zeros(B, T, 4, 4)
+    for t in range(T):
+        a = 2 * math.pi * t / T
+        o = torch.tensor([2 * math.cos(a), 2 * math.sin(a), 0.3])
+        z = -o / o.norm()
+        x = torch.linalg.cross(z, torch.tensor([0.0, 0.0, -1.0]))
+        x = x / x.norm()
+        y = torch.linalg.cross(z, x)
+        c2w[:, t, :3, 0], c2w[:, t, :3, 1], c2w[:, t, :3, 2], c2w[:, t, :3, 3] = x, y, z, o
+        c2w[:, t, 3, 3] = 1
+    f = size / 2 / math.tan(0.3456)
+    K = torch.tensor([[f, 0, size / 2], [0, f, size / 2], [0, 0, 1.0]]).expand(B, T, 3, 3).clone()
+    return dict(c2w=c2w, K=K)
+
+
 def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, seed: int):
     g = torch.Generator().manual_seed(seed)
     s = cfg.image_size
     shape = (batch, 3, s, s) if modality == "image" else (batch, 3, n_frames, s, s)
     while True:
-        yield dict(data=torch.rand(shape, generator=g) * 2 - 1, modality=modality)
+        b = dict(data=torch.rand(shape, generator=g) * 2 - 1, modality=modality)
+        if modality == "threed":
+            b.update(orbit_cams(batch, n_frames, s))
+        yield b
 
 
 def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dict:
     from mavt.dino_v0.data import infinite, mixed_loaders
-    lds = mixed_loaders(args.imagenet, args.openvid, batch_image=args.batch_image, batch_video=args.batch_video,
-                        size=cfg.image_size, n_frames=args.n_frames, frame_stride=args.frame_stride,
+    lds = mixed_loaders(args.imagenet, args.openvid, args.objaverse, batch_image=args.batch_image,
+                        batch_video=args.batch_video, batch_3d=args.batch_3d, size=cfg.image_size,
+                        n_frames=args.n_frames, frame_stride=args.frame_stride, n_views=args.n_views,
+                        video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
                         num_workers=args.num_workers, rank=rank, world=world, seed=seed)
     return {m: infinite(ld, smp) for m, (ld, smp) in lds.items()}
+
+
+def write_heldout(args) -> None:
+    """Record the eval hold-outs excluded from training (rank 0)."""
+    from mavt.dino_v0.data import ObjaverseViews, read_manifest, split_tail
+    if args.objaverse and args.objaverse_holdout > 0:
+        uids = ObjaverseViews.heldout_uids(args.objaverse, args.objaverse_holdout)
+        with open(os.path.join(args.out, "objaverse_heldout.txt"), "w") as f:
+            f.write("".join(u + "\n" for u in uids))
+    if args.openvid and args.video_tail > 0:
+        rows = split_tail(read_manifest(args.openvid), args.video_tail, "heldout")
+        with open(os.path.join(args.out, "openvid_heldout.txt"), "w") as f:
+            f.write("".join(r["path"] + "\n" for r in rows))
+
+
+def parse_weights(spec: str) -> dict:
+    w = {}
+    for part in spec.split(","):
+        if part.strip():
+            k, v = part.split(":")
+            w[k.strip()] = float(v)
+    bad = set(w) - {"image", "video", "threed"}
+    if bad:
+        raise SystemExit(f"unknown modalities in --modality-weights: {sorted(bad)}")
+    return w
 
 
 def bench_data(args, cfg, rank, world) -> None:
@@ -204,7 +260,7 @@ def main(argv=None) -> int:
     args, model_cfg = parse_args(argv)
     dry = args.dry_run
     if dry:
-        args.steps, args.batch_image, args.batch_video, args.n_frames = 3, 2, 2, 4
+        args.steps, args.batch_image, args.batch_video, args.batch_3d, args.n_frames = 3, 2, 2, 2, 4
         args.warmup, args.log_every, args.ckpt_every, args.bf16 = 1, 1, 2, False
     cfg = make_config(model_cfg, dry)
     rank, world, local, dev = setup_dist(dry)
@@ -243,16 +299,31 @@ def main(argv=None) -> int:
             model, device_ids=[dev.index] if dev.type == "cuda" else None, find_unused_parameters=True)
 
     if dry:
-        its = {m: synthetic_iter(m, args.batch_image if m == "image" else args.batch_video, cfg, args.n_frames, seed)
-               for m in ("image", "video")}
+        bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d)
+        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed) for m in ("image", "video", "threed")}
     else:
         its = build_data(args, cfg, rank, world, seed + step)
     if not its:
         raise SystemExit("no data: pass --imagenet and/or --openvid (or --dry-run)")
 
+    weights = None
+    if args.modality_weights:
+        weights = parse_weights(args.modality_weights)
+    elif "threed" in its:
+        weights = dict(image=0.4, video=0.4, threed=0.2)
+    if weights is not None:
+        weights = {m: w for m, w in weights.items() if m in its and w > 0}
+        if not weights:
+            raise SystemExit("--modality-weights selects no available modality")
+
     def modality_for(s: int) -> str:
+        if dry:
+            return ("image", "video", "threed")[s % 3]
+        if weights is not None:                                  # same draw on every rank
+            r = random.Random(args.seed * 1_000_003 + s)
+            return r.choices(list(weights), weights=list(weights.values()))[0]
         if "video" not in its:
-            return "image"
+            return next(iter(its))
         if "image" not in its:
             return "video"
         return "video" if args.video_every > 0 and s % args.video_every == args.video_every - 1 else "image"
@@ -280,7 +351,9 @@ def main(argv=None) -> int:
         print(f"world={world} device={dev} trainable={n_train / 1e6:.1f}M start_step={step} "
               f"data={sorted(its)}", flush=True)
         with open(os.path.join(args.out, "config.json"), "w") as f:
-            json.dump(dict(cfg=dataclasses.asdict(cfg), args=vars(args)), f, indent=1)
+            json.dump(dict(cfg=dataclasses.asdict(cfg), args=vars(args), modality_weights=weights), f, indent=1)
+        if not dry:
+            write_heldout(args)
     log_f = open(os.path.join(args.out, "log.jsonl"), "a") if rank == 0 else None
     use_amp = args.bf16 and dev.type == "cuda"
     if dev.type == "cuda":
@@ -292,13 +365,22 @@ def main(argv=None) -> int:
         modality = modality_for(step)
         opt.zero_grad(set_to_none=True)
         for micro in range(args.grad_accum):
-            b = next(its[modality])
+            try:
+                b = next(its[modality])
+            except Exception:
+                if stop["flag"] and rank == 0:                  # loader torn down by the signal
+                    save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args)
+                    print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
+                raise
             x = b["data"].to(dev, non_blocking=True)
+            cam = None
+            if modality == "threed":
+                cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
             sync = micro == args.grad_accum - 1
             ctx = ddp.no_sync() if (is_dist() and not sync) else _null()
             with ctx:
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
-                    out = ddp(x, modality)
+                    out = ddp(x, modality, cam)
                 (out["loss"] / args.grad_accum).backward()
             clips_since += x.shape[0]
         gnorm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
