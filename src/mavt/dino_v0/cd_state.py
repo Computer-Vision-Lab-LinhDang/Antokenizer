@@ -111,7 +111,9 @@ class CBuilder(nn.Module):
         self.rope = AxialRoPE(cfg.dim // cfg.heads)
         self.blocks = nn.ModuleList([CBlock(cfg) for _ in range(cfg.c_blocks)])
         self.norm = nn.LayerNorm(cfg.dim)
-        self.register_buffer("nbr", neighbourhood_mask(cfg.grid), persistent=False)
+        # additive float mask (0 / -inf): bool masks gave zero gradients on some SDPA backends
+        nbr = torch.zeros(cfg.n_patches, cfg.n_patches).masked_fill(~neighbourhood_mask(cfg.grid), float("-inf"))
+        self.register_buffer("nbr", nbr, persistent=False)
 
     def forward(self, x_k: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """x_k [B, N, dim], coords / mask [N, 4] -> C_k [B, N, dim]."""
@@ -119,7 +121,7 @@ class CBuilder(nn.Module):
         ang = self.rope.angles(coords, mask)                     # cells share the patch coords of X_k
         c = self.c0.unsqueeze(0).expand(B, -1, -1).to(x_k.dtype)
         for blk in self.blocks:
-            c = blk(c, x_k, self.rope, ang, self.nbr)
+            c = blk(c, x_k, self.rope, ang, self.nbr.to(x_k.dtype))
         return self.norm(c)
 
 
