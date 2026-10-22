@@ -152,6 +152,60 @@ def make_loader(ds, batch_size: int, num_workers: int = 0, shuffle: bool = False
                                        persistent_workers=False)
 
 
+def as_loader(ds_or_loader, batch_size: int, num_workers: int = 0):
+    """A DataLoader is used as given (e.g. with a grouped batch_sampler); a Dataset gets a plain loader."""
+    if isinstance(ds_or_loader, torch.utils.data.DataLoader):
+        return ds_or_loader
+    return make_loader(ds_or_loader, batch_size, num_workers)
+
+
+def grouped_batches(indices: Sequence[int], group_ids: Sequence[int], batch_size: int,
+                    num_workers: int) -> List[List[int]]:
+    """Batches for a row-group-backed dataset (parquet): each DataLoader worker gets whole groups.
+
+    Groups are dealt round-robin to max(1, num_workers) streams; batches are emitted round-robin over
+    the streams, matching DataLoader's dispatch order, so every row group is decoded by one worker only.
+    """
+    by_group: Dict[int, List[int]] = {}
+    for i, g in zip(indices, group_ids):
+        by_group.setdefault(int(g), []).append(int(i))
+    gs = sorted(by_group)
+    W = max(1, num_workers)
+    streams = []
+    for w in range(W):
+        rows = [i for g in gs[w::W] for i in by_group[g]]
+        streams.append([rows[b:b + batch_size] for b in range(0, len(rows), batch_size)])
+    out, r = [], 0
+    while any(r < len(s) for s in streams):
+        out += [s[r] for s in streams if r < len(s)]
+        r += 1
+    return out
+
+
+def balanced_by_groups(labels: torch.Tensor, group_ids: torch.Tensor, per_class: int, seed: int = 0) -> torch.Tensor:
+    """Up to per_class indices per class, reading as few row groups as possible: visit groups in a random
+    order and keep each row whose class is not yet full; stop when every class is full. Sorted indices."""
+    labels, group_ids = torch.as_tensor(labels).long(), torch.as_tensor(group_ids).long()
+    C = int(labels.max()) + 1
+    need = torch.full((C,), per_class, dtype=torch.long)
+    need[torch.bincount(labels[labels >= 0], minlength=C) == 0] = 0
+    g = torch.Generator().manual_seed(seed)
+    order = group_ids.unique()[torch.randperm(group_ids.unique().numel(), generator=g)]
+    sort = torch.argsort(group_ids, stable=True)
+    gs = group_ids[sort]
+    out = []
+    for grp in order.tolist():
+        lo, hi = torch.searchsorted(gs, grp).item(), torch.searchsorted(gs, grp, right=True).item()
+        for i in sort[lo:hi].tolist():
+            c = int(labels[i])
+            if c >= 0 and need[c] > 0:
+                need[c] -= 1
+                out.append(i)
+        if int(need.sum()) == 0:
+            break
+    return torch.tensor(sorted(out), dtype=torch.long)
+
+
 def _take(batch, key="data"):
     return batch[key] if isinstance(batch, dict) else batch[0]
 
@@ -412,7 +466,7 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
              num_classes: Optional[int] = None, probe_epochs: int = 10,
              probe_lrs: Sequence[float] = (1e-3, 3e-3, 1e-2, 3e-2), use_lpips: bool = True,
              use_fid: bool = True, extra_video: Optional[dict] = None, log: Optional[Logger] = None) -> dict:
-    """Run every eval whose dataset is given. extra_video: {name: dataset | None} (None -> skipped)."""
+    """Run every eval whose dataset (or ready DataLoader) is given. extra_video: {name: dataset | None}."""
     log = log or Logger()
     cfg: DinoV0Config = model.cfg
     res: dict = dict(budget=dict(image=cfg.budget("image"), video_segment=cfg.budget("video"),
@@ -426,14 +480,14 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
             if opt is not None and not opt.available:
                 res["notes"].append(opt.reason)
                 log(opt.reason, force=True)
-        out = image_pass(model, make_loader(image_val, batch_size, num_workers), device, amp=amp, limit=limit,
+        out = image_pass(model, as_loader(image_val, batch_size, num_workers), device, amp=amp, limit=limit,
                          recon=True, feats=image_train is not None, lpips=lp, fid=fid, log=log)
         val_feats = dict(features=out.pop("features", None), labels=out.pop("labels", None))
         out["budget"] = cfg.budget("image")
         res["image_recon"] = out
         log(f"image recon: {json.dumps(out)}", force=True)
     if image_train is not None and val_feats is not None and val_feats["labels"] is not None:
-        tr = image_pass(model, make_loader(image_train, batch_size, num_workers), device, amp=amp,
+        tr = image_pass(model, as_loader(image_train, batch_size, num_workers), device, amp=amp,
                         recon=False, feats=True, log=log)
         res["understanding"] = understanding(tr, val_feats, k=knn_k, temperature=knn_t, num_classes=num_classes,
                                              probe_epochs=probe_epochs, probe_lrs=probe_lrs, device=device,
@@ -441,7 +495,7 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
     elif image_train is not None:
         res["notes"].append("understanding skipped: image val set has no labels or was not given")
     if video is not None:
-        res["video_recon"] = video_pass(model, make_loader(video, video_batch_size, num_workers), device,
+        res["video_recon"] = video_pass(model, as_loader(video, video_batch_size, num_workers), device,
                                         amp=amp, limit=video_limit, log=log)
         log(f"video recon: {json.dumps(res['video_recon'])}", force=True)
     for name, ds in (extra_video or {}).items():
@@ -450,7 +504,7 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
             res["notes"].append(msg)
             log(msg, force=True)
             continue
-        res[f"video_{name}"] = video_pass(model, make_loader(ds, video_batch_size, num_workers), device,
+        res[f"video_{name}"] = video_pass(model, as_loader(ds, video_batch_size, num_workers), device,
                                           amp=amp, limit=video_limit, log=log)
     return res
 
@@ -462,7 +516,7 @@ def _f(v, fmt="{:.4f}"):
 def to_markdown(res: dict) -> str:
     lines = [f"# MAVT DINOv3 v0 eval", ""]
     if "meta" in res:
-        lines += [f"- {k}: {v}" for k, v in res["meta"].items()] + [""]
+        lines += [f"- {k}: {v}" for k, v in res["meta"].items() if k != "cfg"] + [""]
     b = res.get("budget", {})
     lines += [f"Latent budget: image {b.get('image')} values; video {b.get('video_segment')} per "
               f"K-frame segment ({_f(b.get('video_per_frame'), '{:.0f}')} per frame)", ""]
