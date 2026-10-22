@@ -29,6 +29,10 @@ class DinoV0Config:
     trunk_layers: int = 8
     mlp_ratio: float = 4.0
     temporal_window: int = 1             # radius of the (2r+1)^2 window each token reads at frame t-1
+    rgat_relations: int = 0              # 0 = R0 plain attention; > 0 (e.g. 4) = R2 learned relations per edge
+    rgat_rank: int = 32                  # rank of each relation's value transform U_r V_r^T (per head)
+    rgat_entropy_w: float = 0.01         # weight of -H(batch-marginal of r): anti-collapse of relation usage
+    rgat_tau: float = 1.0                # Gumbel-softmax temperature of the relation choice
     # ---- tier C: C / D -------------------------------------------------------------------
     keyframe_every: int = 4              # K
     c_blocks: int = 2                    # C_k: self-attn over C + cross-attn to X_k
