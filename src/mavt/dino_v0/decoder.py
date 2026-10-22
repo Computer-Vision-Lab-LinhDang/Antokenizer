@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .camera import ZeroLinear
 from .config import DinoV0Config
 from .rope import AxialRoPE, grid_coords
 
@@ -179,6 +180,7 @@ class QueryDecoder(nn.Module):
 
     def __init__(self, cfg: DinoV0Config, feat_dim: int):
         super().__init__()
+        self.ray_q = ZeroLinear(6, cfg.dec_dim)        # query rays for posed views; zero at init
         d = cfg.dec_dim
         self.cfg, self.grid, self.r = cfg, cfg.grid, cfg.read_window
         self.in_c_image = nn.Linear(cfg.zr_c_image, d)
@@ -204,7 +206,9 @@ class QueryDecoder(nn.Module):
         return self.offset(torch.cat([dm, fourier_uv(q_coords[..., 1:3], self.n_fourier).to(dm.dtype)], -1))
 
     def forward(self, zc: torch.Tensor, zd: Optional[torch.Tensor], q_coords: torch.Tensor,
-                q_mask: torch.Tensor, modality: str, delta_override: Optional[torch.Tensor] = None) -> dict:
+                q_mask: torch.Tensor, modality: str, delta_override: Optional[torch.Tensor] = None,
+                q_rays: Optional[torch.Tensor] = None) -> dict:
+        """q_rays [B, Q, 6]: Plücker rays of the target view's queries (posed 3D views), else None."""
         B, Q = q_coords.shape[:2]
         if modality == "image":
             assert zc.shape[-1] == self.cfg.zr_c_image, "image zc must have zr_c_image channels"
@@ -228,6 +232,8 @@ class QueryDecoder(nn.Module):
         win = (idx, valid, q_pos, k_pos, q_m, k_m)
 
         h = self.query.expand(B, Q, -1).to(c.dtype)
+        if q_rays is not None:
+            h = h + self.ray_q(q_rays.to(c.dtype))
         gate = None
         for blk in self.blocks:
             h, gate = blk(h, c, d, win, q_coords, q_mask)

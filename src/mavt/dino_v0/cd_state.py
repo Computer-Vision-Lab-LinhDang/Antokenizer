@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .camera import ZeroLinear, relative_pose
 from .config import DinoV0Config
 from .rope import AxialRoPE
 
@@ -163,15 +164,20 @@ class DState(nn.Module):
         self.pred = DBlock(cfg, n_ctx=1, self_first=True)        # self-attn over D, cross-attn D -> C_k, MLP
         self.corr = nn.ModuleList([DBlock(cfg, n_ctx=2, self_first=False) for _ in range(cfg.d_blocks)])
         self.up_proj = nn.Linear(cfg.d_dim, cfg.dim)
+        # target-view pose relative to the keyframe view, an 'action' for the prediction; zero at init
+        self.pose_proj = nn.Sequential(nn.Linear(12, cfg.d_dim), nn.GELU(), ZeroLinear(cfg.d_dim, cfg.d_dim))
 
     def init(self, B: int, dtype=None) -> torch.Tensor:
         D = self.d0.unsqueeze(0).expand(B, -1, -1)
         return D if dtype is None else D.to(dtype)
 
-    def predict(self, D_prev: Optional[torch.Tensor], C_k: torch.Tensor) -> torch.Tensor:
-        """D_prev [B, M, d] | None, C_k [B, N, dim] -> D_hat [B, M, d]."""
+    def predict(self, D_prev: Optional[torch.Tensor], C_k: torch.Tensor,
+                pose: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """D_prev [B, M, d] | None, C_k [B, N, dim], pose [B, 12] (target view vs keyframe) -> D_hat [B, M, d]."""
         if D_prev is None:
             D_prev = self.init(C_k.shape[0], C_k.dtype)
+        if pose is not None:
+            D_prev = D_prev + self.pose_proj(pose.to(D_prev.dtype)).unsqueeze(1)
         return self.pred(D_prev, [C_k], include_self=False)
 
     def correct(self, D_hat: torch.Tensor, x_t: torch.Tensor, C_k: torch.Tensor) -> torch.Tensor:
@@ -190,6 +196,13 @@ class DState(nn.Module):
 # ----------------------------------------------------------------------------------------
 
 class CDState(nn.Module):
+    @staticmethod
+    def _pose(c2w: Optional[torch.Tensor], ref: int, t: int) -> Optional[torch.Tensor]:
+        """Pose of view t in keyframe view ref's frame [B, 12]; None without poses or past the clip."""
+        if c2w is None or t >= c2w.shape[1]:
+            return None
+        return relative_pose(c2w[:, ref], c2w[:, t])
+
     def __init__(self, cfg: DinoV0Config):
         super().__init__()
         _check_v0(cfg)
@@ -197,8 +210,9 @@ class CDState(nn.Module):
         self.c_builder = CBuilder(cfg)
         self.d_state = DState(cfg)
 
-    def forward(self, X: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor) -> dict:
-        """X [B, T, N, dim], coords / mask [T, N, 4] ->
+    def forward(self, X: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor,
+                c2w: Optional[torch.Tensor] = None) -> dict:
+        """X [B, T, N, dim], coords / mask [T, N, 4], c2w [B, T, 4, 4] for posed views (else None) ->
         C [B, S, N, dim], seg [T] long, D / D_hat / D_next [B, T, M, d] (None when T == 1)."""
         B, T = X.shape[:2]
         K = self.cfg.keyframe_every
@@ -215,9 +229,9 @@ class CDState(nn.Module):
             # the prediction is made before X_t arrives, so it uses the C of frame t-1's segment;
             # at a keyframe that is the previous segment's C, never the C built from X_t
             D_hat = (self.d_state.init(B, X.dtype) if t == 0
-                     else self.d_state.predict(D_prev, Cs[(t - 1) // K]))
+                     else self.d_state.predict(D_prev, Cs[(t - 1) // K], self._pose(c2w, ((t - 1) // K) * K, t)))
             D_t = self.d_state.correct(D_hat, X[:, t], C_k)
-            D_nexts.append(self.d_state.predict(D_t, C_k))
+            D_nexts.append(self.d_state.predict(D_t, C_k, self._pose(c2w, (t // K) * K, t + 1)))
             D_hats.append(D_hat)
             Ds.append(D_t)
             D_prev = D_t

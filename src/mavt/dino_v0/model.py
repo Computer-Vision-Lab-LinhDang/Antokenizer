@@ -5,6 +5,9 @@
          -> QueryDecoder (reads z_r of C_k at (u, v) + delta(D_t), reads D_t by content)
 
 Input layout follows mavt.data: image [B, 3, H, W], video [B, 3, T, H, W], both in [-1, 1].
+Posed 3D views (modality "threed") use the video layout over views plus cam = dict(c2w [B,T,4,4]
+OpenCV camera-to-world, K [B,T,3,3] pixels at the model resolution): tokens and decoder queries get
+Plücker rays, and the prediction of view t+1 is conditioned on its pose (novel-view synthesis).
 Training: every frame t is decoded from (C of its keyframe, D_t)  -> L_rec; the prediction
 D_next_t made before X_{t+1} is decoded at frame t+1 against DINOv3 features -> L_fut.
 """
@@ -16,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from mavt.dino_v0 import losses as L
+from mavt.dino_v0.camera import patch_rays
 from mavt.dino_v0.cd_state import CDState
 from mavt.dino_v0.config import DinoV0Config
 from mavt.dino_v0.decoder import QueryDecoder, image_to_patches, patches_to_image, query_coords
@@ -32,9 +36,18 @@ def to_frames(data: torch.Tensor, modality: str) -> torch.Tensor:
     return data.permute(0, 2, 1, 3, 4).contiguous()
 
 
+def _mm(modality: str) -> str:
+    """Model path of a modality: images alone; video and posed 3D views share the sequence path."""
+    return "image" if modality == "image" else "video"
+
+
 def _gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     """x [B, N, C], idx [B, Q] -> [B, Q, C]."""
     return torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+
+
+def _rays_t(e: dict, t: int) -> Optional[torch.Tensor]:
+    return None if e.get("rays") is None else e["rays"][:, t]
 
 
 class MAVTDinoV0(nn.Module):
@@ -57,18 +70,22 @@ class MAVTDinoV0(nn.Module):
         mask = modality_mask(modality, N, device=device).unsqueeze(0).expand(T, -1, -1)
         return coords, mask
 
-    def encode(self, data: torch.Tensor, modality: str) -> dict:
+    def encode(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None) -> dict:
         """Tiers A-D. Returns frame targets, C/D states and their latents."""
-        frames = to_frames(data, modality)
+        mm = _mm(modality)
+        frames = to_frames(data, mm)
         B, T = frames.shape[:2]
-        enc = self.encoder(frames.flatten(0, 1))
+        rays = None
+        if cam is not None:
+            rays = patch_rays(cam["c2w"], cam["K"], self.cfg.image_size, self.cfg.grid)   # [B,T,N,6]
+        enc = self.encoder(frames.flatten(0, 1), None if rays is None else rays.flatten(0, 1))
         x = enc["x"].unflatten(0, (B, T))
-        coords, mask = self._coords(T, modality, data.device)
+        coords, mask = self._coords(T, mm, data.device)
         X = self.trunk(x, coords, mask)
-        st = self.cd(X, coords, mask)
+        st = self.cd(X, coords, mask, None if cam is None else cam["c2w"])
         S = st["C"].shape[1]
-        zc, mu_c, lv_c = self.latent.encode_c(st["C"].flatten(0, 1), modality)
-        out = dict(frames=frames, coords=coords, mask=mask, state=st,
+        zc, mu_c, lv_c = self.latent.encode_c(st["C"].flatten(0, 1), mm)
+        out = dict(frames=frames, coords=coords, mask=mask, state=st, rays=rays, modality=mm,
                    feat_target=enc["feat_target"].unflatten(0, (B, T)), cls=enc["cls"].unflatten(0, (B, T)),
                    mean_energy=enc["mean_energy"], zc=zc.unflatten(0, (B, S)), kl_c=(mu_c, lv_c))
         if st["D"] is not None:
@@ -89,31 +106,35 @@ class MAVTDinoV0(nn.Module):
 
     # ------------------------------------------------------------------ decode
     def decode_frame(self, zc: torch.Tensor, zd: Optional[torch.Tensor], t: float, modality: str,
-                     idx: Optional[torch.Tensor] = None) -> dict:
-        """Decode queries of one frame. zc [B,N,cc], zd [B,M,zr_d] | None, idx [B,Q] | None (all N)."""
+                     idx: Optional[torch.Tensor] = None, rays: Optional[torch.Tensor] = None) -> dict:
+        """Decode queries of one frame. zc [B,N,cc], zd [B,M,zr_d] | None, idx [B,Q] | None (all N),
+        rays [B,N,6] of the target view (posed views) | None."""
+        mm = _mm(modality)
         B = zc.shape[0]
         qc = query_coords(self.cfg.grid, t, B, idx, device=zc.device)
-        qm = modality_mask(modality, qc.shape[1], device=zc.device).unsqueeze(0).expand(B, -1, -1)
-        return self.decoder(zc, zd, qc, qm, modality)
+        qm = modality_mask(mm, qc.shape[1], device=zc.device).unsqueeze(0).expand(B, -1, -1)
+        if rays is not None and idx is not None:
+            rays = _gather(rays, idx)
+        return self.decoder(zc, zd, qc, qm, mm, q_rays=rays)
 
     @torch.no_grad()
-    def reconstruct(self, data: torch.Tensor, modality: str) -> torch.Tensor:
+    def reconstruct(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None) -> torch.Tensor:
         """Full reconstruction in the input layout, in [-1, 1]."""
-        e = self.encode(data, modality)
+        e = self.encode(data, modality, cam)
         B, T = e["frames"].shape[:2]
         seg = e["state"]["seg"]
         outs = []
         for t in range(T):
             zd = e["zd"][:, t] if "zd" in e else None
-            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality)
+            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, rays=_rays_t(e, t))
             outs.append(patches_to_image(o["rgb"], self.cfg.grid, self.cfg.patch))
         rec = torch.stack(outs, 1).clamp(-1, 1)
-        return rec[:, 0] if modality == "image" else rec.permute(0, 2, 1, 3, 4)
+        return rec[:, 0] if _mm(modality) == "image" else rec.permute(0, 2, 1, 3, 4)
 
     # ------------------------------------------------------------------ train
-    def forward(self, data: torch.Tensor, modality: str) -> dict:
+    def forward(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None) -> dict:
         cfg = self.cfg
-        e = self.encode(data, modality)
+        e = self.encode(data, modality, cam)
         frames, st = e["frames"], e["state"]
         B, T = frames.shape[:2]
         N, p = cfg.n_patches, cfg.patch
@@ -125,7 +146,7 @@ class MAVTDinoV0(nn.Module):
         for t in range(T):
             idx = torch.rand(B, N, device=data.device).argsort(-1)[:, :Q]
             zd = e["zd"][:, t] if "zd" in e else None
-            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, idx)
+            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, idx, _rays_t(e, t))
             tgt_rgb = _gather(image_to_patches(frames[:, t], p), idx)
             tgt_feat = _gather(e["feat_target"][:, t], idx)
             rgb_l.append(L.rgb_l1(o["rgb"], tgt_rgb))
@@ -142,14 +163,15 @@ class MAVTDinoV0(nn.Module):
             fut = []
             for t in range(T - 1):
                 idx = torch.rand(B, N, device=data.device).argsort(-1)[:, :Q]
-                o = self.decode_frame(e["zc"][:, seg[t]], e["zd_next"][:, t], float(t + 1), modality, idx)
+                o = self.decode_frame(e["zc"][:, seg[t]], e["zd_next"][:, t], float(t + 1), modality, idx,
+                                      _rays_t(e, t + 1))
                 fut.append(L.feat_loss(o["feat"], _gather(e["feat_target"][:, t + 1], idx)))
             parts["fut"] = torch.stack(fut).mean()
 
         if self.lpips is not None:
             t = T - 1
             zd = e["zd"][:, t] if "zd" in e else None
-            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality)
+            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, rays=_rays_t(e, t))
             parts["lpips"] = self.lpips(patches_to_image(o["rgb"], cfg.grid, p), frames[:, t])
 
         kl = L.kl(*e["kl_c"])
@@ -159,7 +181,7 @@ class MAVTDinoV0(nn.Module):
         parts["var"] = L.var_cov(st["C"].flatten(0, 1).float())
         zs = self.semantic(e)
         parts["sem"] = L.sem_loss(zs.flatten(0, 1).float(), e["cls"].flatten(0, 1).float())
-        if modality != "image":
+        if _mm(modality) != "image":
             parts["gate"] = L.gate_reg(torch.cat([g.flatten() for g in gates]))
 
         w = dict(rgb=cfg.w_rgb, feat=cfg.w_feat, fut=cfg.w_fut, lpips=cfg.w_lpips, kl=cfg.w_kl,

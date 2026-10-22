@@ -6,10 +6,12 @@ feature target is the same centred patch, layer-normed without affine.
 """
 from __future__ import annotations
 
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .camera import ZeroLinear
 from .config import DinoV0Config
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -97,13 +99,17 @@ class FrameEncoder(nn.Module):
         d = self.dino.out_dim
         self.sem_norm = nn.LayerNorm(d)
         self.proj = nn.Linear(d + cfg.pix_dim, cfg.dim)
+        self.ray_proj = ZeroLinear(6, cfg.dim)      # Plücker rays of posed views; zero at init
 
-    def forward(self, frames: torch.Tensor) -> dict:
+    def forward(self, frames: torch.Tensor, rays: Optional[torch.Tensor] = None) -> dict:
+        """rays [B', N, 6] for posed views (3D objects), None otherwise."""
         patch, cls = self.dino(frames)
         patch, cls = patch.float(), cls.float()
         mean = patch.mean(1, keepdim=True)
         centred = patch - mean
         x = self.proj(torch.cat([self.sem_norm(centred), self.stem(frames)], -1))
+        if rays is not None:
+            x = x + self.ray_proj(rays.to(x.dtype))
         n = patch.shape[1]
         energy = mean.squeeze(1).pow(2).sum(-1) * n / patch.pow(2).sum((1, 2)).clamp_min(1e-12)
         return dict(x=x, feat_target=F.layer_norm(centred, centred.shape[-1:]).detach(),

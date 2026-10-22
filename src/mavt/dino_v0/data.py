@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------- transforms
 def _to_tensor(arr: np.ndarray) -> torch.Tensor:
     """uint8 [H, W, 3] (or [T, H, W, 3]) -> float in [-1, 1], channels first ([3,H,W] / [3,T,H,W])."""
-    t = torch.from_numpy(np.ascontiguousarray(arr)).float().div_(127.5).sub_(1.0)
+    t = torch.from_numpy(np.array(arr, dtype=np.uint8, copy=True)).float().div_(127.5).sub_(1.0)
     return t.permute(2, 0, 1) if t.dim() == 3 else t.permute(3, 0, 1, 2)
 
 
