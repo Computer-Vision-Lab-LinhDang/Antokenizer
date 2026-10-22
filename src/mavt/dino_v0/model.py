@@ -183,13 +183,19 @@ class MAVTDinoV0(nn.Module):
         parts["sem"] = L.sem_loss(zs.flatten(0, 1).float(), e["cls"].flatten(0, 1).float())
         if _mm(modality) != "image":
             parts["gate"] = L.gate_reg(torch.cat([g.flatten() for g in gates]))
+        rel = self.trunk.relation_stats() if cfg.rgat_relations > 0 else None
+        if rel is not None:                                             # R2 anti-collapse, weight inside
+            parts["rel"] = -cfg.rgat_entropy_w * rel["marginal_entropy"]
 
         w = dict(rgb=cfg.w_rgb, feat=cfg.w_feat, fut=cfg.w_fut, lpips=cfg.w_lpips, kl=cfg.w_kl,
-                 var=cfg.w_var, sem=cfg.w_sem, gate=cfg.w_gate)
+                 var=cfg.w_var, sem=cfg.w_sem, gate=cfg.w_gate, rel=1.0)
         loss = sum(w[k] * v for k, v in parts.items())
         with torch.no_grad():
             diag["psnr_queries"] = torch.stack(psnr).mean()
             diag["mean_energy"] = e["mean_energy"].float()
             diag["gate_mean"] = torch.cat([g.flatten() for g in gates]).float().mean()
+            if rel is not None:
+                diag["rel_marginal_entropy"] = rel["marginal_entropy"].detach().float()
+                diag["rel_edge_entropy"] = rel["edge_entropy"].float()
             diag["delta_abs_cells"] = torch.cat([d.flatten() for d in deltas]).float().abs().mean() * cfg.grid
         return dict(loss=loss, parts={k: v.detach() for k, v in parts.items()}, diag=diag)
