@@ -130,7 +130,7 @@ FC_KEYS = ("psnr", "psnr_copy_rec", "psnr_copy_gt", "cos", "cos_copy_rec", "cos_
 
 
 def test_video_pass_cd_split_and_forecast_v0():
-    """A v0 model: C/D split and the h = 1 forecast (from zd_next) are measured, warp is skipped."""
+    """v0 flags: C/D split, warp-only decode and the h = 1 forecast are measured (the model code has the v1 API)."""
     torch.manual_seed(0)
     model = MAVTDinoV0(tiny_config()).eval()
     v = E.video_pass(model, E.make_loader(_Clips(3, stride=4), 2), "cpu")
@@ -138,7 +138,7 @@ def test_video_pass_cd_split_and_forecast_v0():
         for kind in ("", "_key", "_nonkey"):
             assert k + kind in v, k + kind
     assert v["psnr_full"] == pytest.approx(v["psnr"]) and v["psnr_full_key"] == pytest.approx(v["psnr_key"])
-    assert "psnr_warp" not in v and any("warp" in s for s in v["skipped"])
+    assert "psnr_warp" in v and not any("warp" in s for s in v["skipped"])
     assert v["forecast_horizons"] == [1] and "forecast_h2_psnr" not in v and v["frame_stride"] == 4
     assert v["delta_cells_p95"] >= 0 and 0 < v["gate"] <= 1 and -1 <= v["cos_full"] <= 1
     pc = v["per_clip"]
@@ -294,7 +294,7 @@ def test_script_video_at_stride(tmp_path):
     assert all(k in v for k in ("psnr_full_key", "psnr_eraseC_nonkey", "delta_cells_p95", "forecast_h1_psnr_copy_gt"))
     assert len(v["per_clip"]) == 2 and all(c["stride"] == 4 for c in v["per_clip"])
     assert any("1/2 clips" in n and "29-frame span" in n for n in res["notes"])     # short.mp4 < 29 frames
-    assert any("psnr_warp skipped" in n for n in res["notes"])
+    assert "psnr_warp" in v and not any("psnr_warp skipped" in n for n in res["notes"])   # model code has warp_only
     assert "Forecast of frame" in (out / "eval_s4.md").read_text()
 
 

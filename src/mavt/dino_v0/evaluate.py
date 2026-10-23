@@ -51,6 +51,7 @@ def load_model(ckpt_path: str, device="cpu", strict: bool = True):
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     fields = DinoV0Config.__dataclass_fields__
     cfg_d = {k: v for k, v in dict(ck.get("cfg", {})).items() if k in fields}
+    cfg_d.update(w_lpips=0.0, w_gram=0.0)                      # training-only losses: no VGG needed to evaluate
     cfg = DinoV0Config(**cfg_d)
     model = MAVTDinoV0(cfg)
     sd = ck["model"] if "model" in ck else ck

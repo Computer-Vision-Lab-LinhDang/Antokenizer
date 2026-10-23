@@ -74,7 +74,7 @@ w_warp: 0.5              # non-key frames decoded with the gate locked to 1: Δ 
 w_var: 0.1
 w_kl: 1.0e-6
 w_sem: 0.5
-w_gate: 0.01
+w_gate: 1.0              # hinge: zero while mean o >= gate_floor, so a large weight only bites when D takes over
 gate_loss: hinge         # relu(gate_floor - mean o): only penalise D taking over (v0 "mean" pushed o to 1)
 gate_floor: 0.5
 # ---- forecasts of D
