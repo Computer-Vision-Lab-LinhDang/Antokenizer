@@ -5,7 +5,9 @@ content grid) and zd = z_r(D_t) (how frame t deviates from C_k). Per query:
 
   Δ      = MLP([mean_M in_d(zd) ; fourier(u, v)])        last layer zero-init -> Δ = 0 at init
   readC  = cross-attn to the (2r+1)^2 C cells around the cell containing (u, v) + Δ; the query
-           sits at the SHIFTED centre under AxialRoPE, so the gradient reaches Δ through RoPE
+           sits at the SHIFTED centre under AxialRoPE, so the gradient reaches Δ through RoPE.
+           Computed as dense attention over all N cells with a window mask (same result as
+           gathering the window, without (2r+1)^2 copies of k / v and their scatter-add backward)
   readD  = cross-attn to in_d(zd) tokens by content (no RoPE)
   o      = sigmoid(Linear([h ; readC]))                   bias init cfg.gate_init_bias
   h     += o * readC + (1 - o) * readD                     (images: h += readC, o = 1)
@@ -99,8 +101,24 @@ class _MLP(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
+def window_bias(centre: torch.Tensor, grid: int, r: int, dtype) -> torch.Tensor:
+    """[B, Q, N] additive mask: 0 where cell n is in the (2r+1)^2 window around the (clamped) cell
+    containing each centre [B, Q, 2], -inf elsewhere. Same window as gather_window."""
+    with torch.no_grad():
+        col = (centre[..., 0] * grid).floor().long().clamp(0, grid - 1)   # [B, Q]
+        row = (centre[..., 1] * grid).floor().long().clamp(0, grid - 1)
+        n = torch.arange(grid * grid, device=centre.device)
+        inside = ((row.unsqueeze(-1) - n // grid).abs() <= r) & ((col.unsqueeze(-1) - n % grid).abs() <= r)
+        bias = torch.zeros(inside.shape, device=centre.device, dtype=dtype)
+        return bias.masked_fill(~inside, float("-inf"))
+
+
 class _WindowCrossAttn(nn.Module):
-    """Query -> its own gathered (2r+1)^2 C cells, AxialRoPE on (shifted centre, cell centres)."""
+    """Query -> the (2r+1)^2 C cells around its shifted centre, AxialRoPE on (shifted centre, cell centres).
+
+    forward: dense attention over all N cells, each cell's key rotated once, window as an additive
+    mask (float, not bool: bool masks gave zero gradients on some SDPA backends).
+    forward_gather: the original gather-the-window version, kept as the reference in tests."""
 
     def __init__(self, dim: int, heads: int, rope: AxialRoPE):
         super().__init__()
@@ -108,7 +126,17 @@ class _WindowCrossAttn(nn.Module):
         self.q, self.kv, self.o = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
         self.rope = rope
 
-    def forward(self, x, c, idx, valid, q_pos, k_pos, q_m, k_m):
+    def forward(self, x, c, bias, q_pos, q_m, c_pos, c_m):
+        # x [B,Q,D]; c [B,N,D]; bias [B,Q,N]; q_pos/q_m [B,Q,4]; c_pos/c_m [B,N,4]
+        B, Q, D = x.shape
+        N = c.shape[1]
+        q = self.rope(self.q(x).view(B, Q, self.h, self.hd).transpose(1, 2), q_pos, q_m)   # [B,H,Q,hd]
+        k, v = self.kv(c).view(B, N, 2, self.h, self.hd).permute(2, 0, 3, 1, 4)           # [B,H,N,hd]
+        k = self.rope(k, c_pos, c_m)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias.unsqueeze(1).to(q.dtype))
+        return self.o(out.transpose(1, 2).reshape(B, Q, D))
+
+    def forward_gather(self, x, c, idx, valid, q_pos, k_pos, q_m, k_m):
         # x [B,Q,D]; c [B,N,D]; idx/valid [B,Q,W]; q_pos/q_m [B,Q,4]; k_pos/k_m [B,Q,W,4]
         B, Q, D = x.shape
         W = idx.shape[-1]
@@ -159,9 +187,8 @@ class DecoderBlock(nn.Module):
         self.n_m, self.mlp = nn.LayerNorm(d), _MLP(d, cfg.mlp_ratio)
 
     def forward(self, h, c, d, win, q_coords, q_mask):
-        idx, valid, q_pos, k_pos, q_m, k_m = win
         hn = self.n_q(h)
-        rc = self.read_c(hn, self.n_c(c), idx, valid, q_pos, k_pos, q_m, k_m)
+        rc = self.read_c(hn, self.n_c(c), *win)
         if d is None:
             o = torch.ones_like(h[..., :1])
             h = h + rc
@@ -221,15 +248,14 @@ class QueryDecoder(nn.Module):
 
         # window read of C at the shifted centre (computed once, shared by all blocks)
         centre = q_coords[..., 1:3] + delta                                    # [B,Q,2]
-        idx, valid, cell = gather_window(centre, self.grid, self.r)            # [B,Q,W], [B,Q,W,2]
         uv = torch.tensor(UV_MASK, device=q_mask.device, dtype=q_mask.dtype)
         q_m = q_mask * uv                                                      # (u, v) bits only
         q_pos = torch.cat([q_coords[..., :1], centre, q_coords[..., 3:]], -1)
-        W = idx.shape[-1]
-        k_pos = torch.cat([q_coords[..., :1].unsqueeze(2).expand(-1, -1, W, -1), cell.to(q_coords.dtype),
-                           torch.zeros_like(cell[..., :1]).to(q_coords.dtype)], -1)  # [B,Q,W,4]
-        k_m = q_m.unsqueeze(2).expand(-1, -1, W, -1)
-        win = (idx, valid, q_pos, k_pos, q_m, k_m)
+        N = c.shape[1]
+        c_pos = grid_coords(self.grid, 0.0, device=q_coords.device).to(q_coords.dtype)
+        c_pos = torch.cat([q_coords[:, :1, :1].expand(-1, N, -1), c_pos[None, :, 1:].expand(B, -1, -1)], -1)
+        c_m = q_m[:, :1].expand(-1, N, -1)                                     # cells share the queries' mask
+        win = (window_bias(centre, self.grid, self.r, c.dtype), q_pos, q_m, c_pos, c_m)
 
         h = self.query.expand(B, Q, -1).to(c.dtype)
         if q_rays is not None:
