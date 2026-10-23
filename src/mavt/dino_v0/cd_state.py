@@ -45,10 +45,10 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-head attention, q from xq and k/v from xkv (same width), optional RoPE angles and bool mask.
+    """Multi-head attention, q from xq and k/v from xkv (same width), optional RoPE angles and additive mask.
 
     q_ang / k_ang: [Nq, head_dim/2] / [Nk, head_dim/2] from AxialRoPE.angles, or None (no rotation).
-    attn_mask: [Nq, Nk] bool, True = may attend.
+    attn_mask: [Nq, Nk] float, 0 = may attend, -inf = blocked.
     """
 
     def __init__(self, dim: int, heads: int):
@@ -70,7 +70,11 @@ class Attention(nn.Module):
             q = rope.rotate(q, q_ang)
         if rope is not None and k_ang is not None:
             k = rope.rotate(k, k_ang)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        if attn_mask is None:
+            o = F.scaled_dot_product_attention(q, k, v)
+        else:                                                    # explicit math: same result on every backend
+            a = (q.float() @ k.float().transpose(-2, -1)) * self.head_dim ** -0.5 + attn_mask.float()
+            o = (a.softmax(-1) @ v.float()).to(v.dtype)
         return self.out(o.transpose(1, 2).reshape(B, Nq, D))
 
 
