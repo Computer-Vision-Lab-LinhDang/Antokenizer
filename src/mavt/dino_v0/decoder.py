@@ -3,7 +3,11 @@
 For a query at (t, u, v) of frame t in a video segment the decoder gets zc = z_r(C_k) (keyframe
 content grid) and zd = z_r(D_t) (how frame t deviates from C_k). Per query:
 
-  Δ      = MLP([mean_M in_d(zd) ; fourier(u, v)])        last layer zero-init -> Δ = 0 at init
+  Δ      = offset in (u, v) units at which the query reads C, last layer zero-init -> Δ = 0 at init
+           delta_mode "mean"  (v0): MLP([mean_M in_d(zd) ; fourier(u, v)]): one D summary for all queries
+           delta_mode "query" (v1): q = Linear(fourier(u, v)) (+ ZeroLinear(ray) for posed views);
+                                    readD_q = cross-attn(LN q -> LN in_d(zd)), no RoPE;
+                                    Δ = MLP([readD_q ; fourier(u, v)]): each region its own motion
   readC  = cross-attn to the (2r+1)^2 C cells around the cell containing (u, v) + Δ; the query
            sits at the SHIFTED centre under AxialRoPE, so the gradient reaches Δ through RoPE.
            Computed as dense attention over all N cells with a window mask (same result as
@@ -13,7 +17,17 @@ content grid) and zd = z_r(D_t) (how frame t deviates from C_k). Per query:
   h     += o * readC + (1 - o) * readD                     (images: h += readC, o = 1)
   h     += SelfAttn(h) (RoPE on the unshifted coords); h += MLP(h)       pre-LN everywhere
 
-Heads: rgb [B, Q, p*p*3] and feat [B, Q, feat_dim]. Coordinates: u = column, v = row, in [0, 1].
+warp_only=True (video): every block does h += readC (o = 1, readD skipped) while Δ is still computed
+from zd, so D reaches the output only through Δ: a decode that forces Δ to carry the motion.
+
+Heads on the final LN(h): feat [B, Q, feat_dim] per query; rgb by cfg.rgb_head:
+  "linear" (v0): per-query Linear -> rgb [B, Q, p*p*3], image None
+  "conv"   (v1): h of all N queries (row-major grid order, Q == N) -> [B, dec_dim, G, G] -> conv in ->
+                 ResBlocks -> log2(p) x (nearest x2, 3x3 conv, ResBlocks) at cfg.conv_channels ->
+                 GN, SiLU, 3x3 conv -> image [B, 3, H, W]; rgb = image_to_patches(image), so per-patch
+                 losses work unchanged. No patch grid: neighbouring patches share conv context.
+Every row of the batch is independent (rows may be B * T flattened frames, each with its own t).
+Coordinates: u = column, v = row, in [0, 1].
 """
 from __future__ import annotations
 
@@ -202,11 +216,59 @@ class DecoderBlock(nn.Module):
         return h, o
 
 
+# ---- conv rgb head ---------------------------------------------------------------------------
+
+def _gn(ch: int) -> nn.GroupNorm:
+    return nn.GroupNorm(math.gcd(32, ch), ch)
+
+
+class _ResBlock(nn.Module):
+    """x + conv(SiLU(GN(conv(SiLU(GN(x)))))), 3x3 convs, width preserved."""
+
+    def __init__(self, ch: int):
+        super().__init__()
+        self.n1, self.c1 = _gn(ch), nn.Conv2d(ch, ch, 3, padding=1)
+        self.n2, self.c2 = _gn(ch), nn.Conv2d(ch, ch, 3, padding=1)
+
+    def forward(self, x):
+        return x + self.c2(F.silu(self.n2(self.c1(F.silu(self.n1(x))))))
+
+
+class ConvUpsampler(nn.Module):
+    """[B, G*G, dim] tokens in row-major grid order -> image [B, 3, G * 2^S, G * 2^S], S = len(channels) - 1.
+
+    channels[0] is the width at grid resolution, then one width per nearest-x2 stage. No output
+    activation (the v0 linear rgb head had none either; targets are in [-1, 1])."""
+
+    def __init__(self, dim: int, channels: tuple, res_blocks: int):
+        super().__init__()
+        ch = list(channels)
+        self.conv_in = nn.Conv2d(dim, ch[0], 3, padding=1)
+        self.stages = nn.ModuleList([nn.Sequential(*[_ResBlock(ch[0]) for _ in range(res_blocks)])])
+        for cin, cout in zip(ch[:-1], ch[1:]):
+            self.stages.append(nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"),
+                                             nn.Conv2d(cin, cout, 3, padding=1),
+                                             *[_ResBlock(cout) for _ in range(res_blocks)]))
+        self.n_out, self.conv_out = _gn(ch[-1]), nn.Conv2d(ch[-1], 3, 3, padding=1)
+
+    def forward(self, h: torch.Tensor, grid: int) -> torch.Tensor:
+        B, N, D = h.shape
+        x = self.conv_in(h.transpose(1, 2).reshape(B, D, grid, grid))      # row n = r * G + c -> [r, c]
+        for st in self.stages:
+            x = st(x)
+        return self.conv_out(F.silu(self.n_out(x)))
+
+
 class QueryDecoder(nn.Module):
-    """z_r (C, D) + query coords -> per-query rgb patch, DINO feature, offset Δ and gate o."""
+    """z_r (C, D) + query coords -> per-query rgb patch, DINO feature, offset Δ and gate o.
+
+    Parameters of the v1 options exist only when their flag is on (delta_* for delta_mode "query",
+    rgb_conv for rgb_head "conv"), so with default flags the state_dict keys are the v0 ones."""
 
     def __init__(self, cfg: DinoV0Config, feat_dim: int):
         super().__init__()
+        assert cfg.delta_mode in ("mean", "query"), f"unknown delta_mode {cfg.delta_mode!r}"
+        assert cfg.rgb_head in ("linear", "conv"), f"unknown rgb_head {cfg.rgb_head!r}"
         self.ray_q = ZeroLinear(6, cfg.dec_dim)        # query rays for posed views; zero at init
         d = cfg.dec_dim
         self.cfg, self.grid, self.r = cfg, cfg.grid, cfg.read_window
@@ -215,28 +277,61 @@ class QueryDecoder(nn.Module):
         self.in_d = nn.Linear(cfg.zr_d, d)
         self.query = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.n_fourier = 8
-        self.offset = nn.Sequential(nn.Linear(d + 2 + 4 * self.n_fourier, d), nn.GELU(), nn.Linear(d, 2))
-        nn.init.zeros_(self.offset[-1].weight)
-        nn.init.zeros_(self.offset[-1].bias)
+        nf = 2 + 4 * self.n_fourier
+        if cfg.delta_mode == "mean":
+            self.offset = nn.Sequential(nn.Linear(d + nf, d), nn.GELU(), nn.Linear(d, 2))
+            last = self.offset[-1]
+        else:                                          # per-query Δ: each query reads D for itself
+            self.delta_q = nn.Linear(nf, d)
+            self.delta_ray = ZeroLinear(6, d)          # target-view ray of the query (posed views)
+            self.delta_n_q, self.delta_n_d = nn.LayerNorm(d), nn.LayerNorm(d)
+            self.delta_read = _Attn(d, cfg.dec_heads)  # no RoPE: D tokens have no coordinates
+            self.delta_mlp = nn.Sequential(nn.Linear(d + nf, d), nn.GELU(), nn.Linear(d, 2))
+            last = self.delta_mlp[-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
         self.rope = AxialRoPE(d // cfg.dec_heads)
         self.blocks = nn.ModuleList([DecoderBlock(cfg, self.rope) for _ in range(cfg.dec_blocks)])
         self.norm = nn.LayerNorm(d)
-        self.rgb_head = nn.Linear(d, cfg.patch * cfg.patch * 3)
+        if cfg.rgb_head == "linear":
+            self.rgb_head = nn.Linear(d, cfg.patch * cfg.patch * 3)
+        else:
+            stages = len(cfg.conv_channels) - 1
+            assert self.grid * 2 ** stages == cfg.image_size, (
+                f"conv_channels gives {stages} x2 stages: grid {self.grid} * 2^{stages} != image_size "
+                f"{cfg.image_size} (need len(conv_channels) = log2(patch) + 1 = {int(math.log2(cfg.patch)) + 1})")
+            self.rgb_conv = ConvUpsampler(d, tuple(cfg.conv_channels), cfg.conv_res_blocks)
         self.feat_head = nn.Linear(d, feat_dim)
 
-    def compute_delta(self, d: Optional[torch.Tensor], q_coords: torch.Tensor) -> torch.Tensor:
-        """Δ [B, Q, 2] in (u, v) units from the projected D tokens; 0 when there is no D."""
+    def compute_delta(self, d: Optional[torch.Tensor], q_coords: torch.Tensor,
+                      q_rays: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Δ [B, Q, 2] in (u, v) units from the projected D tokens; 0 when there is no D.
+        q_rays [B, Q, 6] enter only the "query" mode."""
         if d is None:
             return torch.zeros_like(q_coords[..., 1:3])
         B, Q = q_coords.shape[:2]
-        dm = d.mean(1, keepdim=True).expand(-1, Q, -1)
-        return self.offset(torch.cat([dm, fourier_uv(q_coords[..., 1:3], self.n_fourier).to(dm.dtype)], -1))
+        if self.cfg.delta_mode == "mean":
+            dm = d.mean(1, keepdim=True).expand(-1, Q, -1)
+            return self.offset(torch.cat([dm, fourier_uv(q_coords[..., 1:3], self.n_fourier).to(dm.dtype)], -1))
+        f = fourier_uv(q_coords[..., 1:3], self.n_fourier).to(d.dtype)       # [B,Q,nf]
+        q = self.delta_q(f)
+        if q_rays is not None:
+            q = q + self.delta_ray(q_rays.to(q.dtype))
+        rd = self.delta_read(self.delta_n_q(q), self.delta_n_d(d))           # [B,Q,D] own read of D
+        return self.delta_mlp(torch.cat([rd, f], -1))
 
     def forward(self, zc: torch.Tensor, zd: Optional[torch.Tensor], q_coords: torch.Tensor,
                 q_mask: torch.Tensor, modality: str, delta_override: Optional[torch.Tensor] = None,
-                q_rays: Optional[torch.Tensor] = None) -> dict:
-        """q_rays [B, Q, 6]: Plücker rays of the target view's queries (posed 3D views), else None."""
+                q_rays: Optional[torch.Tensor] = None, warp_only: bool = False) -> dict:
+        """zc [B, N, zr_c], zd [B, M, zr_d] | None, q_coords / q_mask [B, Q, 4] (each row its own t).
+        q_rays [B, Q, 6]: Plücker rays of the target view's queries (posed 3D views), else None.
+        warp_only: with zd, blocks add readC only (gate 1, readD skipped); Δ still comes from zd.
+
+        Returns rgb [B, Q, p*p*3], image [B, 3, H, W] (conv head) | None (linear head),
+        feat [B, Q, feat_dim], delta [B, Q, 2], gate [B, Q, 1] (last block)."""
         B, Q = q_coords.shape[:2]
+        if self.cfg.rgb_head == "conv":
+            assert Q == self.cfg.n_patches, f"conv rgb head decodes the full grid: Q = {Q} != N = {self.cfg.n_patches}"
         if modality == "image":
             assert zc.shape[-1] == self.cfg.zr_c_image, "image zc must have zr_c_image channels"
             c = self.in_c_image(zc)
@@ -244,7 +339,7 @@ class QueryDecoder(nn.Module):
             assert zc.shape[-1] == self.cfg.zr_c_video, "video zc must have zr_c_video channels"
             c = self.in_c_video(zc)
         d = None if zd is None else self.in_d(zd)
-        delta = self.compute_delta(d, q_coords) if delta_override is None else delta_override
+        delta = self.compute_delta(d, q_coords, q_rays) if delta_override is None else delta_override
 
         # window read of C at the shifted centre (computed once, shared by all blocks)
         centre = q_coords[..., 1:3] + delta                                    # [B,Q,2]
@@ -260,8 +355,14 @@ class QueryDecoder(nn.Module):
         h = self.query.expand(B, Q, -1).to(c.dtype)
         if q_rays is not None:
             h = h + self.ray_q(q_rays.to(c.dtype))
+        d_blk = None if warp_only else d                                       # warp-only: D acts via Δ alone
         gate = None
         for blk in self.blocks:
-            h, gate = blk(h, c, d, win, q_coords, q_mask)
+            h, gate = blk(h, c, d_blk, win, q_coords, q_mask)
         h = self.norm(h)
-        return dict(rgb=self.rgb_head(h), feat=self.feat_head(h), delta=delta, gate=gate)
+        if self.cfg.rgb_head == "linear":
+            rgb, image = self.rgb_head(h), None
+        else:
+            image = self.rgb_conv(h, self.grid)
+            rgb = image_to_patches(image, self.cfg.patch)
+        return dict(rgb=rgb, image=image, feat=self.feat_head(h), delta=delta, gate=gate)
