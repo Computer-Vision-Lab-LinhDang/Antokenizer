@@ -6,6 +6,10 @@ image [3, H, W], video and posed 3D views [3, T, H, W] (threed adds 'c2w' [T,4,4
 ImageNet parquet shards hold ~100 rows per row group, so random row access would re-read a row
 group per sample. `ParquetGroupBatchSampler` instead gives each DataLoader worker its own stream
 of row groups (shuffled in windows of a few groups) so every row group is read once per epoch.
+
+Video clips (v1): the frame stride may be a list ("2,4,8"); each training clip draws one stride
+uniformly (the largest one that fits when the video is short) and reports it as 'stride'. SSv2
+(same jsonl format, labels never read) can be mixed into the video stream by `MixtureSampler`.
 """
 from __future__ import annotations
 
@@ -18,11 +22,11 @@ import math
 import os
 import random
 from collections import OrderedDict
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional, Sequence, Union
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, DistributedSampler, Sampler
 
 log = logging.getLogger(__name__)
 
@@ -234,6 +238,60 @@ def _out_hw(w: int, h: int, size: int) -> tuple[int, int]:
     return max(size, round(w * s)), max(size, round(h * s))
 
 
+# ---------------------------------------------------------------------------- frame strides
+StrideSpec = Union[int, str, Sequence[int]]
+
+
+def parse_strides(stride: StrideSpec) -> tuple[int, ...]:
+    """Frame stride spec -> tuple of ints: 2, "2", "2,4,8" or [2, 4, 8] (yaml / CLI / code)."""
+    if isinstance(stride, str):
+        out = tuple(int(s) for s in stride.replace(" ", ",").split(",") if s.strip())
+    elif isinstance(stride, (int, np.integer)):
+        out = (int(stride),)
+    else:
+        out = tuple(int(s) for s in stride)
+    if not out or min(out) < 1:
+        raise ValueError(f"frame stride must be one or more ints >= 1, got {stride!r}")
+    return out
+
+
+def clip_span(n_frames: int, stride: int) -> int:
+    """Source frames covered by n_frames frames taken every `stride`-th frame."""
+    return (n_frames - 1) * stride + 1
+
+
+def pick_stride(strides: Sequence[int], n_frames: int, total: int, rng: random.Random) -> int:
+    """One stride drawn uniformly from `strides`. When the video (`total` frames, 0 = unknown) is
+    shorter than that stride's span, the largest stride of `strides` that fits instead; when none
+    fits, the smallest (the decoder then repeats the last frame, as with a fixed stride)."""
+    s = rng.choice(list(strides))
+    if total and clip_span(n_frames, s) > total:
+        fit = [x for x in strides if clip_span(n_frames, x) <= total]
+        s = max(fit) if fit else min(strides)
+    return int(s)
+
+
+def _stream_total(c, st, fps: float, total_hint: Optional[int] = None) -> int:
+    """Frame count of an open PyAV video stream: header count, hint, stream duration, container duration."""
+    total = int(st.frames or 0) or int(total_hint or 0)
+    if not total and st.duration is not None and st.time_base is not None:
+        total = int(float(st.duration * st.time_base) * fps)
+    if not total and c.duration:                                # e.g. webm (SSv2): no per-stream count
+        total = int(c.duration / 1_000_000 * fps)               # container duration is in AV_TIME_BASE
+    return total
+
+
+def probe_frames(path: str, fps_hint: Optional[float] = None) -> int:
+    """Frame count of a video from its headers only (no decoding); 0 when unknown or unreadable."""
+    try:
+        import av
+        with av.open(path) as c:
+            st = c.streams.video[0]
+            return _stream_total(c, st, float(st.average_rate or st.guessed_rate or fps_hint or 30.0))
+    except Exception:  # noqa: BLE001 - broken files are handled (and logged) by the decode that follows
+        return 0
+
+
 def decode_clip_av(path: str, n_frames: int, stride: int, size: int, rng: random.Random,
                    total_hint: Optional[int] = None, fps_hint: Optional[float] = None) -> np.ndarray:
     """PyAV: random start, seek to the keyframe before it, decode sequentially, keep every
@@ -245,9 +303,7 @@ def decode_clip_av(path: str, n_frames: int, stride: int, size: int, rng: random
         st = c.streams.video[0]
         st.thread_type = "AUTO"
         fps = float(st.average_rate or st.guessed_rate or fps_hint or 30.0)
-        total = int(st.frames or 0) or int(total_hint or 0)
-        if not total and st.duration is not None and st.time_base is not None:
-            total = int(float(st.duration * st.time_base) * fps)
+        total = _stream_total(c, st, fps, total_hint)
         start = rng.randint(0, max(0, total - span)) if total > span else 0
         want = [start + k * stride for k in range(n_frames)]
         tb = float(st.time_base) if st.time_base is not None else 1.0 / fps
@@ -325,42 +381,73 @@ def split_tail(items: list, tail: int, split: str) -> list:
 class OpenVidClips(Dataset):
     """Random n_frames clips (every `frame_stride`-th frame) from OpenVid-1M at original resolution.
 
-    Returns {'data': [3, T, size, size] in [-1, 1], 'modality': 'video'}. Broken files are replaced
-    by another random index (each failing path is logged once). The last `tail` manifest lines (as
-    read at init) are the eval hold-out: split='train' excludes them, split='heldout' is only them."""
+    Returns {'data': [3, T, size, size] in [-1, 1], 'modality': 'video', 'stride': int}. Broken files
+    are replaced by another random index (each failing path is logged once). The last `tail` manifest
+    lines (as read at init) are the eval hold-out: split='train' excludes them, split='heldout' is
+    only them. Any manifest in this format works (SSv2 .webm too); only path / n_frames / fps are read.
 
-    def __init__(self, manifest: str, n_frames: int = 8, frame_stride: int = 2, size: int = 256,
+    frame_stride: an int or several ("2,4,8" / [2, 4, 8]). In train mode each clip draws one stride
+    uniformly; a video shorter than that stride's span uses the largest stride that fits (its frame
+    count comes from the manifest's n_frames, else from the file headers, cached). Eval mode uses
+    one fixed stride: `eval_stride`, else the first of the list."""
+
+    def __init__(self, manifest: str, n_frames: int = 8, frame_stride: StrideSpec = 2, size: int = 256,
                  train: bool = True, max_retries: int = 20, decoder=None, tail: int = 0,
-                 split: Optional[str] = None):
+                 split: Optional[str] = None, eval_stride: Optional[int] = None,
+                 probe: Optional[Callable[..., int]] = None):
         split = split or ("train" if train else "heldout")
         self.items = split_tail(read_manifest(manifest), tail, split)
         if not self.items:
             raise RuntimeError(f"empty manifest {manifest}")
-        self.n_frames, self.stride, self.size, self.train = n_frames, frame_stride, size, train
+        self.strides = parse_strides(frame_stride)
+        self.stride = int(eval_stride) if eval_stride else self.strides[0]     # the fixed (eval) stride
+        self.n_frames, self.size, self.train = n_frames, size, train
         self.max_retries = max_retries
         self._decode = decoder or _pick_decoder()
+        self._probe = probe or probe_frames
+        self._totals: dict = {}                                     # index -> probed frame count
         self._bad: set = set()
         self._rng = random.Random()
 
     def __len__(self) -> int:
         return len(self.items)
 
-    def _load(self, i: int) -> torch.Tensor:
+    def _total(self, i: int) -> int:
+        """Frame count of item i: manifest n_frames, else probed from the file once (0 = unknown)."""
         r = self.items[i]
-        clip = self._decode(r["path"], self.n_frames, self.stride, self.size, self._rng,
-                            total_hint=r.get("n_frames"), fps_hint=r.get("fps"))
+        if r.get("n_frames"):
+            return int(r["n_frames"])
+        if i not in self._totals:
+            self._totals[i] = int(self._probe(r["path"], fps_hint=r.get("fps")) or 0)
+        return self._totals[i]
+
+    def _stride(self, i: int) -> tuple[int, Optional[int]]:
+        """(stride for this draw, frame count hint for the decoder)."""
+        if not self.train:
+            return self.stride, self.items[i].get("n_frames")
+        if len(self.strides) == 1:
+            return self.strides[0], self.items[i].get("n_frames")
+        total = self._total(i)
+        return pick_stride(self.strides, self.n_frames, total, self._rng), total or None
+
+    def _load(self, i: int) -> tuple[torch.Tensor, int]:
+        r = self.items[i]
+        stride, total = self._stride(i)
+        clip = self._decode(r["path"], self.n_frames, stride, self.size, self._rng,
+                            total_hint=total, fps_hint=r.get("fps"))
         T, h, w, _ = clip.shape
         s = self.size
         if self.train:
             t, l = self._rng.randint(0, h - s), self._rng.randint(0, w - s)
         else:
             t, l = (h - s) // 2, (w - s) // 2
-        return _to_tensor(clip[:, t:t + s, l:l + s])
+        return _to_tensor(clip[:, t:t + s, l:l + s]), stride
 
     def __getitem__(self, i: int) -> dict:
         for _ in range(self.max_retries):
             try:
-                return dict(data=self._load(i), modality="video")
+                data, stride = self._load(i)
+                return dict(data=data, modality="video", stride=stride)
             except Exception as ex:                                # broken / truncated / still copying
                 p = self.items[i]["path"]
                 if p not in self._bad:
@@ -473,6 +560,8 @@ def collate(batch: list[dict]) -> dict:
     for k in ("c2w", "K"):
         if k in batch[0]:
             out[k] = torch.stack([b[k] for b in batch])
+    if "stride" in batch[0]:                                      # frame stride of each clip [B]
+        out["stride"] = torch.tensor([int(b["stride"]) for b in batch], dtype=torch.long)
     if "label" in batch[0]:
         labs = [b["label"] for b in batch]
         out["label"] = torch.tensor(labs) if all(isinstance(l, int) for l in labs) else labs
@@ -490,20 +579,84 @@ def _worker_init(wid: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     ds = info.dataset
-    if hasattr(ds, "_rng"):
-        ds._rng = random.Random(seed)
+    # the datasets of a ConcatDataset (video mixture) need their own streams too: forked workers
+    # would otherwise all copy the same _rng state and draw the same crops / starts / strides
+    for k, d in enumerate([ds] + list(getattr(ds, "datasets", []))):
+        if hasattr(d, "_rng"):
+            d._rng = random.Random(seed + 7919 * k)
+
+
+class MixtureSampler(Sampler):
+    """Indices into ConcatDataset(datasets) where each sample comes from dataset j with probability
+    weights[j] (normalised), for one rank of `num_replicas`.
+
+    Each source is shuffled per (epoch, pass) with a seed shared by all ranks and cut into
+    DistributedSampler-style shards (perm[rank::num_replicas]), so ranks never read the same item
+    within a pass; a rank cycles through its own shard of each source, reshuffled on every pass
+    (the small SSv2 is passed more often than OpenVid). The per-sample source draws are a per-rank
+    stream. An epoch is `num_samples` indices per rank (default sum(sizes) // num_replicas)."""
+
+    def __init__(self, sizes: Sequence[int], weights: Sequence[float], num_replicas: int = 1, rank: int = 0,
+                 seed: int = 0, shuffle: bool = True, num_samples: Optional[int] = None):
+        if len(sizes) != len(weights) or not sizes:
+            raise ValueError("MixtureSampler needs one weight per dataset")
+        if min(sizes) < 1 or min(weights) < 0 or sum(weights) <= 0:
+            raise ValueError(f"bad mixture: sizes={list(sizes)} weights={list(weights)}")
+        self.sizes, self.weights = [int(n) for n in sizes], [float(w) for w in weights]
+        self.offsets = [0]
+        for n in self.sizes[:-1]:
+            self.offsets.append(self.offsets[-1] + n)
+        self.world, self.rank, self.seed, self.shuffle = num_replicas, rank, seed, shuffle
+        self.num_samples = int(num_samples or max(1, sum(self.sizes) // num_replicas))
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def shard(self, j: int, p: int) -> list[int]:
+        """This rank's local indices of source j on pass p of the current epoch."""
+        n = self.sizes[j]
+        if self.shuffle:
+            g = torch.Generator().manual_seed(
+                (((self.seed * 1_000_003 + self.epoch) * 1_009 + j) * 100_003 + p) % 2 ** 63)
+            perm = torch.randperm(n, generator=g).tolist()
+        else:
+            perm = list(range(n))
+        return perm[self.rank::self.world] or perm                 # fewer items than ranks: share them
+
+    def __iter__(self):
+        rng = random.Random((self.seed * 1_000_003 + self.epoch) * 7_919 + self.rank)
+        src = list(range(len(self.sizes)))
+        cur, pos, passes = [None] * len(src), [0] * len(src), [0] * len(src)
+        for _ in range(self.num_samples):
+            j = rng.choices(src, weights=self.weights)[0]
+            if cur[j] is None or pos[j] >= len(cur[j]):
+                cur[j], pos[j] = self.shard(j, passes[j]), 0
+                passes[j] += 1
+            yield self.offsets[j] + cur[j][pos[j]]
+            pos[j] += 1
+
+    def __len__(self) -> int:
+        return self.num_samples
 
 
 def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                   objaverse: Optional[str] = None, *, batch_image: int = 32, batch_video: int = 4,
-                  batch_3d: int = 4, size: int = 256, n_frames: int = 8, frame_stride: int = 2,
-                  n_views: int = 4, video_tail: int = 1000, objaverse_holdout: int = 500,
-                  num_workers: int = 8, rank: int = 0, world: int = 1, seed: int = 0,
-                  split: str = "train") -> dict:
+                  batch_3d: int = 4, size: int = 256, n_frames: int = 8, frame_stride: StrideSpec = 2,
+                  eval_frame_stride: Optional[int] = None, n_views: int = 4, video_tail: int = 1000,
+                  objaverse_holdout: int = 500, num_workers: int = 8, rank: int = 0, world: int = 1,
+                  seed: int = 0, split: str = "train", ssv2: Optional[str] = None,
+                  ssv2_weight: float = 0.3) -> dict:
     """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
     Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
     DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
-    are excluded."""
+    are excluded.
+
+    frame_stride: int or list ("2,4,8"), see OpenVidClips. ssv2: an SSv2 manifest (OpenVid jsonl
+    format, used whole as unlabeled video: labels are never read) mixed into the video stream: each
+    video sample is SSv2 with probability ssv2_weight (MixtureSampler, rank-sharded). With OpenVid,
+    ssv2_weight <= 0 leaves SSv2 out and >= 1 leaves OpenVid out; without OpenVid, SSv2 is the
+    whole video stream."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -515,10 +668,23 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
         ds = ImageNetParquet(imagenet, split, size=size, train=train)
         bs = ParquetGroupBatchSampler(ds, batch_image, num_workers, rank, world, seed, shuffle=train)
         out["image"] = (DataLoader(ds, batch_sampler=bs, **common), bs)
-    if openvid:
-        ds = OpenVidClips(openvid, n_frames=n_frames, frame_stride=frame_stride, size=size, train=train,
-                          tail=video_tail)
+    clips = dict(n_frames=n_frames, frame_stride=frame_stride, size=size, train=train,
+                 eval_stride=eval_frame_stride)
+    vids = []                                                       # (dataset, weight)
+    w_ssv2 = float(ssv2_weight) if ssv2 else 0.0
+    if openvid and w_ssv2 < 1.0:
+        vids.append((OpenVidClips(openvid, tail=video_tail, **clips), 1.0 - w_ssv2))
+    if ssv2 and (w_ssv2 > 0 or not openvid):
+        vids.append((OpenVidClips(ssv2, split="all", **clips), w_ssv2))
+    if len(vids) == 1:
+        ds = vids[0][0]
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
+    elif vids:
+        ds = ConcatDataset([d for d, _ in vids])
+        smp = MixtureSampler([len(d) for d, _ in vids], [w for _, w in vids], num_replicas=world, rank=rank,
+                             seed=seed, shuffle=train)
+        log.info("video mixture: %s", ", ".join(f"{len(d)} clips x {w:.2f}" for d, w in vids))
+    if vids:
         out["video"] = (DataLoader(ds, batch_size=batch_video, sampler=smp, drop_last=True, **common), smp)
     if objaverse:
         ds = ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout)

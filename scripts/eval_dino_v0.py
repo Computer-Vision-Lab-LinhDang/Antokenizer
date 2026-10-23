@@ -9,6 +9,10 @@ Example (alpha, one GPU):
       --out runs/dino_v0/eval
 
 Writes <out>/eval.json and <out>/eval.md. SSv2 / Kinetics probes run only when --ssv2 / --kinetics are given.
+Video evals also report the C/D split (psnr_full / noD / zeroD / eraseC / warp, |delta| mean and p95, gate)
+and forecasts per horizon against copy-frame-t baselines, per clip and averaged (see evaluate.py). They use
+one fixed --frame-stride; to compare strides run once per stride with its own --stem, e.g.
+  ... --frame-stride 4 --stem eval_s4
 """
 from __future__ import annotations
 
@@ -73,9 +77,21 @@ def grouped_loader(ds, indices, batch_size, workers):
 
 
 def seeded_clips(manifest, args, size):
-    ds = OpenVidClips(manifest, args.video_frames, args.frame_stride, size, train=False)
+    ds = OpenVidClips(manifest, args.video_frames, args.frame_stride, size, train=False,
+                      eval_stride=args.frame_stride)
     ds._rng = random.Random(args.seed)                   # clip start is drawn from ds._rng: make it repeatable
     return ds
+
+
+def short_clip_note(name: str, ds, n_frames: int, stride: int):
+    """Note on clips whose manifest n_frames is below the span at this stride (their last frames repeat)."""
+    span = (n_frames - 1) * stride + 1
+    known = [int(r["n_frames"]) for r in ds.items if r.get("n_frames")]
+    short = sum(1 for k in known if k < span)
+    if not short:
+        return None
+    return (f"{name}: {short}/{len(known)} clips with a frame count are shorter than the {span}-frame span of "
+            f"{n_frames} frames at stride {stride}; their last frames repeat (copy baselines inflate there)")
 
 
 def openvid_heldout(manifest: str, n_tail: int, out_dir: str, run_list: str = "") -> str:
@@ -139,7 +155,8 @@ def main():
     ap.add_argument("--video-tail", type=int, default=1000, help="held-out manifest tail size")
     ap.add_argument("--video-limit", type=int, default=500)
     ap.add_argument("--video-frames", type=int, default=16, choices=[8, 16])
-    ap.add_argument("--frame-stride", type=int, default=2)
+    ap.add_argument("--frame-stride", type=int, default=2,
+                    help="fixed frame stride of every video eval (e.g. 2, 4, 8)")
     ap.add_argument("--ssv2", default=None, help="SSv2 manifest jsonl (OpenVid format); skipped if absent")
     ap.add_argument("--kinetics", default=None, help="Kinetics manifest jsonl (OpenVid format); skipped if absent")
     args = ap.parse_args()
@@ -191,6 +208,11 @@ def main():
                      knn_t=args.knn_t, num_classes=1000 if image_train is not None else None,
                      probe_epochs=args.probe_epochs, probe_lrs=[float(x) for x in args.probe_lrs.split(",")],
                      use_lpips=not args.no_lpips, use_fid=not args.no_fid, extra_video=extra)
+    for name, ds in (("openvid", video), *extra.items()):
+        msg = short_clip_note(name, ds, args.video_frames, args.frame_stride) if ds is not None else None
+        if msg:
+            res["notes"].append(msg)
+            print(f"[data] {msg}", flush=True)
     res["meta"] = dict(ckpt=os.path.abspath(args.ckpt), step=step, amp=args.amp, device=args.device,
                        video_frames=args.video_frames, frame_stride=args.frame_stride, cfg=cfg.__dict__)
     jp, mp = E.write_results(res, args.out, args.stem)
