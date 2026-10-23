@@ -19,6 +19,7 @@ import random
 import signal
 import sys
 import time
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
@@ -164,7 +165,7 @@ def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args) 
     os.replace(tmp, path)
 
 
-def load_ckpt(path: str, model, opt, sched) -> int:
+def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None) -> int:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     missing, unexpected = model.load_state_dict(ck["model"], strict=False)
     missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
@@ -172,6 +173,11 @@ def load_ckpt(path: str, model, opt, sched) -> int:
         raise RuntimeError(f"checkpoint mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
     opt.load_state_dict(ck["optim"])
     sched.load_state_dict(ck["sched"])
+    if lr is not None:                          # --lr wins over the checkpoint's peak lr (schedule follows --steps)
+        sched.base_lrs = [lr] * len(opt.param_groups)
+        for g, f in zip(opt.param_groups, sched.lr_lambdas):
+            g["initial_lr"] = lr
+            g["lr"] = lr * f(sched.last_epoch)
     return int(ck["step"])
 
 
@@ -287,7 +293,7 @@ def main(argv=None) -> int:
     elif args.resume and args.resume != "none":
         resume = args.resume
     if resume:
-        step = load_ckpt(resume, model, opt, sched)
+        step = load_ckpt(resume, model, opt, sched, lr=args.lr)
         if rank == 0:
             print(f"resumed from {resume} at step {step}", flush=True)
     torch.manual_seed(seed + step)                             # per-rank stream (queries, data aug)
