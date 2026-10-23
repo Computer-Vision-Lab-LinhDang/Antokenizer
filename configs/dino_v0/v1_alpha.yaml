@@ -1,4 +1,5 @@
-# MAVT on DINOv3 v1 phase 1 -- training on "alpha" (AMD / ROCm, GPUs 1,2,3).
+# MAVT on DINOv3 v1 phase 1 -- training on "alpha" (AMD MI355X / ROCm, GPUs 0-3; GPUs 4-7 belong to others).
+# Run of 23/10/2026: /scratch/vunguyen13/mavt/runs/muse-spark-mavt-v1 (exact command in its launch.sh).
 #
 # Same model as v0_alpha.yaml plus the v1 phase-1 options (config.py "v1 phase 1" block):
 #   per-query Δ, conv rgb head (full frames, no patch grid), hinge gate loss (D may be used, only
@@ -12,12 +13,12 @@
 #    (LPIPS loads torchvision's ImageNet VGG16 weights on first use: make sure they are in the torch hub cache)
 # 1) loader throughput check (no model, ~1 min):
 #    python scripts/train_dino_v0.py --config configs/dino_v0/v1_alpha.yaml \
-#      --out /scratch/vunguyen13/mavt/runs/mavt-v1-alpha --bench-data 50
+#      --out /scratch/vunguyen13/mavt/runs/muse-spark-mavt-v1 --bench-data 50
 # 2) launch inside tmux (auto-resumes from <out>/last.pt; SIGTERM / Ctrl-C saves last.pt):
-#    tmux new -s mavt-v1
-#    cd ~/Antokenizer && CUDA_VISIBLE_DEVICES=1,2,3 torchrun --standalone --nproc_per_node 3 \
+#    tmux new -s muse-spark-mavt-v1
+#    cd ~/Antokenizer && CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
 #      scripts/train_dino_v0.py --config configs/dino_v0/v1_alpha.yaml \
-#      --out /scratch/vunguyen13/mavt/runs/mavt-v1-alpha 2>&1 | tee -a /scratch/vunguyen13/mavt/runs/mavt-v1-alpha.log
+#      --out /scratch/vunguyen13/mavt/runs/muse-spark-mavt-v1 2>&1 | tee -a /scratch/vunguyen13/mavt/runs/muse-spark-mavt-v1/train.log
 #    (out of memory -> lower batch_video / batch_image, or add --use-checkpoint)
 # Logs: <out>/log.jsonl (one json per --log-every steps); checkpoints <out>/last.pt + step_XXXXXXX.pt.
 # Loss parts are logged unweighted (loss_rgb, loss_lpips, loss_gram, ...): after the first steps check
@@ -87,20 +88,22 @@ train:
   objaverse: /scratch/vunguyen13/data/objaverse-lvis-subset-v1
   video_tail: 1000         # last 1000 OpenVid manifest lines -> eval only (<out>/openvid_heldout.txt)
   objaverse_holdout: 500   # last 500 non-blank uids -> eval only (<out>/objaverse_heldout.txt)
-  steps: 200000
+  ssv2_train: /scratch/vunguyen13/data/dino_v0_data/ssv2/ssv2_train_manifest.jsonl   # train split only (168,913 clips)
+  ssv2_weight: 0.3         # share of video clips drawn from SSv2 (unlabeled; labels are never read)
+  steps: 16000             # ~7.7 h at ~0.58 it/s on 4 GPUs (run of 23/10/2026)
   lr: 2.0e-4
   wd: 0.05
   warmup: 2000
-  # batch sizes as in v0_alpha: to be tuned on the machine (the conv head decodes full frames,
-  # ~120 MB of activations per frame in bf16, plus the forecast and warp-only decodes)
-  batch_image: 32          # per GPU
-  batch_video: 4           # per GPU, 8 frames each (2 segments of K=4)
-  batch_3d: 4              # per GPU, objects of n_views posed views
+  # per GPU, tuned on MI355X (288 GB): peak 231 GB with --compile; eager OOMs at this size.
+  # 256 / 32 / 32 OOMs even with --use-checkpoint (conv head decodes full frames).
+  batch_image: 128
+  batch_video: 16          # clips of n_frames frames
+  batch_3d: 16             # objects of n_views posed views
   n_views: 4
   n_frames: 8
-  frame_stride: "2,4,8"    # several strides: the forecasts see slow and fast motion (list parsing: trainer, in parallel)
-  modality_weights: image:0.4,video:0.4,threed:0.2
-  mix_modalities: true     # several modalities per step instead of one (trainer flag being added in parallel)
+  frame_stride: "2,4,8"    # one stride drawn per clip: Δ and the forecasts see slow and fast motion
+  mix_modalities: true     # image + video + 3D in every step, one backward (DDP: no unused params, static graph)
+  compile: true            # regional torch.compile: -15% step time, -34% memory on MI355X
   grad_accum: 1
   bf16: true
   grad_clip: 1.0
