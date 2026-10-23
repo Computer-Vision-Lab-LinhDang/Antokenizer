@@ -62,6 +62,19 @@ class DinoV0Config:
     w_kl: float = 1e-6
     w_sem: float = 0.5
     w_gate: float = 0.01                 # keeps o from collapsing to 0 (D carrying everything)
+    # ---- v1 phase 1 (defaults keep v0 behaviour, so v0 checkpoints load and evaluate unchanged) ----
+    delta_mode: str = "mean"             # "mean": Δ from the mean of the D tokens (v0); "query": each query attends to D for its own Δ
+    rgb_head: str = "linear"             # "linear": per-patch Linear (v0); "conv": full-grid conv upsampler (needs all N queries)
+    conv_channels: tuple = (512, 256, 128, 64, 64)   # conv upsampler: width at grid resolution, then one per x2 stage
+    conv_res_blocks: int = 2             # ResBlocks per conv stage
+    gate_loss: str = "mean"              # "mean": (1 - o).mean() (v0, pushes o to 1); "hinge": relu(gate_floor - mean(o))
+    gate_floor: float = 0.5
+    w_warp: float = 0.0                  # warp-only loss: decode with the gate locked to 1 (C read at (u, v) + Δ only)
+    forecast_horizons: tuple = (1,)      # D_hat forecasts frame t + h for each h (v0: t + 1 only)
+    forecast_residual: bool = False      # D_hat(t + h) = D_t + f(D_t, C_k, h), f zero-init: starts as copy-last
+    w_fut_rgb: float = 0.0               # rgb L1 on forecast frames
+    w_gram: float = 0.0                  # Gram loss on the LPIPS VGG features (AToken-style)
+    lpips_max_frames: int = 64           # frames per step that get LPIPS / Gram (random subset)
     extra: dict = field(default_factory=dict)
 
     @property
