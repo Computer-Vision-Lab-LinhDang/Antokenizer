@@ -32,21 +32,22 @@ Rules that define the C/D split (do not break them):
 
 | File | What it holds |
 |---|---|
-| `config.py` | `DinoV0Config`: every hyper-parameter; v1 flags in the "v1 phase 1" and "v1 phase 2" blocks; `tiny_config()` for CPU tests |
+| `config.py` | `DinoV0Config`: every hyper-parameter; v1 flags in the "v1 phase 1", "phase 2" and "phase 3" blocks; `tiny_config()` for CPU tests |
 | `encoder.py` | frozen DINOv3 (local HF dir) + pixel stem; DINOv3 patch features are the `feat` targets |
 | `rope.py` | masked axial RoPE on (t, u, v, z); cos/sin tables built once per forward |
 | `trunk.py` | 8-layer trunk (in-frame + causal t-1 window attention); optional R2 learned relations (`rgat_relations`, off) |
 | `cd_state.py` | `CBuilder` (C at keyframes), `DState` / `CDState` (D per frame, forecasts `D_fut[h]`) |
 | `latent.py` | z_r heads (KL) and the z_s pool |
-| `decoder.py` | `QueryDecoder`: Δ (mean or per-query), dense masked 5x5 window read of C, gate, rgb head (linear or conv), warp-only mode |
+| `decoder.py` | `QueryDecoder`: Δ (mean or per-query), dense masked 5x5 window read of C, gate, rgb head (linear or conv), warp-only mode, D prefix masks (`zd_len`, nested dropout) |
 | `losses.py` | rgb L1, feat (1-cos + MSE), KL, VICReg var/cov, sem (z_s -> DINOv3 CLS), gate, LPIPS + Gram |
 | `model.py` | `MAVTDinoV0`: `encode`, `decode_frame`, `reconstruct`, `forward` (all losses, batched over frames) |
 | `data.py` | ImageNet parquet, OpenVid / SSv2 clips (PyAV, random stride), Objaverse posed views, mixed loaders |
-| `evaluate.py` | PSNR/SSIM/LPIPS/rFID, C/D split metrics, forecasts vs copy baselines, kNN / linear probes |
+| `evaluate.py` | PSNR/SSIM/LPIPS/rFID, C/D split metrics, PSNR vs D prefix length by motion tercile, forecasts vs copy baselines, kNN / linear probes |
 | `camera.py` | Plücker rays and relative poses for posed views |
 
 Scripts: `scripts/train_dino_v0.py` (torchrun DDP), `scripts/eval_dino_v0.py`, `scripts/profile_dino_v0.py`.
-Configs: `configs/dino_v0/v0_alpha.yaml`, `configs/dino_v0/v1_alpha.yaml`. Tests: `tests/dino_v0/`.
+Configs: `configs/dino_v0/v0_alpha.yaml`, `v1_alpha.yaml`, `v1b_alpha.yaml` (speed), `v1c_alpha.yaml`
+(variable-length D). Tests: `tests/dino_v0/`.
 
 ## v0 vs v1 (config flags)
 
@@ -107,6 +108,32 @@ on an MI355X the dense masked read takes 18.3 ms / 7.1 GB, within 5% of the same
 (17.4 ms), while the gathered read takes 196 ms / 69 GB (25 copies of k / v and their scatter-add backward).
 So the window read is not where the time goes and `dense` stays the default; `gather` is a correctness
 reference only.
+
+## v1 phase 3: variable-length D by nested dropout (`configs/dino_v0/v1c_alpha.yaml`)
+
+First step towards a token budget that follows the innovation of a frame rather than the clock: the D tokens
+of a frame become a rate ladder. With `d_nested: true`, every training step draws one prefix length
+l in {0, ..., M} per clip and masks the D tokens beyond l in every read of D the decoder makes (the content
+read of each block and the Δ read), for the reconstruction, the forecasts and the warp-only decodes of that
+clip alike. A learned null token is always visible, so l = 0 is a valid code (the C-only decode) and not an
+error. Nothing else changes: the encoder still produces all M tokens, the KL and the forecasts cover all of
+them, and at inference `model.decode_frame(..., zd_len=...)` reads any prefix per row. `v1c_alpha.yaml`
+also moves half of the segment budget into D: 64 tokens x 24 channels per frame and C 256 x 24 per segment
+(still 12,288 per 4-frame segment; images stay at 256 x 48). Tests: `tests/dino_v0/test_nested_d.py` (a
+prefix mask equals the sliced tokens; the default keeps phase 2 bit-identical).
+
+| Flag | phase 2 (default) | phase 3 | What it does |
+|---|---|---|---|
+| `d_nested` | false | true | random D prefix per clip and step, the rest masked; null token for the empty prefix |
+| `d_tokens`, `zr_d`, `zr_c_video` | 16, 64, 32 | 64, 24, 24 | 64-step ladder per frame; C and D each get half of the 12,288 |
+
+The test this step has to pass (`evaluate.py`, `video_pass`): PSNR against the prefix length 0 / 8 / 16 /
+32 / 48 / 64 tokens, split by motion tercile of the clips (`motion_l1`, the mean |frame_t - frame_{t-1}|),
+written as a table in `eval.md`. If the curve separates by motion (high-motion clips need the long prefixes,
+static clips do not), D carries what changes and its length can follow the innovation; if l does not matter
+in any bucket, D is still unused and the budget has to move first. The training log adds
+`diag_zd_energy_head` / `_tail`, the mean squared z_r(D) of the first and the last quarter of the tokens, to
+see whether the information concentrates in the prefix.
 
 ## Commands
 

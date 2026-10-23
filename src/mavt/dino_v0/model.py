@@ -151,14 +151,15 @@ class MAVTDinoV0(nn.Module):
     # ------------------------------------------------------------------ decode
     def decode_frame(self, zc: torch.Tensor, zd: Optional[torch.Tensor], t, modality: str,
                      idx: Optional[torch.Tensor] = None, rays: Optional[torch.Tensor] = None,
-                     warp_only: bool = False) -> dict:
+                     warp_only: bool = False, zd_len: Optional[torch.Tensor] = None) -> dict:
         """Decode B rows in ONE decoder call; a row is one frame, rows may come from different frames / clips.
 
         zc [B,N,cc], zd [B,M,zr_d] | None, t: float (every row) or tensor [B] (frame time of each row),
         idx [B,Q] | None (all N queries in row-major order; the conv rgb head needs None),
         rays [B,N,6] of the target view (posed views) | None, warp_only: gate locked to 1 (C read at
-        (u, v) + Δ only). Returns the decoder dict; "image" [B,3,H,W] is the conv head's output, or the
-        patches put together when idx is None (linear head), else None."""
+        (u, v) + Δ only), zd_len [B] long | None: each row reads only its first zd_len D tokens (nested
+        dropout; 0 needs cfg.d_nested). Returns the decoder dict; "image" [B,3,H,W] is the conv head's
+        output, or the patches put together when idx is None (linear head), else None."""
         mm = _mm(modality)
         B = zc.shape[0]
         if idx is not None and self.cfg.rgb_head == "conv":
@@ -171,28 +172,30 @@ class MAVTDinoV0(nn.Module):
         qm = modality_mask(mm, qc.shape[1], device=zc.device).unsqueeze(0).expand(B, -1, -1)
         if rays is not None and idx is not None:
             rays = _gather(rays, idx)
-        o = self.decoder(zc, zd, qc, qm, mm, q_rays=rays, warp_only=warp_only)
+        o = self.decoder(zc, zd, qc, qm, mm, q_rays=rays, warp_only=warp_only, zd_len=zd_len)
         if o.get("image") is None:
             o["image"] = patches_to_image(o["rgb"], self.cfg.grid, self.cfg.patch) if idx is None else None
         return o
 
     def _decode_set(self, e: dict, src: torch.Tensor, dst: torch.Tensor, zd: Optional[torch.Tensor],
-                    subset: bool, warp_only: bool = False) -> tuple:
+                    subset: bool, warp_only: bool = False, zd_len: Optional[torch.Tensor] = None) -> tuple:
         """Decode frames dst [T'] of every clip in ONE decoder call, from the zc of src's [T'] segments and
         zd [B, T', M, zr_d] | None, at query time dst. subset (linear head only): a random subset of
-        train_queries_per_frame queries per row (v0 training), else all N queries.
+        train_queries_per_frame queries per row (v0 training), else all N queries. zd_len [B] | None: the
+        D prefix each clip reads (every frame of a clip the same).
         -> (decoder dict, targets dict(img [B*T',3,H,W], rgb [B*T',Q,p*p*3], feat [B*T',Q,F])), rows b-major."""
         cfg = self.cfg
         B, N = e["frames"].shape[0], cfg.n_patches
         zc = e["zc"][:, e["state"]["seg"][src]].flatten(0, 1)
         zd = None if zd is None else zd.flatten(0, 1)
+        rows_len = None if zd_len is None or zd is None else zd_len.repeat_interleave(int(dst.numel()))
         rays = None if e["rays"] is None else e["rays"][:, dst].flatten(0, 1)
         img = e["frames"][:, dst].flatten(0, 1)
         feat = e["feat_target"][:, dst].flatten(0, 1)
         idx = None
         if subset and cfg.rgb_head == "linear" and cfg.train_queries_per_frame < N:
             idx = torch.rand(zc.shape[0], N, device=zc.device).argsort(-1)[:, :cfg.train_queries_per_frame]
-        o = self.decode_frame(zc, zd, dst.float().repeat(B), e["modality"], idx, rays, warp_only)
+        o = self.decode_frame(zc, zd, dst.float().repeat(B), e["modality"], idx, rays, warp_only, rows_len)
         rgb = image_to_patches(img, cfg.patch)
         if idx is not None:
             rgb, feat = _gather(rgb, idx), _gather(feat, idx)
@@ -224,8 +227,16 @@ class MAVTDinoV0(nn.Module):
         key = tt % cfg.keyframe_every == 0
         parts, diag = {}, {}
 
+        # ---- nested dropout: one D prefix length per clip and step, used by every decode of the step
+        zd_len = None
+        if cfg.d_nested and self.training and seq and e.get("zd") is not None:
+            zd_len = torch.randint(0, cfg.d_tokens + 1, (B,), device=data.device)
+            mu = e["kl_d"][0].detach().float()                                      # [B*T, M, zr_d]
+            en, q = mu.pow(2).mean((0, 2)), max(1, cfg.d_tokens // 4)             # energy by token order
+            diag["zd_energy_head"], diag["zd_energy_tail"] = en[:q].mean(), en[-q:].mean()
+
         # ---- reconstruction: every frame from (C of its keyframe, D_t)
-        o, tg = self._decode_set(e, tt, tt, e.get("zd"), subset=self.training)
+        o, tg = self._decode_set(e, tt, tt, e.get("zd"), subset=self.training, zd_len=zd_len)
         parts["rgb"] = L.rgb_l1(*self._rgb_pair(o, tg))
         parts["feat"] = L.feat_loss(o["feat"], tg["feat"])
 
@@ -237,7 +248,7 @@ class MAVTDinoV0(nn.Module):
             src = torch.cat([srcs[h] for h in hs])
             dst = torch.cat([srcs[h] + h for h in hs])
             zd_f = torch.cat([e["zd_fut"][h][:, srcs[h]] for h in hs], 1)
-            of, tf = self._decode_set(e, src, dst, zd_f, subset=self.training)
+            of, tf = self._decode_set(e, src, dst, zd_f, subset=self.training, zd_len=zd_len)
             pred_f, tgt_f = self._rgb_pair(of, tf)
             fut, fut_rgb = [], []
             per_h = zip(hs, *(_split(x, B, sizes) for x in (of["feat"], tf["feat"], pred_f, tgt_f)))
@@ -253,7 +264,8 @@ class MAVTDinoV0(nn.Module):
         if seq and cfg.w_warp > 0 and not bool(key.all()):
             nk = tt[~key]
             nk = nk[_subset(int(nk.numel()), cfg.warp_frames, data.device)]
-            ow, tw = self._decode_set(e, nk, nk, e["zd"][:, nk], subset=self.training, warp_only=True)
+            ow, tw = self._decode_set(e, nk, nk, e["zd"][:, nk], subset=self.training, warp_only=True,
+                                      zd_len=zd_len)
             pred_w, tgt_w = self._rgb_pair(ow, tw)
             parts["warp"] = L.rgb_l1(pred_w, tgt_w)
             diag["psnr_warp"] = _psnr(pred_w, tgt_w, B)

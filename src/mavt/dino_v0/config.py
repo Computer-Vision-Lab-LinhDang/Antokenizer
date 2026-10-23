@@ -80,6 +80,8 @@ class DinoV0Config:
     warp_frames: int = 0                 # 0: warp-only loss on every non-key frame; k > 0: k random non-key frames per step
     conv_channels_last: bool = False     # conv rgb head (weights + input) in channels_last: no NCHW <-> NHWC transposes around MIOpen / cuDNN
     window_read: str = "dense"           # decoder's C read: "dense" = masked SDPA over all N cells; "gather" = the (2r+1)^2 window cells per query
+    # ---- v1 phase 3: variable-length D by nested dropout (default off) ----
+    d_nested: bool = False               # train: each clip keeps a random prefix of 0..M D tokens (fixed order) per step, the rest are masked in every read of D; a learned null token makes the empty prefix a valid code
     extra: dict = field(default_factory=dict)
 
     @property

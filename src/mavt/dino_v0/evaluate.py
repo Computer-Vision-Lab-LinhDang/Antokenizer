@@ -327,6 +327,11 @@ def forecast_latents(e: dict) -> Dict[int, torch.Tensor]:
     return {}
 
 
+def prefix_lengths(M: int) -> List[int]:
+    """D prefix lengths of the distortion-vs-length sweep (nested dropout): 0, M/8, M/4, M/2, 3M/4, M."""
+    return sorted({0, M // 8, M // 4, M // 2, 3 * M // 4, M})
+
+
 def feat_cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Cosine of feature maps [B, N, d] per cell, averaged over cells -> [B]."""
     return F.cosine_similarity(a.float(), b.float(), dim=-1).mean(1)
@@ -362,6 +367,8 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
     can_warp = accepts_kwarg(model.decode_frame, "warp_only")
     if not can_warp:
         skipped["warp"] = "psnr_warp skipped: model.decode_frame has no warp_only"
+    # distortion vs D prefix length (nested dropout): every frame decoded with 0 .. M D tokens
+    lens = prefix_lengths(cfg.d_tokens) if getattr(cfg, "d_nested", False) and accepts_kwarg(model.decode_frame, "zd_len") else []
     horizons, strides = set(), set()
 
     def dec(zc, zd, t, **kw):
@@ -390,6 +397,8 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
             seg = e["state"]["seg"]
             frames = e["frames"]
             ft = e.get("feat_target")
+            motion = ((frames[:, 1:] - frames[:, :-1]).abs().float().mean((1, 2, 3, 4)) if T > 1
+                      else torch.zeros(B))                                 # mean |frame_t - frame_{t-1}| per clip
             recs, rfeats = [], []
             if e.get("zd") is None:
                 skipped["cd"] = "C/D split skipped: encode() returned no zd"
@@ -422,6 +431,9 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
                 put("psnr_noD", t, p1); put("gap_noD", t, p - p1)
                 p2 = psnr(frame_image(dec(torch.zeros_like(zc), zd, t), cfg), tgt)
                 put("psnr_eraseC", t, p2); put("gap_eraseC", t, p - p2)
+                for ell in lens:                                           # the first ell D tokens only
+                    ln = torch.full((B,), ell, device=zd.device, dtype=torch.long)
+                    put(f"psnr_dlen{ell}", t, psnr(frame_image(dec(zc, zd, t, zd_len=ln), cfg), tgt))
                 if can_warp:                                               # C read at (u, v) + delta only
                     try:
                         ow = dec(zc, zd, t, warp_only=True)
@@ -469,7 +481,7 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
             strides.update(int(s) for s in torch.as_tensor(st)[:B].tolist())
         if per_clip:
             for b in range(B):
-                r: dict = dict(clip=n + b)
+                r: dict = dict(clip=n + b, motion_l1=float(motion[b]))
                 if st is not None:
                     r["stride"] = int(torch.as_tensor(st)[b])
                 for name, m in sorted(fr.items()):
@@ -695,6 +707,28 @@ def _cd_split_md(v: dict) -> List[str]:
     return lines + [""]
 
 
+def _dlen_md(v: dict) -> List[str]:
+    """Distortion vs D prefix length (nested dropout): all / non-key frames, then the clips by motion tercile
+    (motion_l1 = mean |frame_t - frame_{t-1}| in [-1, 1] pixels): the rate ladder must separate by motion."""
+    pre = "psnr_dlen"
+    lens = sorted(int(k[len(pre):]) for k in v if k.startswith(pre) and k[len(pre):].isdigit())
+    if not lens:
+        return []
+    lines = ["D prefix length (nested dropout): PSNR dB when only the first n D tokens are read.", "",
+             "| frames / clips | " + " | ".join(f"n = {n}" for n in lens) + " |", "|---|" + "---|" * len(lens)]
+    for label, s in (("all frames", ""), ("non-key frames", "_nonkey")):
+        lines.append(f"| {label} | " + " | ".join(_f(v.get(f"{pre}{n}{s}"), "{:.2f}") for n in lens) + " |")
+    clips = sorted((c for c in v.get("per_clip", []) if "motion_l1" in c and f"{pre}{lens[-1]}" in c),
+                   key=lambda c: c["motion_l1"])
+    if len(clips) >= 3:
+        k = len(clips) // 3
+        for label, part in (("low motion", clips[:k]), ("mid motion", clips[k:2 * k]), ("high motion", clips[2 * k:])):
+            m = sum(c["motion_l1"] for c in part) / len(part)
+            cells = (sum(c.get(f"{pre}{n}", float("nan")) for c in part) / len(part) for n in lens)
+            lines.append(f"| {label} ({len(part)} clips, |dpix| {m:.3f}) | " + " | ".join(f"{x:.2f}" for x in cells) + " |")
+    return lines + [""]
+
+
 def _forecast_md(v: dict) -> List[str]:
     """Forecast table of one video_pass result (rows: horizons, all target frames)."""
     hs = v.get("forecast_horizons") or []
@@ -736,7 +770,7 @@ def to_markdown(res: dict) -> str:
                   f"({_f(v.get('gap_zeroD_key'), '{:.2f}')} / {_f(v.get('gap_zeroD_nonkey'), '{:.2f}')}) | "
                   f"{_f(v.get('gap_noD'), '{:.2f}')} | {_f(v.get('gate'), '{:.3f}')} | "
                   f"{_f(v.get('delta_abs_cells'), '{:.3f}')} |", ""]
-        lines += _cd_split_md(v) + _forecast_md(v)
+        lines += _cd_split_md(v) + _dlen_md(v) + _forecast_md(v)
     u = res.get("understanding")
     if u:
         lines += [f"## Understanding (ImageNet, train {u['n_train']} / val {u['n_val']})", "",

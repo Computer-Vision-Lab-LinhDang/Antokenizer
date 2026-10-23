@@ -183,14 +183,16 @@ class _Attn(nn.Module):
         self.q, self.kv, self.o = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
         self.rope = rope
 
-    def forward(self, x, ctx, q_pos=None, q_m=None, k_pos=None, k_m=None):
+    def forward(self, x, ctx, q_pos=None, q_m=None, k_pos=None, k_m=None, k_valid=None):
+        # k_valid [B, N] bool | None: the keys each row may attend to (a prefix of the D tokens)
         B, Q, D = x.shape
         N = ctx.shape[1]
         q = self.q(x).view(B, Q, self.h, self.hd).transpose(1, 2)
         k, v = self.kv(ctx).view(B, N, 2, self.h, self.hd).permute(2, 0, 3, 1, 4)
         if self.rope is not None and q_pos is not None:
             q, k = self.rope(q, q_pos, q_m), self.rope(k, k_pos, k_m)
-        out = F.scaled_dot_product_attention(q, k, v)
+        mask = None if k_valid is None else k_valid[:, None, None, :]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.o(out.transpose(1, 2).reshape(B, Q, D))
 
 
@@ -205,14 +207,14 @@ class DecoderBlock(nn.Module):
         self.n_s, self.self_attn = nn.LayerNorm(d), _Attn(d, cfg.dec_heads, rope)
         self.n_m, self.mlp = nn.LayerNorm(d), _MLP(d, cfg.mlp_ratio)
 
-    def forward(self, h, c, d, win, q_coords, q_mask):
+    def forward(self, h, c, d, win, q_coords, q_mask, d_valid=None):
         hn = self.n_q(h)
         rc = self.read_c.read(hn, self.n_c(c), win)
         if d is None:
             o = torch.ones_like(h[..., :1])
             h = h + rc
         else:
-            rd = self.read_d(self.n_qd(h), self.n_d(d))
+            rd = self.read_d(self.n_qd(h), self.n_d(d), k_valid=d_valid)
             o = torch.sigmoid(self.gate(torch.cat([hn, rc], -1)))
             h = h + o * rc + (1 - o) * rd
         hs = self.n_s(h)
@@ -293,6 +295,8 @@ class QueryDecoder(nn.Module):
         self.in_c_image = nn.Linear(cfg.zr_c_image, d)
         self.in_c_video = nn.Linear(cfg.zr_c_video, d)
         self.in_d = nn.Linear(cfg.zr_d, d)
+        if cfg.d_nested:                               # always-visible null token: the empty prefix reads it alone
+            self.d_null = nn.Parameter(torch.zeros(1, 1, d))
         self.query = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.n_fourier = 8
         nf = 2 + 4 * self.n_fourier
@@ -321,29 +325,57 @@ class QueryDecoder(nn.Module):
             self.rgb_conv = ConvUpsampler(d, tuple(cfg.conv_channels), cfg.conv_res_blocks, cfg.conv_channels_last)
         self.feat_head = nn.Linear(d, feat_dim)
 
+    def d_tokens(self, zd: Optional[torch.Tensor], zd_len: Optional[torch.Tensor] = None) -> tuple:
+        """Projected D tokens [B, M (+1), dim] and the keys each row may read, [B, M (+1)] bool | None.
+        zd_len [B] long: the prefix of the D tokens visible to each row (nested dropout), None = all. With
+        cfg.d_nested the learned null token is appended and always visible, so an empty prefix is a code."""
+        if zd is None:
+            return None, None
+        d = self.in_d(zd)
+        B, M = d.shape[:2]
+        null = getattr(self, "d_null", None)
+        if null is not None:
+            d = torch.cat([d, null.expand(B, -1, -1).to(d.dtype)], 1)
+        if zd_len is None:
+            return d, None
+        zd_len = zd_len.to(d.device)
+        if null is None and bool((zd_len <= 0).any()):
+            raise ValueError("an empty D prefix needs d_nested (the null token): without it a row has no key to read")
+        valid = torch.arange(M, device=d.device)[None] < zd_len[:, None]   # [B,M]
+        if null is not None:
+            valid = torch.cat([valid, valid.new_ones(B, 1)], 1)
+        return d, valid
+
     def compute_delta(self, d: Optional[torch.Tensor], q_coords: torch.Tensor,
-                      q_rays: Optional[torch.Tensor] = None) -> torch.Tensor:
+                      q_rays: Optional[torch.Tensor] = None, d_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Δ [B, Q, 2] in (u, v) units from the projected D tokens; 0 when there is no D.
-        q_rays [B, Q, 6] enter only the "query" mode."""
+        q_rays [B, Q, 6] enter only the "query" mode; d_valid [B, M] bool: the D tokens each row may read."""
         if d is None:
             return torch.zeros_like(q_coords[..., 1:3])
         B, Q = q_coords.shape[:2]
         if self.cfg.delta_mode == "mean":
-            dm = d.mean(1, keepdim=True).expand(-1, Q, -1)
+            if d_valid is None:
+                dm = d.mean(1, keepdim=True)
+            else:
+                w = d_valid.to(d.dtype).unsqueeze(-1)
+                dm = (d * w).sum(1, keepdim=True) / w.sum(1, keepdim=True)
+            dm = dm.expand(-1, Q, -1)
             return self.offset(torch.cat([dm, fourier_uv(q_coords[..., 1:3], self.n_fourier).to(dm.dtype)], -1))
         f = fourier_uv(q_coords[..., 1:3], self.n_fourier).to(d.dtype)       # [B,Q,nf]
         q = self.delta_q(f)
         if q_rays is not None:
             q = q + self.delta_ray(q_rays.to(q.dtype))
-        rd = self.delta_read(self.delta_n_q(q), self.delta_n_d(d))           # [B,Q,D] own read of D
+        rd = self.delta_read(self.delta_n_q(q), self.delta_n_d(d), k_valid=d_valid)   # [B,Q,D] own read of D
         return self.delta_mlp(torch.cat([rd, f], -1))
 
     def forward(self, zc: torch.Tensor, zd: Optional[torch.Tensor], q_coords: torch.Tensor,
                 q_mask: torch.Tensor, modality: str, delta_override: Optional[torch.Tensor] = None,
-                q_rays: Optional[torch.Tensor] = None, warp_only: bool = False) -> dict:
+                q_rays: Optional[torch.Tensor] = None, warp_only: bool = False,
+                zd_len: Optional[torch.Tensor] = None) -> dict:
         """zc [B, N, zr_c], zd [B, M, zr_d] | None, q_coords / q_mask [B, Q, 4] (each row its own t).
         q_rays [B, Q, 6]: Plücker rays of the target view's queries (posed 3D views), else None.
         warp_only: with zd, blocks add readC only (gate 1, readD skipped); Δ still comes from zd.
+        zd_len [B] long | None: each row reads only the first zd_len D tokens (nested dropout; see d_tokens).
 
         Returns rgb [B, Q, p*p*3], image [B, 3, H, W] (conv head) | None (linear head),
         feat [B, Q, feat_dim], delta [B, Q, 2], gate [B, Q, 1] (last block)."""
@@ -356,8 +388,8 @@ class QueryDecoder(nn.Module):
         else:
             assert zc.shape[-1] == self.cfg.zr_c_video, "video zc must have zr_c_video channels"
             c = self.in_c_video(zc)
-        d = None if zd is None else self.in_d(zd)
-        delta = self.compute_delta(d, q_coords, q_rays) if delta_override is None else delta_override
+        d, d_valid = self.d_tokens(zd, zd_len)
+        delta = self.compute_delta(d, q_coords, q_rays, d_valid) if delta_override is None else delta_override
 
         # window read of C at the shifted centre (computed once, shared by all blocks)
         centre = q_coords[..., 1:3] + delta                                    # [B,Q,2]
@@ -383,7 +415,7 @@ class QueryDecoder(nn.Module):
         d_blk = None if warp_only else d                                       # warp-only: D acts via Δ alone
         gate = None
         for blk in self.blocks:
-            h, gate = blk(h, c, d_blk, win, q_coords, q_mask)
+            h, gate = blk(h, c, d_blk, win, q_coords, q_mask, d_valid)
         h = self.norm(h)
         if self.cfg.rgb_head == "linear":
             rgb, image = self.rgb_head(h), None
