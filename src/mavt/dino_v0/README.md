@@ -80,8 +80,27 @@ Tests: `tests/dino_v0/test_speed_v1b.py` (old vs new outputs and gradients; defa
 |---|---|---|---|
 | `fut_frames_per_horizon` | 0 (every pair) | 2 | forecast loss on 2 random source frames per horizon per step (one draw per step, shared by the batch, so shapes are constant for `torch.compile`) |
 | `warp_frames` | 0 (every non-key frame) | 2 | warp-only loss on 2 random non-key frames per step |
-| `conv_channels_last` | false | true | conv rgb head and its input in channels_last: the token grid `[B, G, G, D]` already is the NHWC layout of `[B, D, G, G]`, so the convs run NHWC end to end and MIOpen / cuDNN skip the NCHW <-> NHWC transposes they otherwise insert around their NHWC kernels |
+| `conv_channels_last` | false | false | conv rgb head and its input in channels_last: the token grid `[B, G, G, D]` already is the NHWC layout of `[B, D, G, G]`, so the convs could run NHWC end to end without the NCHW <-> NHWC transposes MIOpen / cuDNN insert around their NHWC kernels. Measured useless on ROCm + inductor (below); kept for cuDNN |
 | `window_read` | `dense` | `dense` | how the decoder reads the 5x5 C window: `dense` = masked SDPA over all 256 cells; `gather` = the 25 window cells gathered per query (the reference implementation, kept for tests) |
+
+Measured on one MI355X (torch 2.14.1+rocm7.2, 128 images + 16 clips + 16 objects per step, regional compile,
+one run at a time on an idle GPU, `scripts/profile_dino_v0.py --modality mixed`):
+
+| Configuration | ms / step | peak memory | decoder forward |
+|---|---|---|---|
+| phase 1 (`v1_alpha.yaml`) | 1731 | 230 GB | 281 ms |
+| + `fut_frames_per_horizon: 2`, `warp_frames: 2` (= `v1b_alpha.yaml`) | 1515 | 188 GB | 216 ms |
+| + `conv_channels_last: true`, conv head compiled | 1487 | 188 GB | 218 ms |
+| + `conv_channels_last: true`, conv head eager, `PYTORCH_MIOPEN_SUGGEST_NHWC=1` | 1834 | 275 GB | 368 ms |
+
+The frame subsets cut the decodes per step from 688 to 480 (320 reconstructions + 96 forecasts + 64
+warp-only): -12.5% time and -18% memory, less than the -30% of decodes because DINOv3 (145 ms), C / D (55 ms),
+the trunk (30 ms), the attention and the optimizer step do not change. `conv_channels_last` changes nothing on
+this stack: under inductor the NCHW <-> NHWC transposes around MIOpen's kernels stay (about 1,240 per step, 7%
+of GPU time) whether or not the weights are channels_last, and PyTorch's MIOpen backend only honours
+channels_last with `PYTORCH_MIOPEN_SUGGEST_NHWC=1`, which under inductor adds a second transpose kernel (1528
+ms). Running the conv head eagerly with that variable does remove the transposes (conv time -23%) but loses
+inductor's fused GroupNorm / SiLU kernels: +23% step time, +46% memory. So `v1b_alpha.yaml` keeps it off.
 
 `scripts/bench_window_read.py` measures the C read at training shapes (688 rows, 12 heads, bf16, fwd + bwd):
 on an MI355X the dense masked read takes 18.3 ms / 7.1 GB, within 5% of the same SDPA with no mask at all

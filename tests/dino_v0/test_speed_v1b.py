@@ -214,7 +214,7 @@ def test_v1b_alpha_yaml():
     cfg = DinoV0Config(**y)
     assert cfg.budget("video") == 12288 and cfg.budget("image") == 12288
     assert (cfg.delta_mode, cfg.rgb_head, cfg.gate_loss) == ("query", "conv", "hinge")   # phase-1 model unchanged
-    assert cfg.fut_frames_per_horizon == 2 and cfg.warp_frames == 2 and cfg.conv_channels_last
-    assert cfg.window_read in ("dense", "gather")
+    assert cfg.fut_frames_per_horizon == 2 and cfg.warp_frames == 2
+    assert not cfg.conv_channels_last and cfg.window_read == "dense"     # both measured: no gain on MI355X
     assert len(cfg.conv_channels) == int(math.log2(cfg.patch)) + 1
     assert train["mix_modalities"] is True and train["compile"] is True

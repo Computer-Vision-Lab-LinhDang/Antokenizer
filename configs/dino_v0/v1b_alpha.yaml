@@ -1,7 +1,8 @@
 # MAVT on DINOv3 v1 phase 2 (speed) -- the phase-1 model of v1_alpha.yaml, unchanged, plus the speed options of
-# config.py's "v1 phase 2" block: forecast and warp-only decodes on frame subsets, the conv rgb head in
-# channels_last, and the window read chosen with scripts/bench_window_read.py on the training GPU.
-# Tests: tests/dino_v0/test_speed_v1b.py. Profile on one GPU before launching:
+# config.py's "v1 phase 2" block: forecast and warp-only decodes on frame subsets (the two that pay off:
+# 1731 -> 1515 ms/step, 230 -> 188 GB on one MI355X at the batch below); channels_last conv head and the
+# gathered window read stay off (measured, see the README). Tests: tests/dino_v0/test_speed_v1b.py.
+# Profile on one GPU before launching:
 #   HIP_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/profile_dino_v0.py --config configs/dino_v0/v1b_alpha.yaml \
 #     --modality mixed --batch-image 128 --batch-video 16 --batch-3d 16 --compile
 # Launch as v1_alpha.yaml (same torchrun line, --config configs/dino_v0/v1b_alpha.yaml, its own --out).
@@ -47,7 +48,7 @@ conv_res_blocks: 2
 # ---- v1 phase 2: speed (model math unchanged; see tests/dino_v0/test_speed_v1b.py)
 fut_frames_per_horizon: 2  # forecast loss on 2 random source frames per horizon per step (phase 1: every pair, 7 + 4 per clip)
 warp_frames: 2             # warp-only loss on 2 random non-key frames per step (phase 1: all 6 per clip)
-conv_channels_last: true   # conv rgb head in NHWC: no NCHW <-> NHWC transposes around MIOpen's igemm kernels
+conv_channels_last: false  # measured on MI355X + inductor (README, "v1 phase 2"): no gain, the transposes around MIOpen stay; the eager NHWC head is +23% time / +46% memory
 window_read: dense         # scripts/bench_window_read.py on MI355X: dense 18 ms vs gather 196 ms per fwd+bwd at 688 rows; gather is the test reference only
 # ---- loss weights
 w_rgb: 1.0

@@ -418,17 +418,18 @@ def mixed_ddp(step_mod: MixedStep, unused: list, device_ids, static_graph: bool)
                  f"buffer sync={bufs} ignored params={len(unused)}")
 
 
-def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print) -> list:
+def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, conv_head: bool = True) -> list:
     """Regional torch.compile (dynamic=False) of the repeated blocks: every TrunkLayer, CBlock, DBlock and
-    DecoderBlock, plus decoder.rgb_conv when present. Each region compiles in place (Module.compile) in
-    try / except; a region that fails, here or at its first call (dynamo suppress_errors), runs eagerly.
-    Python loops over frames / blocks stay eager. Returns the compiled module names."""
+    DecoderBlock, plus decoder.rgb_conv when present (conv_head=False leaves it eager: a profiling knob,
+    see scripts/profile_dino_v0.py). Each region compiles in place (Module.compile) in try / except; a region
+    that fails, here or at its first call (dynamo suppress_errors), runs eagerly. Python loops over frames /
+    blocks stay eager. Returns the compiled module names."""
     import torch._dynamo
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)   # shapes per modality
     targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in COMPILE_REGIONS]
     conv = getattr(getattr(model, "decoder", None), "rgb_conv", None)
-    if isinstance(conv, torch.nn.Module):
+    if conv_head and isinstance(conv, torch.nn.Module):
         targets.append(("decoder.rgb_conv", conv))
     done = []
     for n, m in targets:

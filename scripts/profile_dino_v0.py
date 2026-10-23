@@ -127,6 +127,10 @@ def main(argv=None) -> int:
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                    help="regional torch.compile as the trainer's --compile")
     p.add_argument("--compile-backend", default="inductor")
+    p.add_argument("--compile-conv-head", action=argparse.BooleanOptionalAction, default=True,
+                   help="with --compile: also compile decoder.rgb_conv (the trainer always does); "
+                        "--no-compile-conv-head profiles the conv head eagerly (e.g. channels_last on ROCm with "
+                        "PYTORCH_MIOPEN_SUGGEST_NHWC=1, which inductor's layout choices otherwise undo)")
     p.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--steps", type=int, default=6, help="profiled steps (after 3 warm-up steps)")
     p.add_argument("--trace", default=None, help="dir for a chrome trace (optional)")
@@ -153,7 +157,7 @@ def main(argv=None) -> int:
         call = lambda: model(x, a.modality, cam)
         desc = f"{a.modality} batch {a.batch}"
     if a.compile:
-        apply_compile(model, a.compile_backend)
+        apply_compile(model, a.compile_backend, conv_head=a.compile_conv_head)
     params = [q for q in model.parameters() if q.requires_grad]
     fused = a.fused_adamw and gpu
     opt = torch.optim.AdamW(params, lr=1e-4, fused=True) if fused else torch.optim.AdamW(params, lr=1e-4)
