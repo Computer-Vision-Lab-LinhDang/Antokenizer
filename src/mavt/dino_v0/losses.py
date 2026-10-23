@@ -1,4 +1,5 @@
-"""Losses of MAVT on DINOv3, v0. Plain functions, each returns a scalar tensor."""
+"""Losses of MAVT on DINOv3. Plain functions, each returns a scalar tensor; LPIPSLoss also gives the
+Gram loss from the same VGG forward."""
 from __future__ import annotations
 
 import torch
@@ -40,20 +41,41 @@ def sem_loss(zs: torch.Tensor, cls: torch.Tensor) -> torch.Tensor:
 
 
 def gate_reg(gate: torch.Tensor) -> torch.Tensor:
+    """v0: (1 - o).mean(); pushes every gate to 1 (the decoder ends up reading only C)."""
     return (1 - gate.float()).mean()
 
 
-class LPIPSLoss(nn.Module):
-    """Frozen LPIPS (VGG) on images in [-1, 1]; the `lpips` package is imported lazily."""
+def gate_hinge(gate: torch.Tensor, floor: float) -> torch.Tensor:
+    """v1: relu(floor - mean(o)); zero while C carries at least `floor` of the read on average,
+    so it penalises only D taking over, not D being used."""
+    return F.relu(floor - gate.float().mean())
 
-    def __init__(self, net: str = "vgg"):
+
+def gram(f: torch.Tensor) -> torch.Tensor:
+    """Feature map [B, C, H, W] -> Gram matrix [B, C, C] / (C * H * W), float32 (autocast off)."""
+    B, C, H, W = f.shape
+    with torch.autocast(device_type=f.device.type, enabled=False):
+        x = f.float().reshape(B, C, H * W)
+        return x @ x.transpose(1, 2) / (C * H * W)
+
+
+def _unit(f: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """Unit norm over channels at each position (lpips.normalize_tensor)."""
+    return f / (f.pow(2).sum(1, keepdim=True).sqrt() + eps)
+
+
+class LPIPSLoss(nn.Module):
+    """Frozen LPIPS (VGG) on images in [-1, 1]; the `lpips` package is imported lazily.
+    pretrained_trunk=False: random VGG trunk, no weight download (tests only)."""
+
+    def __init__(self, net: str = "vgg", pretrained_trunk: bool = True):
         super().__init__()
         try:
             import lpips
         except ImportError as e:
             raise ImportError("LPIPSLoss needs the `lpips` package: pip install lpips "
-                              "(or set w_lpips = 0)") from e
-        self.model = lpips.LPIPS(net=net, verbose=False)
+                              "(or set w_lpips = 0 and w_gram = 0)") from e
+        self.model = lpips.LPIPS(net=net, pnet_rand=not pretrained_trunk, verbose=False)
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.model.eval()
@@ -63,5 +85,38 @@ class LPIPSLoss(nn.Module):
         self.model.eval()
         return self
 
+    def state_dict(self, *args, destination=None, prefix: str = "", keep_vars: bool = False):
+        """Frozen and re-built from the lpips package, so never saved (keeps ~60 MB of VGG out of every
+        checkpoint); the owner ignores the then-missing keys on load (see ignore_lpips_keys)."""
+        return {} if destination is None else destination
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return self.model(pred.float(), target.float()).mean()
+        return self.lpips_gram(pred, target)[0]
+
+    def lpips_gram(self, pred: torch.Tensor, target: torch.Tensor, with_gram: bool = False,
+                   dist: str = "l1") -> tuple:
+        """pred / target [B, 3, H, W] in [-1, 1] -> (LPIPS mean, Gram loss | None) from ONE VGG forward
+        over [pred ; target]. LPIPS as lpips.LPIPS.forward (scaling layer, unit-normed features, linear
+        heads, spatial mean, summed over layers). Gram: per VGG layer, dist ("l1" | "mse") between the
+        Gram matrices (normalised by C * H * W) of the raw feature maps, mean over layers."""
+        m = self.model
+        assert m.lpips and not m.spatial, "LPIPSLoss expects lpips.LPIPS(lpips=True, spatial=False)"
+        B = pred.shape[0]
+        x = torch.cat([pred.float(), target.float()])
+        if m.version == "0.1":
+            x = m.scaling_layer(x)
+        lp, gl = 0.0, []
+        for kk, f in enumerate(m.net(x)):
+            f0, f1 = f[:B], f[B:]
+            lp = lp + m.lins[kk]((_unit(f0) - _unit(f1)) ** 2).mean((2, 3), keepdim=True)
+            if with_gram:
+                d = gram(f0) - gram(f1.detach())
+                gl.append(d.abs().mean() if dist == "l1" else d.pow(2).mean())
+        return lp.mean(), (torch.stack(gl).mean() if with_gram else None)
+
+
+def ignore_lpips_keys(module: nn.Module, incompatible) -> None:
+    """load_state_dict post-hook for a module that owns an LPIPSLoss: its keys are never saved, so they
+    are not 'missing'; LPIPS keys of an older checkpoint load into it or are dropped, never fatal."""
+    for keys in (incompatible.missing_keys, incompatible.unexpected_keys):
+        keys[:] = [k for k in keys if "lpips" not in k.split(".")]

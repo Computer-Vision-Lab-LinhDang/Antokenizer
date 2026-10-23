@@ -59,7 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
     p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
     p.add_argument("--n-frames", type=int, default=8)
-    p.add_argument("--frame-stride", type=int, default=2)
+    p.add_argument("--frame-stride", default="2",
+                   help="int, or a list like 2,4,8: each training clip draws one stride uniformly "
+                        "(the largest one that fits when the video is short)")
+    p.add_argument("--ssv2-train", default=None,
+                   help="SSv2 train manifest jsonl (OpenVid format), mixed into the video stream as "
+                        "unlabeled clips (labels are never read)")
+    p.add_argument("--ssv2-weight", type=float, default=0.3,
+                   help="probability that a video sample comes from --ssv2-train (with --openvid)")
     p.add_argument("--modality-weights", default=None,
                    help="e.g. image:0.4,video:0.4,threed:0.2 (seeded per step, same on all ranks); "
                         "default: --video-every alternation, or 0.4/0.4/0.2 when --objaverse is given")
@@ -265,7 +272,8 @@ def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dic
                         batch_video=args.batch_video, batch_3d=args.batch_3d, size=cfg.image_size,
                         n_frames=args.n_frames, frame_stride=args.frame_stride, n_views=args.n_views,
                         video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
-                        num_workers=args.num_workers, rank=rank, world=world, seed=seed)
+                        num_workers=args.num_workers, rank=rank, world=world, seed=seed,
+                        ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3))
     return {m: infinite(ld, smp) for m, (ld, smp) in lds.items()}
 
 
@@ -297,17 +305,21 @@ def parse_weights(spec: str) -> dict:
 def bench_data(args, cfg, rank, world) -> None:
     its = build_data(args, cfg, rank, world, args.seed)
     if not its:
-        raise SystemExit("--bench-data needs --imagenet and/or --openvid")
+        raise SystemExit("--bench-data needs --imagenet, --openvid, --ssv2-train and/or --objaverse")
     for m, it in its.items():
         b = next(it)                                           # warm-up: worker start + first batch
         t0, n = time.time(), 0
+        strides: dict = {}
         for _ in range(args.bench_data):
             b = next(it)
             n += b["data"].shape[0]
+            for s in b.get("stride", torch.empty(0)).tolist():
+                strides[s] = strides.get(s, 0) + 1
         dt = time.time() - t0
+        hist = (" strides " + ",".join(f"{s}:{c}" for s, c in sorted(strides.items()))) if strides else ""
         print(f"[bench rank{rank}] {m}: {args.bench_data} batches, {n} clips in {dt:.1f}s -> "
               f"{n / dt:.1f} clips/s/rank, {args.bench_data / dt:.2f} batches/s; batch shape "
-              f"{tuple(b['data'].shape)} range [{b['data'].min():.2f}, {b['data'].max():.2f}]", flush=True)
+              f"{tuple(b['data'].shape)} range [{b['data'].min():.2f}, {b['data'].max():.2f}]{hist}", flush=True)
 
 
 # ---------------------------------------------------------------------------- mixed step / compile

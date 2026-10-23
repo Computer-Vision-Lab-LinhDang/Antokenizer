@@ -4,6 +4,18 @@ Reconstruction
   images : PSNR, Gaussian SSIM, LPIPS-VGG (if `lpips`), rFID (if `torchmetrics` + inception weights).
   video  : per-frame PSNR / SSIM, PSNR split keyframe vs non-keyframe, swap diagnostics
            (frame t decoded with D_t zeroed / without D vs real D_t), mean |delta| in cells, mean gate.
+           Every per-frame metric m is reported over all frames (m), keyframes (m_key, t % K == 0)
+           and the rest (m_nonkey), averaged over frames and per clip (per_clip).
+  C / D split (video_pass): psnr_full (zc + zd), psnr_noD (zd = None), psnr_zeroD (zd = 0),
+           psnr_eraseC (zc = 0: what D alone carries), psnr_warp (decode_frame(warp_only=True): C read
+           at (u, v) + delta only; skipped when the model has no warp_only), gap_* = psnr_full - psnr_*,
+           delta_cells_mean / delta_cells_p95 (L2 norm of delta in cells), gate, cos_full (decoded vs
+           DINOv3 feature cosine).
+  forecast (video_pass): for each horizon h of e['zd_fut'] (v1) or e['zd_next'] (v0, h = 1), frame
+           t + h decoded from zc of frame t's segment and the forecast zd, against the ground truth:
+           forecast_h{h}_psnr / _cos, and the copy baselines (frame t as the guess for t + h):
+           _psnr_copy_rec / _cos_copy_rec (the model's reconstruction of t), _psnr_copy_gt /
+           _cos_copy_gt (ground-truth frame t and its DINOv3 features). Bucketed by the target frame.
 Understanding (ImageNet)
   features: z_s, mean-pooled z_r of C, frozen DINOv3 CLS (reference).
   kNN top-1 (k=20, cosine, temperature-weighted vote as in DINO) and a linear probe
@@ -15,6 +27,7 @@ Images in the model's layout: [B, 3, H, W] in [-1, 1]; video [B, 3, T, H, W].
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import math
 import os
@@ -38,6 +51,7 @@ def load_model(ckpt_path: str, device="cpu", strict: bool = True):
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     fields = DinoV0Config.__dataclass_fields__
     cfg_d = {k: v for k, v in dict(ck.get("cfg", {})).items() if k in fields}
+    cfg_d.update(w_lpips=0.0, w_gram=0.0)                      # training-only losses: no VGG needed to evaluate
     cfg = DinoV0Config(**cfg_d)
     model = MAVTDinoV0(cfg)
     sd = ck["model"] if "model" in ck else ck
@@ -283,18 +297,75 @@ def image_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
 
 
 # ====================================================================== video pass
+def frame_image(o: dict, cfg: DinoV0Config) -> torch.Tensor:
+    """Decoded frame [B, 3, H, W] in [-1, 1], float: o['image'] (v1 decoders), else the v0 per-patch rgb."""
+    img = o.get("image")
+    if img is None:
+        img = patches_to_image(o["rgb"], cfg.grid, cfg.patch)
+    return img.clamp(-1, 1).float()
+
+
+def accepts_kwarg(fn: Callable, name: str) -> bool:
+    """True when fn takes the keyword `name`, explicitly or through **kwargs."""
+    try:
+        ps = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in ps or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in ps.values())
+
+
+def forecast_latents(e: dict) -> Dict[int, torch.Tensor]:
+    """{h: forecast zd [B, T-h, M, zr_d] made at frame t for frame t + h}, sorted by h:
+    e['zd_fut'] (v1), else e['zd_next'] as h = 1 (v0); {} when the model makes no forecast."""
+    T = e["frames"].shape[1]
+    fut = e.get("zd_fut")
+    if isinstance(fut, dict) and fut:
+        out = {int(h): z[:, :T - int(h)] for h, z in fut.items() if z is not None and 0 < int(h) < T}
+        return dict(sorted(out.items()))
+    if e.get("zd_next") is not None and T > 1:
+        return {1: e["zd_next"][:, :T - 1]}
+    return {}
+
+
+def feat_cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Cosine of feature maps [B, N, d] per cell, averaged over cells -> [B]."""
+    return F.cosine_similarity(a.float(), b.float(), dim=-1).mean(1)
+
+
+def quantile(x: torch.Tensor, q: float) -> float:
+    """Nearest-rank q-quantile of all values of x (kthvalue: no input size limit, unlike torch.quantile)."""
+    x = x.flatten().float()
+    k = min(x.numel(), max(1, math.ceil(q * x.numel())))
+    return float(x.kthvalue(k).values)
+
+
+KINDS = ("", "_key", "_nonkey")       # all frames, keyframes (t % K == 0), the others
+
+
 @torch.no_grad()
 def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Optional[int] = None,
-               log: Optional[Logger] = None) -> dict:
-    """Per-frame reconstruction + C/D swap diagnostics on video clips [B, 3, T, H, W]."""
+               log: Optional[Logger] = None, per_clip: bool = True) -> dict:
+    """Per-frame reconstruction, C/D split diagnostics and forecasts on video clips [B, 3, T, H, W].
+
+    Every per-frame metric m is averaged over all frames (m), keyframes (m_key) and the other frames
+    (m_nonkey); out['per_clip'] holds the same means for each clip (plus its 'stride' when the batch
+    has one). Forecast metrics are bucketed by their target frame t + h. A metric whose model output
+    is missing (v0: no warp_only, no zd_fut) is skipped and listed in out['skipped']."""
     model.eval()
     cfg = model.cfg
     K = cfg.keyframe_every
     log = log or Logger()
     acc: Dict[str, List[float]] = {}
+    cells: Dict[str, List[torch.Tensor]] = {k: [] for k in KINDS}       # |delta| of every query, in cells
+    clips: List[dict] = []
+    skipped: Dict[str, str] = {}
+    can_warp = accepts_kwarg(model.decode_frame, "warp_only")
+    if not can_warp:
+        skipped["warp"] = "psnr_warp skipped: model.decode_frame has no warp_only"
+    horizons, strides = set(), set()
 
-    def add(key, vals):
-        acc.setdefault(key, []).extend(vals.flatten().tolist())
+    def dec(zc, zd, t, **kw):
+        return model.decode_frame(zc, zd, float(t), "video", **kw)
 
     n = 0
     T_seen = None
@@ -306,41 +377,129 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
             x = x[: limit - n]
         B, _, T = x.shape[:3]
         T_seen = T
+        fr: Dict[str, torch.Tensor] = {}                                   # metric -> [B, T], NaN = not measured
+
+        def put(name, t, vals):
+            if name not in fr:
+                fr[name] = torch.full((B, T), float("nan"))
+            fr[name][:, t] = vals.detach().float().cpu()
+
+        dl: List[torch.Tensor] = []
         with autocast(device, amp):
             e = model.encode(x, "video")
             seg = e["state"]["seg"]
+            frames = e["frames"]
+            ft = e.get("feat_target")
+            recs, rfeats = [], []
+            if e.get("zd") is None:
+                skipped["cd"] = "C/D split skipped: encode() returned no zd"
             for t in range(T):
                 zc = e["zc"][:, seg[t]]
-                zd = e["zd"][:, t] if "zd" in e else None
-                tgt = e["frames"][:, t].float()
-                o = model.decode_frame(zc, zd, float(t), "video")
-                rec = patches_to_image(o["rgb"], cfg.grid, cfg.patch).clamp(-1, 1).float()
-                p, s = psnr(rec, tgt), ssim(rec, tgt)
-                kind = "key" if t % K == 0 else "nonkey"
-                add("psnr", p); add("ssim", s); add(f"psnr_{kind}", p); add(f"ssim_{kind}", s)
-                if o["gate"] is not None:
-                    add("gate", o["gate"].float().mean(dim=(1, 2)))
-                    add(f"gate_{kind}", o["gate"].float().mean(dim=(1, 2)))
-                add("delta_abs_cells", o["delta"].float().abs().mean(dim=(1, 2)) * cfg.grid)
-                if zd is not None:
-                    # swap diagnostics: what D_t contributes on top of C_k
-                    o0 = model.decode_frame(zc, torch.zeros_like(zd), float(t), "video")
-                    r0 = patches_to_image(o0["rgb"], cfg.grid, cfg.patch).clamp(-1, 1).float()
-                    p0 = psnr(r0, tgt)
-                    add("psnr_zeroD", p0); add(f"psnr_zeroD_{kind}", p0)
-                    add("gap_zeroD", p - p0); add(f"gap_zeroD_{kind}", p - p0)
-                    o1 = model.decode_frame(zc, None, float(t), "video")
-                    r1 = patches_to_image(o1["rgb"], cfg.grid, cfg.patch).clamp(-1, 1).float()
-                    p1 = psnr(r1, tgt)
-                    add("psnr_noD", p1); add("gap_noD", p - p1); add(f"gap_noD_{kind}", p - p1)
+                zd = e["zd"][:, t] if e.get("zd") is not None else None
+                tgt = frames[:, t].float()
+                o = dec(zc, zd, t)
+                rec = frame_image(o, cfg)
+                recs.append(rec)
+                rfeats.append(o.get("feat"))
+                p = psnr(rec, tgt)
+                put("psnr", t, p); put("psnr_full", t, p); put("ssim", t, ssim(rec, tgt))
+                if o.get("feat") is not None and ft is not None:
+                    put("cos_full", t, feat_cos(o["feat"], ft[:, t]))
+                if o.get("gate") is not None:
+                    put("gate", t, o["gate"].float().flatten(1).mean(1))
+                if o.get("delta") is not None:
+                    d = o["delta"].float()
+                    put("delta_abs_cells", t, d.abs().flatten(1).mean(1) * cfg.grid)
+                    dn = d.norm(dim=-1) * cfg.grid                         # [B, Q] shift of each query, cells
+                    put("delta_cells_mean", t, dn.mean(1))
+                    dl.append(dn.cpu())
+                if zd is None:
+                    continue
+                # what D_t adds on top of C_k (D zeroed / no D), what C_k adds on top of D_t (C erased)
+                p0 = psnr(frame_image(dec(zc, torch.zeros_like(zd), t), cfg), tgt)
+                put("psnr_zeroD", t, p0); put("gap_zeroD", t, p - p0)
+                p1 = psnr(frame_image(dec(zc, None, t), cfg), tgt)
+                put("psnr_noD", t, p1); put("gap_noD", t, p - p1)
+                p2 = psnr(frame_image(dec(torch.zeros_like(zc), zd, t), cfg), tgt)
+                put("psnr_eraseC", t, p2); put("gap_eraseC", t, p - p2)
+                if can_warp:                                               # C read at (u, v) + delta only
+                    try:
+                        ow = dec(zc, zd, t, warp_only=True)
+                    except TypeError as ex:                                # **kwargs without a warp path
+                        can_warp = False
+                        skipped["warp"] = f"psnr_warp skipped: decode_frame(warp_only=True) raised {ex}"
+                    else:
+                        p3 = psnr(frame_image(ow, cfg), tgt)
+                        put("psnr_warp", t, p3); put("gap_warp", t, p - p3)
+            fut = forecast_latents(e)
+            if not fut:
+                skipped["forecast"] = "forecast skipped: encode() returned neither zd_fut nor zd_next"
+            for h, zf in fut.items():                                      # frame t + h guessed at frame t
+                horizons.add(h)
+                pre = f"forecast_h{h}_"
+                for t in range(T - h):
+                    o = dec(e["zc"][:, seg[t]], zf[:, t], t + h)
+                    tgt = frames[:, t + h].float()
+                    put(pre + "psnr", t + h, psnr(frame_image(o, cfg), tgt))
+                    put(pre + "psnr_copy_rec", t + h, psnr(recs[t], tgt))
+                    put(pre + "psnr_copy_gt", t + h, psnr(frames[:, t].float(), tgt))
+                    if ft is None:
+                        continue
+                    if o.get("feat") is not None:
+                        put(pre + "cos", t + h, feat_cos(o["feat"], ft[:, t + h]))
+                    if rfeats[t] is not None:
+                        put(pre + "cos_copy_rec", t + h, feat_cos(rfeats[t], ft[:, t + h]))
+                    put(pre + "cos_copy_gt", t + h, feat_cos(ft[:, t], ft[:, t + h]))
+        if ft is None:
+            skipped["feat"] = "feature cosines skipped: encode() returned no feat_target"
+
+        key = torch.tensor([t % K == 0 for t in range(T)])
+        sel = {"": torch.ones(T, dtype=torch.bool), "_key": key, "_nonkey": ~key}
+        for name, m in fr.items():
+            for kind, c in sel.items():
+                v = m[:, c]
+                acc.setdefault(name + kind, []).extend(v[~v.isnan()].tolist())
+        D = torch.stack(dl, 1) if len(dl) == T else None                   # [B, T, Q]
+        if D is not None:
+            for kind, c in sel.items():
+                if c.any():
+                    cells[kind].append(D[:, c].flatten())
+        st = batch.get("stride") if isinstance(batch, dict) else None
+        if st is not None:
+            strides.update(int(s) for s in torch.as_tensor(st)[:B].tolist())
+        if per_clip:
+            for b in range(B):
+                r: dict = dict(clip=n + b)
+                if st is not None:
+                    r["stride"] = int(torch.as_tensor(st)[b])
+                for name, m in sorted(fr.items()):
+                    for kind, c in sel.items():
+                        v = m[b, c]
+                        v = v[~v.isnan()]
+                        if v.numel():
+                            r[name + kind] = float(v.mean())
+                if D is not None:
+                    for kind, c in sel.items():
+                        if c.any():
+                            r["delta_cells_p95" + kind] = quantile(D[b, c], 0.95)
+                clips.append(r)
         n += B
         log(f"video pass: {n}" + (f"/{limit}" if limit else "") + f"  psnr={sum(acc['psnr']) / len(acc['psnr']):.2f}")
     out = {k: sum(v) / len(v) for k, v in sorted(acc.items()) if v}
+    for kind, chunks in cells.items():
+        if chunks:
+            out["delta_cells_p95" + kind] = quantile(torch.cat(chunks), 0.95)
     out["n_clips"] = n
     out["n_frames"] = T_seen
     out["keyframe_every"] = K
     out["budget_per_segment"] = cfg.budget("video")
     out["budget_per_frame"] = cfg.budget("video") / K
+    out["forecast_horizons"] = sorted(horizons)
+    if strides:
+        out["frame_stride"] = min(strides) if len(strides) == 1 else sorted(strides)
+    out["skipped"] = list(skipped.values())
+    if per_clip:
+        out["per_clip"] = clips
     return out
 
 
@@ -494,10 +653,16 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
                                              log=log)
     elif image_train is not None:
         res["notes"].append("understanding skipped: image val set has no labels or was not given")
+    def note_skipped(key):
+        for s in res[key].get("skipped", []):
+            res["notes"].append(f"{key}: {s}")
+
     if video is not None:
         res["video_recon"] = video_pass(model, as_loader(video, video_batch_size, num_workers), device,
                                         amp=amp, limit=video_limit, log=log)
-        log(f"video recon: {json.dumps(res['video_recon'])}", force=True)
+        note_skipped("video_recon")
+        log(f"video recon: {json.dumps({k: v for k, v in res['video_recon'].items() if k != 'per_clip'})}",
+            force=True)
     for name, ds in (extra_video or {}).items():
         if ds is None:
             msg = f"{name} probe skipped: no dataset path given"
@@ -506,11 +671,44 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
             continue
         res[f"video_{name}"] = video_pass(model, as_loader(ds, video_batch_size, num_workers), device,
                                           amp=amp, limit=video_limit, log=log)
+        note_skipped(f"video_{name}")
     return res
 
 
 def _f(v, fmt="{:.4f}"):
     return "-" if v is None else fmt.format(v)
+
+
+def _cd_split_md(v: dict) -> List[str]:
+    """C/D split table of one video_pass result (rows: all / key / non-key frames)."""
+    if "psnr_full" not in v:
+        return []
+    lines = ["C/D split, PSNR dB (no D: zd = None; D = 0: zd zeroed; erase C: zc zeroed; warp: gate locked "
+             "to the C read at (u, v) + delta). abs delta = L2 norm of the shift, in cells.", "",
+             "| frames | full | no D | D = 0 | erase C | warp only | feat cos | gate | mean abs delta | p95 abs delta |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for label, s in (("all", ""), ("key", "_key"), ("non-key", "_nonkey")):
+        g = lambda k, fmt="{:.2f}": _f(v.get(k + s), fmt)  # noqa: E731
+        lines.append(f"| {label} | {g('psnr_full')} | {g('psnr_noD')} | {g('psnr_zeroD')} | {g('psnr_eraseC')} | "
+                     f"{g('psnr_warp')} | {g('cos_full', '{:.4f}')} | {g('gate', '{:.3f}')} | "
+                     f"{g('delta_cells_mean', '{:.3f}')} | {g('delta_cells_p95', '{:.3f}')} |")
+    return lines + [""]
+
+
+def _forecast_md(v: dict) -> List[str]:
+    """Forecast table of one video_pass result (rows: horizons, all target frames)."""
+    hs = v.get("forecast_horizons") or []
+    if not hs:
+        return []
+    lines = ["Forecast of frame t + h (zc of frame t's segment + forecast zd) vs copying frame t "
+             "(own reconstruction / ground truth). PSNR dB, DINOv3 feature cosine.", "",
+             "| h | PSNR forecast | PSNR copy rec | PSNR copy GT | cos forecast | cos copy rec | cos copy GT |",
+             "|---|---|---|---|---|---|---|"]
+    for h in hs:
+        g = lambda k, fmt="{:.2f}": _f(v.get(f"forecast_h{h}_{k}"), fmt)  # noqa: E731
+        lines.append(f"| {h} | {g('psnr')} | {g('psnr_copy_rec')} | {g('psnr_copy_gt')} | {g('cos', '{:.4f}')} | "
+                     f"{g('cos_copy_rec', '{:.4f}')} | {g('cos_copy_gt', '{:.4f}')} |")
+    return lines + [""]
 
 
 def to_markdown(res: dict) -> str:
@@ -527,7 +725,8 @@ def to_markdown(res: dict) -> str:
                   f"{_f(ir.get('lpips_vgg'))} | {_f(ir.get('rfid'), '{:.2f}')} |", ""]
     for key in [k for k in res if k.startswith("video_") and isinstance(res[k], dict)]:
         v = res[key]
-        lines += [f"## {key.replace('_', ' ')}", "",
+        stride = f" (frame stride {v['frame_stride']})" if "frame_stride" in v else ""
+        lines += [f"## {key.replace('_', ' ')}{stride}", "",
                   "| clips x T | PSNR | SSIM | PSNR key | PSNR non-key | PSNR D=0 | gap D=0 (key / non-key) "
                   "| gap no-D | mean gate | mean abs delta (cells) |",
                   "|---|---|---|---|---|---|---|---|---|---|",
@@ -537,6 +736,7 @@ def to_markdown(res: dict) -> str:
                   f"({_f(v.get('gap_zeroD_key'), '{:.2f}')} / {_f(v.get('gap_zeroD_nonkey'), '{:.2f}')}) | "
                   f"{_f(v.get('gap_noD'), '{:.2f}')} | {_f(v.get('gate'), '{:.3f}')} | "
                   f"{_f(v.get('delta_abs_cells'), '{:.3f}')} |", ""]
+        lines += _cd_split_md(v) + _forecast_md(v)
     u = res.get("understanding")
     if u:
         lines += [f"## Understanding (ImageNet, train {u['n_train']} / val {u['n_val']})", "",
