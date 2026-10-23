@@ -5,6 +5,10 @@ An axis whose mask bit is 0 contributes angle 0, so it rotates as identity; toke
 m = 0000 (the D queries) are not rotated at all. Angles are computed in float32 so that
 t in seconds does not lose precision under bf16 autocast.
 
+Rotation: dims (2i, 2i + 1) of a head form a pair rotated by angle i (interleaved pairing, v0).
+rope_tables turns the angles into cos / sin tables once (per forward, shared by all layers) and
+apply_rope computes x * cos + pair_swap(x) * sin: the v0 function without its stack + flatten copies.
+
 coords: [..., N, 4] float (t in seconds or frame index, u and v in [0, 1] as patch centres, z unused in v0)
 mask:   [..., N, 4] {0, 1}
 """
@@ -12,6 +16,35 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+
+
+def compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """dtype the attention inputs (Linear outputs) will have: the autocast dtype when autocast is on
+    for x's device, else x.dtype. Used to build rope tables and additive masks once per forward."""
+    dev = x.device.type
+    if torch.is_autocast_enabled(dev):
+        return torch.get_autocast_dtype(dev)
+    return x.dtype
+
+
+def rope_tables(ang: torch.Tensor, dtype=None) -> tuple:
+    """Angles [..., N, hd/2] (float32) -> (cos, sin) [..., N, hd]: cos_i at dims 2i and 2i + 1, sin as
+    (-sin_i, +sin_i). cos / sin are taken in float32, then cast to dtype (the rotation's dtype) if given."""
+    c, s = ang.cos(), ang.sin()
+    cos = torch.stack((c, c), -1).flatten(-2)
+    sin = torch.stack((-s, s), -1).flatten(-2)
+    if dtype is not None:
+        cos, sin = cos.to(dtype), sin.to(dtype)
+    return cos, sin
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """x [..., hd] with tables broadcastable to it: out_2i = x_2i cos_i - x_2i+1 sin_i, out_2i+1 = x_2i sin_i + x_2i+1 cos_i.
+
+    3 kernels (flip, mul, addcmul). The swapped copy comes first so that the output is contiguous in x's
+    logical layout even when x is a strided view (the trunk relies on that to get [B, H, T, N, hd] q / k)."""
+    xs = x.unflatten(-1, (-1, 2)).flip(-1).flatten(-2)       # pair swap (x_2i+1, x_2i)
+    return torch.addcmul(xs * sin, x, cos)
 
 
 class AxialRoPE(nn.Module):
@@ -32,15 +65,16 @@ class AxialRoPE(nn.Module):
         ang = c.unsqueeze(-1) * self.inv_freq                    # [..., N, 4, per_axis/2]
         return ang.flatten(-2)
 
-    def rotate(self, x: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
-        """x: [B, H, N, head_dim]; ang: [B, N, head_dim/2] or [N, head_dim/2]."""
+    def rotate(self, x: torch.Tensor, ang) -> torch.Tensor:
+        """x: [B, H, N, head_dim]; ang: angles [B, N, head_dim/2] or [N, head_dim/2], rotated in float32
+        (v0 numerics; the decoder's angles carry the gradient of Δ), or a (cos, sin) pair from rope_tables
+        broadcastable to x, rotated in the tables' dtype (trunk / C: tables built once per forward)."""
+        if isinstance(ang, tuple):
+            return apply_rope(x, *ang).to(x.dtype)
         if ang.dim() == 2:
             ang = ang.unsqueeze(0)
-        cos, sin = ang.cos().unsqueeze(1), ang.sin().unsqueeze(1)  # [B, 1, N, hd/2]
-        xf = x.float()
-        x1, x2 = xf[..., 0::2], xf[..., 1::2]
-        out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
-        return out.to(x.dtype)
+        cos, sin = rope_tables(ang.unsqueeze(1))                 # [B, 1, N, hd]
+        return apply_rope(x.float(), cos, sin).to(x.dtype)
 
     def forward(self, x: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return self.rotate(x, self.angles(coords, mask))

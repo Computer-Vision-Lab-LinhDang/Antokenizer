@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Train MAVT on DINOv3 v0 (torchrun DDP; image / video / posed-3D-view steps, one modality per step).
+"""Train MAVT on DINOv3 v0 (torchrun DDP; image / video / posed-3D-view steps).
 
   CUDA_VISIBLE_DEVICES=1,2,3 torchrun --nproc_per_node 3 scripts/train_dino_v0.py \
       --config configs/dino_v0/v0_alpha.yaml --out /scratch/.../runs/muse-spark-mavt
   python scripts/train_dino_v0.py --dry-run --out /tmp/x          # CPU, tiny config, 3 steps
+  torchrun --nproc_per_node 2 scripts/train_dino_v0.py --dry-run --mix-modalities --out /tmp/x   # DDP on CPU (gloo)
   python scripts/train_dino_v0.py --config ... --bench-data 50     # loader throughput only
+
+Steps: one modality per step (v0 default; DDP with find_unused_parameters=True), or with
+--mix-modalities (train: mix_modalities: true) every available modality in one step: MixedStep runs
+model(x, m, cam) per modality and returns the weighted loss sum, so each step has one backward and
+one all-reduce, and DDP runs without find_unused_parameters (static graph, grads as bucket views).
+--compile: regional torch.compile of the repeated blocks. AdamW is fused on GPU.
 
 The yaml holds DinoV0Config fields at top level and trainer defaults under `train:` (CLI wins).
 """
@@ -12,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import inspect
 import json
 import math
 import os
@@ -65,9 +73,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", default="auto", help="auto (out/last.pt if present) | none | <path>")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
+    # ---- speed: mixed-modality steps, DDP, compile
+    p.add_argument("--mix-modalities", action=argparse.BooleanOptionalAction, default=False,
+                   help="every step runs all available modalities (one backward, one all-reduce, DDP without "
+                        "find_unused_parameters); per-modality batch sizes from --batch-*. Off: one modality "
+                        "per step (v0), --modality-weights / --video-every pick it")
+    p.add_argument("--modality-loss-weights", default=None,
+                   help="with --mix-modalities, e.g. image:1,video:1,threed:0.5; normalised to sum 1 over the "
+                        "available modalities (a modality left out or at 0 is not run). Default: equal")
+    p.add_argument("--static-graph", action=argparse.BooleanOptionalAction, default=True,
+                   help="DDP static_graph=True for --mix-modalities (only with --grad-accum 1: its first "
+                        "iteration cannot run under no_sync); --no-static-graph if a backend objects")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                   help="regional torch.compile (dynamic=False) of each TrunkLayer, CBlock, DBlock, DecoderBlock "
+                        "and decoder.rgb_conv; a region that fails to compile runs eagerly")
+    p.add_argument("--compile-backend", default="inductor", help="torch.compile backend for --compile")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--dry-run", action="store_true", help="CPU, tiny_config, synthetic data, 3 steps, no DDP")
+    p.add_argument("--dry-run", action="store_true",
+                   help="CPU, tiny_config, synthetic data, 3 steps; DDP (gloo) only when launched by torchrun")
     p.add_argument("--bench-data", type=int, default=0, metavar="N", help="iterate N batches per loader, print clips/s")
     return p
 
@@ -105,11 +129,13 @@ def make_config(model_cfg: dict, dry: bool) -> DinoV0Config:
 
 # ---------------------------------------------------------------------------- dist helpers
 def setup_dist(dry: bool):
-    if dry or "RANK" not in os.environ:
+    """(rank, world, local_rank, device). Distributed only when launched by torchrun (RANK set); a dry run
+    under torchrun uses gloo on CPU, so the DDP setup can be exercised without GPUs."""
+    if "RANK" not in os.environ:
         dev = torch.device("cuda" if torch.cuda.is_available() and not dry else "cpu")
         return 0, 1, 0, dev
     rank, world, local = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), int(os.environ.get("LOCAL_RANK", 0))
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not dry:
         torch.cuda.set_device(local)
         dev = torch.device("cuda", local)
         try:
@@ -135,14 +161,24 @@ def all_mean(t: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------- optim
-def build_optim(model: torch.nn.Module, args):
+def build_optim(model: torch.nn.Module, args, device=None):
+    """AdamW (decay on >= 2-D weights only) + warmup / cosine LambdaLR. Fused AdamW (one kernel set for all
+    params) when device is a GPU, the default implementation otherwise or if fused is unavailable."""
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
         (no_decay if p.ndim < 2 or n.endswith(".bias") else decay).append(p)
-    opt = torch.optim.AdamW([dict(params=decay, weight_decay=args.wd), dict(params=no_decay, weight_decay=0.0)],
-                            lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+    groups = lambda: [dict(params=decay, weight_decay=args.wd), dict(params=no_decay, weight_decay=0.0)]
+    kw = dict(lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+    opt = None
+    if device is not None and torch.device(device).type == "cuda":
+        try:
+            opt = torch.optim.AdamW(groups(), fused=True, **kw)
+        except (RuntimeError, TypeError, ValueError) as ex:
+            print(f"fused AdamW unavailable ({ex}); using the default AdamW", flush=True)
+    if opt is None:
+        opt = torch.optim.AdamW(groups(), **kw)
 
     def lr_lambda(step: int) -> float:
         if step < args.warmup:
@@ -151,6 +187,19 @@ def build_optim(model: torch.nn.Module, args):
         return args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
 
     return opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+
+def set_fused(opt: torch.optim.Optimizer, fused: bool) -> None:
+    """Restore the fused choice after a resume: load_state_dict keeps the checkpoint's group options (a v0
+    checkpoint says fused=None) and leaves its step counters on the CPU, where fused AdamW cannot use them."""
+    if not fused:
+        return
+    for g in opt.param_groups:
+        g["fused"], g["foreach"] = True, None
+        for p in g["params"]:
+            st = opt.state.get(p, {})
+            if torch.is_tensor(st.get("step")):
+                st["step"] = st["step"].to(device=p.device, dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------- checkpoint
@@ -261,6 +310,126 @@ def bench_data(args, cfg, rank, world) -> None:
               f"{tuple(b['data'].shape)} range [{b['data'].min():.2f}, {b['data'].max():.2f}]", flush=True)
 
 
+# ---------------------------------------------------------------------------- mixed step / compile
+MODALITIES = ("image", "video", "threed")
+COMPILE_REGIONS = ("TrunkLayer", "CBlock", "DBlock", "DecoderBlock")   # repeated blocks, by class name
+
+
+class MixedStep(torch.nn.Module):
+    """One training step over several modalities as ONE module call, so DDP sees one forward, one backward
+    and one all-reduce per step and every parameter is used each step (no find_unused_parameters).
+
+    forward(batches {modality: (x, cam)}) runs model(x, modality, cam) for each modality present (fixed
+    order image, video, threed) and returns loss = sum_m weights[m] * loss_m, parts {'<m>/loss': loss_m,
+    '<m>/loss_<k>': ...} and diag {'<m>/diag_<k>': ...}. No parameters of its own: checkpoints hold the
+    inner model, keys unchanged."""
+
+    def __init__(self, model: torch.nn.Module, weights: dict):
+        super().__init__()
+        self.model, self.weights = model, dict(weights)
+
+    def forward(self, batches: dict) -> dict:
+        loss, parts, diag = 0.0, {}, {}
+        for m in MODALITIES:
+            if m not in batches:
+                continue
+            x, cam = batches[m]
+            out = self.model(x, m, cam)
+            loss = loss + self.weights[m] * out["loss"]
+            parts[f"{m}/loss"] = out["loss"].detach()
+            parts.update({f"{m}/loss_{k}": v for k, v in out["parts"].items()})
+            diag.update({f"{m}/diag_{k}": v for k, v in out["diag"].items()})
+        return dict(loss=loss, parts=parts, diag=diag)
+
+
+def mixed_weights(spec: Optional[str], available) -> dict:
+    """Loss weights of a mixed step over the available modalities, normalised to sum 1 so the step loss
+    stays on the scale of a one-modality step (--grad-clip keeps its meaning). spec None: equal; a
+    modality missing from spec or at 0 is not run."""
+    w = parse_weights(spec) if spec else {m: 1.0 for m in MODALITIES}
+    w = {m: w.get(m, 0.0) for m in MODALITIES if m in available and w.get(m, 0.0) > 0}
+    if not w:
+        raise SystemExit("--modality-loss-weights selects no available modality")
+    tot = sum(w.values())
+    return {m: v / tot for m, v in w.items()}
+
+
+def to_inputs(b: dict, modality: str, dev) -> tuple:
+    """Loader batch -> (x, cam) on dev; cam = dict(c2w, K) for posed views, else None."""
+    x = b["data"].to(dev, non_blocking=True)
+    cam = None
+    if modality == "threed":
+        cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
+    return x, cam
+
+
+def probe_unused(step_mod: MixedStep, cfg: DinoV0Config, args, dev, use_amp: bool) -> list:
+    """Names of trainable parameters that get no gradient from one mixed step (synthetic batch of 1 per
+    modality: which parameters are used depends on cfg and the modalities, not on the data). Max over
+    ranks. DDP ignores them: without find_unused_parameters it would wait for their gradients forever."""
+    batches = {}
+    for m in step_mod.weights:
+        T = args.n_views if m == "threed" else args.n_frames
+        batches[m] = to_inputs(next(synthetic_iter(m, 1, cfg, T, args.seed)), m, dev)
+    step_mod.train().zero_grad(set_to_none=True)
+    with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
+        out = step_mod(batches)
+    out["loss"].backward()
+    named = [(n, p) for n, p in step_mod.named_parameters() if p.requires_grad]
+    used = torch.tensor([float(p.grad is not None) for _, p in named], device=dev)
+    step_mod.zero_grad(set_to_none=True)
+    if is_dist():
+        dist.all_reduce(used, op=dist.ReduceOp.MAX)
+    return [n for (n, _), u in zip(named, used.tolist()) if u == 0]
+
+
+def needs_buffer_sync(model: torch.nn.Module) -> bool:
+    """True if a module keeps running statistics (BatchNorm-like) that DDP must broadcast. The v0 buffers
+    (RoPE frequencies, ImageNet mean / std, the C neighbourhood mask, LPIPS scaling) are constants."""
+    return any(isinstance(m, torch.nn.modules.batchnorm._NormBase) and m.track_running_stats
+               for m in model.modules())
+
+
+def mixed_ddp(step_mod: MixedStep, unused: list, device_ids, static_graph: bool) -> tuple:
+    """DDP for the mixed step: find_unused_parameters=False (every parameter is used each step; the ones
+    probe_unused found are ignored), static_graph, grads as views of the all-reduce buckets (no copy), and
+    no buffer sync unless a module keeps running statistics. Returns (ddp, description)."""
+    DDP = torch.nn.parallel.DistributedDataParallel
+    if unused:
+        DDP._set_params_and_buffers_to_ignore_for_model(step_mod, unused)
+    bufs = needs_buffer_sync(step_mod)                         # False for v0: no buffer changes in training
+    kw = dict(forward_sync_buffers=bufs) if "forward_sync_buffers" in inspect.signature(DDP).parameters \
+        else dict(broadcast_buffers=bufs)                      # newer torch renamed broadcast_buffers
+    ddp = DDP(step_mod, device_ids=device_ids, find_unused_parameters=False, static_graph=static_graph,
+              gradient_as_bucket_view=True, **kw)
+    return ddp, (f"DDP: find_unused_parameters=False static_graph={static_graph} gradient_as_bucket_view=True "
+                 f"buffer sync={bufs} ignored params={len(unused)}")
+
+
+def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print) -> list:
+    """Regional torch.compile (dynamic=False) of the repeated blocks: every TrunkLayer, CBlock, DBlock and
+    DecoderBlock, plus decoder.rgb_conv when present. Each region compiles in place (Module.compile) in
+    try / except; a region that fails, here or at its first call (dynamo suppress_errors), runs eagerly.
+    Python loops over frames / blocks stay eager. Returns the compiled module names."""
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)   # shapes per modality
+    targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in COMPILE_REGIONS]
+    conv = getattr(getattr(model, "decoder", None), "rgb_conv", None)
+    if isinstance(conv, torch.nn.Module):
+        targets.append(("decoder.rgb_conv", conv))
+    done = []
+    for n, m in targets:
+        try:
+            m.compile(backend=backend, dynamic=False)
+            done.append(n)
+        except Exception as ex:                                 # noqa: BLE001 - any failure: stay eager
+            log(f"compile: {n} left eager ({type(ex).__name__}: {ex})")
+    kinds = sorted({type(m).__name__ for n, m in targets if n in done})
+    log(f"compile: {len(done)}/{len(targets)} regions, backend={backend}, dynamic=False ({', '.join(kinds)})")
+    return done
+
+
 # ---------------------------------------------------------------------------- main loop
 def main(argv=None) -> int:
     args, model_cfg = parse_args(argv)
@@ -282,9 +451,11 @@ def main(argv=None) -> int:
         return 0
 
     from mavt.dino_v0.model import MAVTDinoV0
+    log = (lambda s: print(s, flush=True)) if rank == 0 else (lambda s: None)
     torch.manual_seed(args.seed)                               # identical init on every rank
     model = MAVTDinoV0(cfg, use_checkpoint=args.use_checkpoint).to(dev)
-    opt, sched = build_optim(model, args)
+    opt, sched = build_optim(model, args, dev)
+    fused = bool(opt.param_groups[0].get("fused"))
     step = 0
     resume = None
     if args.resume == "auto":
@@ -294,23 +465,42 @@ def main(argv=None) -> int:
         resume = args.resume
     if resume:
         step = load_ckpt(resume, model, opt, sched, lr=args.lr)
-        if rank == 0:
-            print(f"resumed from {resume} at step {step}", flush=True)
-    torch.manual_seed(seed + step)                             # per-rank stream (queries, data aug)
-    random.seed(seed + step)
-
-    ddp = model
-    if is_dist():
-        ddp = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[dev.index] if dev.type == "cuda" else None, find_unused_parameters=True)
+        set_fused(opt, fused)
+        log(f"resumed from {resume} at step {step}")
+    use_amp = args.bf16 and dev.type == "cuda"
+    mixed = args.mix_modalities
 
     if dry:
         bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d)
-        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed) for m in ("image", "video", "threed")}
+        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed) for m in MODALITIES}
     else:
-        its = build_data(args, cfg, rank, world, seed + step)
+        # sampler seed: the same on every rank, so the rank shards are disjoint (it was per rank in v0).
+        # Augmentation stays per rank: worker seeds come from each rank's own torch stream (data._worker_init).
+        its = build_data(args, cfg, rank, world, args.seed + step)
     if not its:
         raise SystemExit("no data: pass --imagenet and/or --openvid (or --dry-run)")
+
+    step_mod, unused = None, []
+    if mixed:
+        step_mod = MixedStep(model, mixed_weights(args.modality_loss_weights, its))
+        unused = probe_unused(step_mod, cfg, args, dev, use_amp)
+        log(f"mixed step: loss weights {step_mod.weights}; trainable parameters without a gradient "
+            f"(DDP ignores them): {unused or 'none'}")
+    if args.compile:                                           # after the probe: compile for the real shapes only
+        apply_compile(model, args.compile_backend, log)
+    torch.manual_seed(seed + step)                             # per-rank stream (queries, data aug)
+    random.seed(seed + step)
+
+    ddp = step_mod if mixed else model
+    if is_dist():
+        DDP, ids = torch.nn.parallel.DistributedDataParallel, [dev.index] if dev.type == "cuda" else None
+        if mixed:
+            # static_graph trips an internal reducer assert when its first iteration runs under no_sync()
+            static = args.static_graph and args.grad_accum == 1
+            ddp, desc = mixed_ddp(step_mod, unused, ids, static)
+            log(desc + (" (static_graph off: --grad-accum > 1)" if args.static_graph and not static else ""))
+        else:                                                  # one modality per step: some params unused
+            ddp = DDP(model, device_ids=ids, find_unused_parameters=True)
 
     weights = None
     if args.modality_weights:
@@ -355,40 +545,44 @@ def main(argv=None) -> int:
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         print(f"world={world} device={dev} trainable={n_train / 1e6:.1f}M start_step={step} "
-              f"data={sorted(its)}", flush=True)
+              f"data={sorted(its)} steps={'mixed' if mixed else 'one modality'} fused_adamw={fused}", flush=True)
         with open(os.path.join(args.out, "config.json"), "w") as f:
-            json.dump(dict(cfg=dataclasses.asdict(cfg), args=vars(args), modality_weights=weights), f, indent=1)
+            json.dump(dict(cfg=dataclasses.asdict(cfg), args=vars(args), modality_weights=weights,
+                           mixed_loss_weights=step_mod.weights if mixed else None), f, indent=1)
         if not dry:
             write_heldout(args)
     log_f = open(os.path.join(args.out, "log.jsonl"), "a") if rank == 0 else None
-    use_amp = args.bf16 and dev.type == "cuda"
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats(dev)
     t_last, steps_since, clips_since = time.time(), 0, 0
     model.train()
 
+    def fetch(m: str) -> dict:
+        try:
+            return next(its[m])
+        except Exception:
+            if stop["flag"] and rank == 0:                      # loader torn down by the signal
+                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args)
+                print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
+            raise
+
     while step < args.steps:
-        modality = modality_for(step)
+        modality = "mixed" if mixed else modality_for(step)
         opt.zero_grad(set_to_none=True)
         for micro in range(args.grad_accum):
-            try:
-                b = next(its[modality])
-            except Exception:
-                if stop["flag"] and rank == 0:                  # loader torn down by the signal
-                    save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args)
-                    print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
-                raise
-            x = b["data"].to(dev, non_blocking=True)
-            cam = None
-            if modality == "threed":
-                cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
+            if mixed:                                           # one batch of every modality, one module call
+                batches = {m: to_inputs(fetch(m), m, dev) for m in step_mod.weights}
+                inputs, n_clips = (batches,), sum(x.shape[0] for x, _ in batches.values())
+            else:
+                x, cam = to_inputs(fetch(modality), modality, dev)
+                inputs, n_clips = (x, modality, cam), x.shape[0]
             sync = micro == args.grad_accum - 1
             ctx = ddp.no_sync() if (is_dist() and not sync) else _null()
             with ctx:
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
-                    out = ddp(x, modality, cam)
+                    out = ddp(*inputs)
                 (out["loss"] / args.grad_accum).backward()
-            clips_since += x.shape[0]
+            clips_since += n_clips
         gnorm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
                                                args.grad_clip if args.grad_clip > 0 else float("inf"))
         finite = bool(torch.isfinite(gnorm))
@@ -399,15 +593,13 @@ def main(argv=None) -> int:
         steps_since += 1
 
         if step % args.log_every == 0 or step == args.steps:
-            keys = sorted(out["parts"])
-            dkeys = sorted(out["diag"])
-            vec = torch.stack([out["loss"].detach().float()] + [out["parts"][k].float() for k in keys]
-                              + [out["diag"][k].float() for k in dkeys])
-            vec = all_mean(vec).tolist()
+            # one modality: loss_<k>, diag_<k>; mixed: keys already carry the modality (image/loss_rgb, ...)
+            pl, pd = ("", "") if mixed else ("loss_", "diag_")
+            named = ([(pl + k, out["parts"][k]) for k in sorted(out["parts"])]
+                     + [(pd + k, out["diag"][k]) for k in sorted(out["diag"])])
+            vec = all_mean(torch.stack([out["loss"].detach().float()] + [v.float() for _, v in named])).tolist()
             dt = time.time() - t_last
-            rec = dict(step=step, modality=modality, loss=vec[0],
-                       **{f"loss_{k}": v for k, v in zip(keys, vec[1:1 + len(keys)])},
-                       **{f"diag_{k}": v for k, v in zip(dkeys, vec[1 + len(keys):])},
+            rec = dict(step=step, modality=modality, loss=vec[0], **{k: v for (k, _), v in zip(named, vec[1:])},
                        grad_norm=float(gnorm), skipped=not finite, lr=sched.get_last_lr()[0],
                        it_s=steps_since / dt, clips_s=clips_since * world / dt, time=time.time())
             if dev.type == "cuda":
@@ -418,7 +610,7 @@ def main(argv=None) -> int:
                 print(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in rec.items()
                                if k != "time"), flush=True)
                 if wb is not None:
-                    wb.log({f"{modality}/{k}" if k.startswith(("loss", "diag")) else k: v
+                    wb.log({k if "/" in k else f"{modality}/{k}" if k.startswith(("loss", "diag")) else k: v
                             for k, v in rec.items() if isinstance(v, (int, float))}, step=step)
             t_last, steps_since, clips_since = time.time(), 0, 0
         if not finite and rank == 0:

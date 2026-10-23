@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from .camera import ZeroLinear, relative_pose
 from .config import DinoV0Config
-from .rope import AxialRoPE
+from .rope import AxialRoPE, compute_dtype, rope_tables
 
 
 def _check_v0(cfg: DinoV0Config) -> None:
@@ -45,10 +45,13 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-head attention, q from xq and k/v from xkv (same width), optional RoPE angles and additive mask.
+    """Multi-head attention, q from xq and k/v from xkv (same width), optional RoPE and additive mask.
 
-    q_ang / k_ang: [Nq, head_dim/2] / [Nk, head_dim/2] from AxialRoPE.angles, or None (no rotation).
-    attn_mask: [Nq, Nk] float, 0 = may attend, -inf = blocked.
+    q_ang / k_ang: [Nq, head_dim/2] / [Nk, head_dim/2] angles from AxialRoPE.angles (rotated in float32),
+    a (cos, sin) pair from rope_tables (rotated in the tables' dtype), or None (no rotation).
+    attn_mask: [Nq, Nk] float, 0 = may attend, -inf = blocked (float, not bool: bool masks gave zero
+    gradients on some SDPA backends); cast to q's dtype here when the caller has not done it already.
+    Always SDPA, so the fused kernels apply under the mask too.
     """
 
     def __init__(self, dim: int, heads: int):
@@ -60,8 +63,7 @@ class Attention(nn.Module):
         self.out = nn.Linear(dim, dim)
 
     def forward(self, xq: torch.Tensor, xkv: torch.Tensor, rope: Optional[AxialRoPE] = None,
-                q_ang: Optional[torch.Tensor] = None, k_ang: Optional[torch.Tensor] = None,
-                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                q_ang=None, k_ang=None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, Nq, D = xq.shape
         Nk = xkv.shape[1]
         q = self.q(xq).view(B, Nq, self.heads, self.head_dim).transpose(1, 2)
@@ -70,11 +72,9 @@ class Attention(nn.Module):
             q = rope.rotate(q, q_ang)
         if rope is not None and k_ang is not None:
             k = rope.rotate(k, k_ang)
-        if attn_mask is None:
-            o = F.scaled_dot_product_attention(q, k, v)
-        else:                                                    # explicit math: same result on every backend
-            a = (q.float() @ k.float().transpose(-2, -1)) * self.head_dim ** -0.5 + attn_mask.float()
-            o = (a.softmax(-1) @ v.float()).to(v.dtype)
+        if attn_mask is not None and attn_mask.dtype != q.dtype and attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(q.dtype)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return self.out(o.transpose(1, 2).reshape(B, Nq, D))
 
 
@@ -122,10 +122,13 @@ class CBuilder(nn.Module):
     def forward(self, x_k: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """x_k [B, N, dim], coords / mask [N, 4] -> C_k [B, N, dim]."""
         B = x_k.shape[0]
-        ang = self.rope.angles(coords, mask)                     # cells share the patch coords of X_k
+        dt = compute_dtype(x_k)                                  # dtype of q / k inside the blocks
+        # cells share the patch coords of X_k; cos / sin and the mask cast once, shared by all blocks
+        cs = rope_tables(self.rope.angles(coords, mask), dt)
+        nbr = self.nbr.to(dt)
         c = self.c0.unsqueeze(0).expand(B, -1, -1).to(x_k.dtype)
         for blk in self.blocks:
-            c = blk(c, x_k, self.rope, ang, self.nbr.to(x_k.dtype))
+            c = blk(c, x_k, self.rope, cs, nbr)
         return self.norm(c)
 
 

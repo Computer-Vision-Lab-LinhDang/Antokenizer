@@ -38,6 +38,27 @@ def test_dry_run_writes_ckpt_and_log(tmp_path):
     assert len((out / "log.jsonl").read_text().splitlines()) == 3
 
 
+def test_dry_run_mixed_modalities(tmp_path):
+    """--mix-modalities: every step runs image + video + threed; per-modality losses are logged with a
+    modality prefix; the checkpoint holds the inner model with the same keys as a one-modality run."""
+    tr = _trainer()
+    one, mixed = tmp_path / "one", tmp_path / "mixed"
+    assert tr.main(["--dry-run", "--out", str(one), "--steps", "2"]) == 0
+    assert tr.main(["--dry-run", "--mix-modalities", "--modality-loss-weights", "image:2,video:1,threed:1",
+                    "--use-checkpoint", "--compile", "--compile-backend", "eager", "--out", str(mixed)]) == 0
+    recs = [json.loads(l) for l in (mixed / "log.jsonl").read_text().splitlines()]
+    assert [r["step"] for r in recs] == [1, 2, 3] and all(r["modality"] == "mixed" for r in recs)
+    for r in recs:
+        assert {"image/loss_rgb", "video/loss_fut", "threed/loss_fut", "image/diag_psnr_queries"} <= set(r)
+        expect = 0.5 * r["image/loss"] + 0.25 * r["video/loss"] + 0.25 * r["threed/loss"]
+        assert np.isclose(r["loss"], expect, rtol=1e-5)
+    cfg_json = json.loads((mixed / "config.json").read_text())
+    assert cfg_json["mixed_loss_weights"] == dict(image=0.5, video=0.25, threed=0.25)
+    k_one = torch.load(one / "last.pt", map_location="cpu", weights_only=False)["model"].keys()
+    k_mixed = torch.load(mixed / "last.pt", map_location="cpu", weights_only=False)["model"].keys()
+    assert list(k_one) == list(k_mixed)
+
+
 def test_yaml_config_parses(tmp_path):
     tr = _trainer()
     args, mcfg = tr.parse_args(["--config", os.path.join(ROOT, "configs", "dino_v0", "v0_alpha.yaml"),

@@ -1,16 +1,28 @@
 """Tier B: trunk. R0 = plain attention (default); R2 = learned relations (cfg.rgat_relations > 0).
 
 Each layer, a token of frame t attends to all N tokens of frame t plus the tokens of frame t-1
-in the (2r+1)^2 grid window around its own cell. Causal and parallel over T: keys are
-[x_t ; x_{t-1}] (frame -1 = zeros, fully masked) with one boolean mask [N, 2N] built from the grid.
-RoPE uses each key's own frame coords, so Delta t is visible. T = 1 is plain full attention.
+in the (2r+1)^2 grid window around its own cell. Causal and parallel over T. RoPE uses each key's
+own frame coords, so Delta t is visible. T = 1 is plain full attention.
+
+R0 runs as two 4-D SDPA calls (4-D so that the fused kernels apply: SDPA sends 5-D inputs to its
+math path on every backend, as v0 did), the same function as v0's one masked call over [x_t ; x_{t-1}]:
+  frame 0 (all of an image): its own N tokens only, no mask (v0 masked out a zero frame -1);
+  frames 1..T-1, batch B(T-1): keys [x_{t-1} ; x_t] and ONE additive float mask [N, 2N] (window on the
+                             x_{t-1} half), the same for every frame: cached, broadcast over batch and heads.
+q / k are rotated once per layer (frame t-1's keys reuse their own rotation) from cos / sin tables
+built once per forward (rope_tables). Why this split: an exact log-sum-exp merge of in-frame + window
+attention needs a differentiable LSE, which SDPA does not return; one 4-D call over all frames needs
+the per-frame mask materialised over the batch ([B T, 1, N, 2N], read once per head); on CPU (fp32,
+fwd + bwd, T = 8, N = 256) the split ran 1.6-3.2x faster than v0's 5-D call, on par with that
+one-call variant, and an unfold view of the keys (no cat copy) was not faster.
 
 R2 (rgat_relations = R > 0): position stays with RoPE; each edge (i, j) also picks a relation
 r_ij in {1..R} from MLP([a_i * b_j ; |a_i - b_j|]) with a = LN(Linear_q(h)), b = LN(Linear_k(h))
 (d -> 64 per side, so the pair MLP is 128 -> 256 -> R). r is a straight-through Gumbel top-1 in
 training (argmax, no noise, in eval). The edge carries v_j + U_r V_r^T v_j (per head, rank
 rgat_rank) and adds b_{r,h} + b_{type,h} (type = same frame / frame t-1) to its logit. U and the
-biases start at zero, so R2 at init equals R0. This path uses explicit attention [B, T, H, N, 2N].
+biases start at zero, so R2 at init equals R0. This path uses explicit attention [B, T, H, N, 2N]
+over keys [x_t ; x_{t-1}] (frame -1 = zeros, masked by the bool mask of attn_mask).
 """
 from __future__ import annotations
 
@@ -20,7 +32,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import DinoV0Config
-from .rope import AxialRoPE
+from .rope import AxialRoPE, apply_rope, compute_dtype, rope_tables
 
 
 def window_mask(grid: int, r: int, device=None) -> torch.Tensor:
@@ -58,6 +70,9 @@ class RelationHead(nn.Module):
 
 
 class TrunkLayer(nn.Module):
+    """forward(x [B,T,N,D], cs, mask): cs = rope (cos, sin) tables [T, 1, N, hd] (Trunk builds them once);
+    mask = R0: float bias [N, 2N] for frames 1..T-1 (None when T == 1); R2: bool [T, 1, N, 2N]."""
+
     def __init__(self, cfg: DinoV0Config):
         super().__init__()
         d, self.h = cfg.dim, cfg.heads
@@ -77,28 +92,39 @@ class TrunkLayer(nn.Module):
             self.rel_bias = nn.Parameter(torch.zeros(R, H))                # b_{r,h}
             self.type_bias = nn.Parameter(torch.zeros(2, H))               # b_{type,h}: same frame / t-1
 
-    def _qkv(self, x, ang, ang_prev):
+    def _qkv(self, x: torch.Tensor, cs: tuple) -> tuple:
+        """q, k (rotated, each frame by its own coords) and v, each [B, T, H, N, hd] (token-major views)."""
         B, T, N, D = x.shape
-        q, k, v = self.qkv(x).view(B, T, N, 3, self.h, self.hd).permute(3, 0, 1, 4, 2, 5)  # [B,T,H,N,hd]
-        rot = lambda z, a: self.rope.rotate(z.reshape(B * T, self.h, N, self.hd),
-                                            a.repeat(B, 1, 1)).view(B, T, self.h, N, self.hd)
-        q, k_cur, k_prev = rot(q, ang), rot(k, ang), rot(_shift(k, 1), ang_prev)
-        k = torch.cat([k_cur, k_prev], 3)
-        v = torch.cat([v, _shift(v, 1)], 3)
-        return q, k, v
+        qkv = self.qkv(x).view(B, T, N, 3, self.h, self.hd).permute(3, 0, 1, 4, 2, 5)  # [3,B,T,H,N,hd]
+        qk, v = qkv.split([2, 1])                                          # split / unbind: one cat in backward
+        q, k = apply_rope(qk, *cs).to(qk.dtype).unbind(0)                  # q and k in one pass
+        return q, k, v.squeeze(0)
 
-    def attn(self, x: torch.Tensor, ang: torch.Tensor, ang_prev: torch.Tensor,
-             mask: torch.Tensor) -> torch.Tensor:
+    def attn(self, x: torch.Tensor, cs: tuple, bias) -> torch.Tensor:
         B, T, N, D = x.shape
-        q, k, v = self._qkv(x, ang, ang_prev)
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)       # mask [T,1,N,2N]
-        return self.out(o.transpose(2, 3).reshape(B, T, N, D))
+        q, k, v = self._qkv(x, cs)
+        # frame 0 (all of an image): its own frame only, no mask
+        o = F.scaled_dot_product_attention(q[:, 0], k[:, 0], v[:, 0]).transpose(1, 2).unsqueeze(1)   # [B,1,N,H,hd]
+        if T > 1:                                                          # frames 1..T-1: keys [x_{t-1} ; x_t]
+            kk = torch.cat([k[:, :-1], k[:, 1:]], 3).flatten(0, 1)        # [B(T-1),H,2N,hd]
+            vv = torch.cat([v[:, :-1], v[:, 1:]], 3).flatten(0, 1)
+            o1 = F.scaled_dot_product_attention(q[:, 1:].flatten(0, 1), kk, vv, attn_mask=bias)
+            o = torch.cat([o, o1.unflatten(0, (B, T - 1)).transpose(2, 3)], 1)   # [B,T,N,H,hd]
+        return self.out(o.reshape(B, T, N, D))
 
-    def attn_rel(self, x: torch.Tensor, ang: torch.Tensor, ang_prev: torch.Tensor,
-                 mask: torch.Tensor) -> tuple:
+    def _qkv_rel(self, x: torch.Tensor, cs: tuple) -> tuple:
+        """q [B,T,H,N,hd]; keys / values [x_t ; x_{t-1}] [B,T,H,2N,hd] with frame -1 = zeros (v0 layout).
+        k of frame t-1 rotates with its own coords either way, so it is rotated once and then shifted."""
+        q, k, v = self._qkv(x, cs)
+        return q, torch.cat([k, _shift(k, 1)], 3), torch.cat([v, _shift(v, 1)], 3)
+
+    def attn_rel(self, x: torch.Tensor, cs: tuple, mask: torch.Tensor) -> tuple:
         """R2 attention. Returns (out [B,T,N,D], stats [3 + R]: marginal H (with grad), edge H, usage)."""
+        q, k, v = self._qkv_rel(x, cs)                                     # q [B,T,H,N,hd], k/v [B,T,H,2N,hd]
+        return self._rel_core(x, q, k, v, mask)
+
+    def _rel_core(self, x, q, k, v, mask) -> tuple:
         B, T, N, D = x.shape
-        q, k, v = self._qkv(x, ang, ang_prev)                              # q [B,T,H,N,hd], k/v [B,T,H,2N,hd]
         logits = self.rel(x).float()                                       # [B,T,N,2N,R]
         probs = (logits / self.tau).softmax(-1)
         idx = logits.argmax(-1)
@@ -135,12 +161,12 @@ class TrunkLayer(nn.Module):
         stats = torch.cat([_entropy(marg).view(1), edge_h.view(1), cnt.view(1).detach(), usage])
         return out, stats
 
-    def forward(self, x, ang, ang_prev, mask):
+    def forward(self, x, cs, mask):
         if self.R > 0:
-            a, stats = self.attn_rel(self.norm1(x), ang, ang_prev, mask)
+            a, stats = self.attn_rel(self.norm1(x), cs, mask)
             x = x + a
             return x + self.mlp(self.norm2(x)), stats
-        x = x + self.attn(self.norm1(x), ang, ang_prev, mask)
+        x = x + self.attn(self.norm1(x), cs, mask)
         return x + self.mlp(self.norm2(x))
 
 
@@ -155,6 +181,7 @@ class Trunk(nn.Module):
         self.norm = nn.LayerNorm(cfg.dim)
         self.rgat = cfg.rgat_relations > 0
         self._rel_stats = None
+        self._masks = {}                                                   # (kind, T, N, device, dtype) -> mask
 
     def relation_stats(self) -> dict | None:
         """R2 stats of the last forward, averaged over layers: marginal_entropy (with grad, for the
@@ -166,6 +193,7 @@ class Trunk(nn.Module):
                     usage=st[:, 3:].detach().mean(0))
 
     def attn_mask(self, T: int, N: int, device=None) -> torch.Tensor:
+        """[T, 1, N, 2N] bool over keys [x_t ; x_{t-1}] (v0 layout; the R2 path and the reference in tests)."""
         grid = int(round(N ** 0.5))
         assert grid * grid == N, "tokens must form a square grid"
         prev = window_mask(grid, self.r, device).expand(T, N, N).clone()
@@ -173,17 +201,37 @@ class Trunk(nn.Module):
         cur = torch.ones(T, N, N, dtype=torch.bool, device=device)
         return torch.cat([cur, prev], -1).unsqueeze(1)                      # [T, 1, N, 2N]
 
+    def prev_bias(self, N: int, device=None, dtype=torch.float32) -> torch.Tensor:
+        """[N, 2N] additive mask over keys [x_{t-1} ; x_t]: -inf outside the window on the x_{t-1} half, else 0
+        (float, not bool: bool masks gave zero gradients on some SDPA backends)."""
+        grid = int(round(N ** 0.5))
+        assert grid * grid == N, "tokens must form a square grid"
+        ok = torch.cat([window_mask(grid, self.r, device), torch.ones(N, N, dtype=torch.bool, device=device)], -1)
+        return torch.zeros(N, 2 * N, device=device, dtype=dtype).masked_fill(~ok, float("-inf"))
+
+    def _cached(self, kind: str, T: int, N: int, device, dtype) -> torch.Tensor:
+        key = (kind, T, N, torch.device(device), dtype)
+        m = self._masks.get(key)
+        if m is None:
+            m = self.attn_mask(T, N, device) if kind == "bool" else self.prev_bias(N, device, dtype)
+            self._masks[key] = m
+        return m
+
     def forward(self, x: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         B, T, N, _ = x.shape
-        ang = self.layers[0].rope.angles(coords, mask)                     # [T, N, hd/2], same for all layers
-        ang_prev = _shift(ang, 0)
-        am = self.attn_mask(T, N, x.device)
+        dt = compute_dtype(x)
+        ang = self.layers[0].rope.angles(coords, mask)                     # [T, N, hd/2] float32, same for all layers
+        cs = rope_tables(ang.unsqueeze(1), dt)                             # cos / sin [T, 1, N, hd], once per forward
+        if self.rgat:
+            am = self._cached("bool", T, N, x.device, torch.bool)
+        else:
+            am = self._cached("bias", 0, N, x.device, dt) if T > 1 else None
         stats = []
         for layer in self.layers:
             if self.use_checkpoint and self.training:
-                y = checkpoint(layer, x, ang, ang_prev, am, use_reentrant=False)
+                y = checkpoint(layer, x, cs, am, use_reentrant=False)
             else:
-                y = layer(x, ang, ang_prev, am)
+                y = layer(x, cs, am)
             if self.rgat:
                 x, st = y
                 stats.append(st)
