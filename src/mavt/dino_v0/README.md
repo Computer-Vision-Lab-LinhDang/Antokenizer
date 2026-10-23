@@ -5,8 +5,8 @@ built on a **frozen DINOv3 ViT-L/16**. The older pipelines described in the repo
 (SigLIP2 backbone, slots, v5-v7d) are paused; new work goes here.
 
 Status on 23/10/2026:
-- **v0** trained on alpha (38,511 steps) and evaluated. Its main flaw: D is barely used.
-- **v1 phase 1** (the fixes below) is training on alpha since 12:26 UTC, 16,000 steps, ETA ~20:15 UTC.
+- **v0** trained and evaluated. Its main flaw: the decoder barely uses D (the gate sat at ~1).
+- **v1 phase 1** (the fixes below) is training.
 - Code lives on branch `claude/project-thread-wco299` (PR #20). Package name stays `dino_v0` for both
   versions: v1 is a set of config flags whose defaults reproduce v0 exactly.
 
@@ -72,22 +72,22 @@ They wait until dropping D costs at least ~2 dB on OpenVid at stride 4, i.e. unt
 ## Commands
 
 ```bash
-# tests (CPU, ~30 s here; ~20 min on alpha's CPU)
+# tests (CPU, ~30 s to ~20 min depending on the machine)
 python -m pytest tests/dino_v0 -q
 
 # CPU smoke runs of the trainer (tiny config, 3 steps)
 python scripts/train_dino_v0.py --dry-run --out /tmp/dry
 python scripts/train_dino_v0.py --dry-run --mix-modalities --out /tmp/dry_mix
 
-# train v1 on alpha (GPUs 0-3 only); the yaml `train:` block holds the run's settings, CLI flags win
+# train v1 on 4 GPUs; the yaml `train:` block holds the run's settings (data paths too), CLI flags win
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 scripts/train_dino_v0.py \
-    --config configs/dino_v0/v1_alpha.yaml --out /scratch/vunguyen13/mavt/runs/muse-spark-mavt-v1
+    --config configs/dino_v0/v1_alpha.yaml --out <run>
 # re-running the same command resumes from <out>/last.pt; SIGTERM / Ctrl-C saves last.pt
 
 # evaluate a checkpoint (one GPU); writes <out>/eval.json + eval.md
 PYTHONPATH=src python scripts/eval_dino_v0.py --ckpt <run>/last.pt --device cuda --amp \
-    --imagenet-root /scratch/vunguyen13/data/imagenet-1k \
-    --openvid-manifest /scratch/vunguyen13/data/dino_v0_data/openvid1m --video-limit 500 --video-frames 16 \
+    --imagenet-root <imagenet-1k parquet root> \
+    --openvid-manifest <openvid manifest or dir> --video-limit 500 --video-frames 16 \
     --frame-stride 4 --stem eval_s4 --out <run>/eval
 
 # profile one GPU (step time, memory, top kernels); --modality image|video|threed|mixed
@@ -103,44 +103,22 @@ should stay within ~0.3-3x of `loss_rgb`.
 
 Eval keys for the C/D split (video): `psnr_full`, `psnr_noD` (no D at all), `psnr_zeroD`, `psnr_eraseC`,
 `psnr_warp`, their `gap_*`, `delta_cells_mean/p95`, `gate`, each also `_key` / `_nonkey`; forecasts:
-`forecast_h{h}_psnr` vs `_copy_rec` and `_copy_gt`. Objaverse novel-view numbers of v0 came from an
-ad-hoc script on alpha; they are not in `eval_dino_v0.py` yet.
+`forecast_h{h}_psnr` vs `_copy_rec` and `_copy_gt`. Objaverse novel-view eval is not in `eval_dino_v0.py` yet.
 
-## Runs on alpha
+## Runs, results and design notes
 
-alpha: 8x AMD MI355X (288 GB), ROCm torch 2.14; env `/scratch/vunguyen13/mavt/env`. **GPUs 4-7 belong to
-other people: never use them.** Data: ImageNet-1k parquet, OpenVid-1M at original resolution
-(281,067 clips, last 1,000 held out), Objaverse-LVIS posed views (38,961 objects, last 500 held out),
-SSv2 (train manifest `/scratch/vunguyen13/data/dino_v0_data/ssv2/ssv2_train_manifest.jsonl`, val for eval only).
+Run directories, data paths on the training server, eval numbers and the design documents are kept
+outside this public repo (the team's local handoff notes). Data used: ImageNet-1k, OpenVid-1M at original
+resolution (last 1,000 clips held out), Objaverse-LVIS posed views (last 500 objects held out),
+Something-Something v2 (train split as unlabeled video; validation only for probes).
 
-| Run | Dir under `/scratch/vunguyen13/mavt/runs/` | Code | Status |
-|---|---|---|---|
-| v0 | `muse-spark-mavt` | 5e319ba | done, 38,511 steps; eval in `eval/` |
-| v1 phase 1 | `muse-spark-mavt-v1` | a755732 (copy in `/scratch/vunguyen13/mavt/muse-spark-mavt/code-a755732`) | training, tmux `muse-spark-mavt-v1` |
-
-v0 results (step 38,511):
-- ImageNet val: PSNR 22.50, SSIM 0.560, LPIPS 0.533, rFID 57.7.
-- OpenVid 21.73 dB (key 22.83 / non-key 21.36); SSv2 23.27 dB (key 27.25 / non-key 21.94).
-- Objaverse: seen views 24.15, novel views 20.18 (copy-previous-view 17.51).
-- Dropping D entirely: OpenVid -0.6 dB, SSv2 -1.4, Objaverse seen -4.6 / novel -2.0. Gate 0.999, |Δ| ~0.06 cells.
-- Forecast feature cosine 0.845 vs copy-last 0.952.
-- Probes (kNN / linear): ImageNet z_s 82.7 / 83.9 vs DINOv3 CLS 82.8 / 83.7; SSv2 z_s 7.0 / 10.8 vs CLS 7.8 / 11.4.
-
-Speed (1 GPU, same batch, before -> after the v1 speed work, eager / compiled): v0 image step
-798 -> 404 / 318 ms, video 1271 -> 645 / 552 ms, 3D 619 -> 444 / 428 ms, memory roughly halved.
-v0 code passed 5-D tensors to SDPA and never reached the fused attention kernels.
-
-## Design documents
-
-- Information flow and weaknesses of v0 vs baselines: https://claude.ai/artifact/12NAQUf4tYndWBk7svCiAz
-- v1 fixes, options and roadmap (phases and gates): https://claude.ai/artifact/FGxTRWcXvaUasE7gkMbMND
-- Philosophy and contribution vs AToken / VideoTok4D: https://claude.ai/artifact/7Hrioen1NA6CnhTRnVZaUK
-- Speed analysis: `/mnt/project-files/mavt-review/tang-toc/de-xuat-tang-toc-v0.md` (project files)
+The v1 speed work roughly halved step time and memory of the v0 model on AMD MI355X: v0 passed 5-D
+tensors to SDPA and never reached the fused attention kernels.
 
 ## Working rules for people and agents
 
 - Develop on the PR branch; keep v0 behaviour bit-identical when the v1 flags are off (tests check it).
 - Every speed change must come with a test comparing old and new outputs and gradients.
-- On alpha: GPUs 0-3 only; no package installs and no deletions without an's explicit OK;
-  credentials only through environment variables or stdin, never in files or logs.
-- On an's Mac, work in the main clone `~/Workspace/AToken/atoken`; do not create new git worktrees there.
+- On the shared training server use only the GPUs assigned to this project; no package installs and no
+  deletions without the owner's explicit OK; credentials only through environment variables or stdin,
+  never in files or logs.
