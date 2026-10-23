@@ -34,7 +34,7 @@ def test_shapes_image():
     out = m(X, coords, mask)
     assert out["C"].shape == (2, 1, cfg.n_patches, cfg.dim)
     assert out["seg"].tolist() == [0]
-    assert out["D"] is None and out["D_hat"] is None and out["D_next"] is None
+    assert out["D"] is None and out["D_hat"] is None and out["D_next"] is None and out["D_fut"] is None
 
 
 def test_shapes_video():
@@ -49,6 +49,7 @@ def test_shapes_video():
     for key in ("D", "D_hat", "D_next"):
         assert out[key].shape == (2, 6, M, d)
     assert m.d_state.up(out["D"]).shape == (2, 6, M, cfg.dim)
+    assert list(out["D_fut"]) == [1] and out["D_fut"][1].shape == (2, 5, M, d)   # v0: t + 1 only
 
 
 def test_mask_by_autograd():

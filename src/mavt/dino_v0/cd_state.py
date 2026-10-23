@@ -160,31 +160,56 @@ class DBlock(nn.Module):
 
 
 class DState(nn.Module):
-    """D tokens: predict(D_prev, C_k) -> D_hat; correct(D_hat, X_t, C_k) -> D_t; up(D) -> width dim. No RoPE (mask 0000)."""
+    """D tokens: predict(D_prev, C_k, pose, h) -> D_hat; correct(D_hat, X_t, C_k) -> D_t; up(D) -> width dim.
+    No RoPE (mask 0000).
+
+    One predictor serves both the in-loop prediction of D_t made before X_t arrives (h = 1, from D_{t-1})
+    and the forecasts D_hat(t + h) made at t for each h in cfg.forecast_horizons. Inputs: D_prev,
+    C_k of D_prev's segment, the target view's pose relative to that segment's keyframe view (posed views)
+    and, when present, a horizon embedding. v1 parameters exist only when their flag is on, so with
+    default flags the parameters (and the math) are the v0 ones:
+      h_emb   [max_h + 1, d], zero-init, added to the input; when len(forecast_horizons) > 1 or forecast_residual
+      fut_out ZeroLinear(d, d); forecast_residual: D_hat = D_prev + fut_out(pred(.)), so every
+              prediction starts as copy-last (D_hat = D_prev)
+    """
 
     def __init__(self, cfg: DinoV0Config):
         super().__init__()
         _check_v0(cfg)
         self.cfg = cfg
+        self.horizons = tuple(sorted({int(h) for h in cfg.forecast_horizons}))   # YAML gives a list
+        assert self.horizons and self.horizons[0] >= 1, f"forecast_horizons must be >= 1: {cfg.forecast_horizons}"
+        self.residual = bool(cfg.forecast_residual)
         self.d0 = nn.Parameter(torch.randn(cfg.d_tokens, cfg.d_dim) * 0.02)
         self.pred = DBlock(cfg, n_ctx=1, self_first=True)        # self-attn over D, cross-attn D -> C_k, MLP
         self.corr = nn.ModuleList([DBlock(cfg, n_ctx=2, self_first=False) for _ in range(cfg.d_blocks)])
         self.up_proj = nn.Linear(cfg.d_dim, cfg.dim)
         # target-view pose relative to the keyframe view, an 'action' for the prediction; zero at init
         self.pose_proj = nn.Sequential(nn.Linear(12, cfg.d_dim), nn.GELU(), ZeroLinear(cfg.d_dim, cfg.d_dim))
+        if len(self.horizons) > 1 or self.residual:              # index h; row 1 serves the in-loop step
+            self.h_emb = nn.Parameter(torch.zeros(max(self.horizons) + 1, cfg.d_dim))
+        else:
+            self.register_parameter("h_emb", None)
+        self.fut_out = ZeroLinear(cfg.d_dim, cfg.d_dim) if self.residual else None
 
     def init(self, B: int, dtype=None) -> torch.Tensor:
         D = self.d0.unsqueeze(0).expand(B, -1, -1)
         return D if dtype is None else D.to(dtype)
 
     def predict(self, D_prev: Optional[torch.Tensor], C_k: torch.Tensor,
-                pose: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """D_prev [B, M, d] | None, C_k [B, N, dim], pose [B, 12] (target view vs keyframe) -> D_hat [B, M, d]."""
+                pose: Optional[torch.Tensor] = None, h=1) -> torch.Tensor:
+        """D_prev [B, M, d] | None, C_k [B, N, dim] (D_prev's segment), pose [B, 12] (target view vs that
+        keyframe view) | None, h: horizon in frames, int or long [B] -> D_hat [B, M, d]."""
         if D_prev is None:
             D_prev = self.init(C_k.shape[0], C_k.dtype)
+        x = D_prev
         if pose is not None:
-            D_prev = D_prev + self.pose_proj(pose.to(D_prev.dtype)).unsqueeze(1)
-        return self.pred(D_prev, [C_k], include_self=False)
+            x = x + self.pose_proj(pose.to(x.dtype)).unsqueeze(1)
+        if self.h_emb is not None:
+            e = self.h_emb[h].to(x.dtype)                        # [d] or [B, d]
+            x = x + (e.unsqueeze(1) if e.dim() == 2 else e)
+        y = self.pred(x, [C_k], include_self=False)
+        return D_prev + self.fut_out(y) if self.residual else y
 
     def correct(self, D_hat: torch.Tensor, x_t: torch.Tensor, C_k: torch.Tensor) -> torch.Tensor:
         """D_hat [B, M, d], x_t / C_k [B, N, dim] -> D_t [B, M, d] (attn over [X_t ; C_k ; D])."""
@@ -202,6 +227,15 @@ class DState(nn.Module):
 # ----------------------------------------------------------------------------------------
 
 class CDState(nn.Module):
+    """C at keyframes, D every frame, and the forecasts of D.
+
+    The prediction of D_t is made before X_t arrives: from D_{t-1}, the C of frame t-1's segment (at a
+    keyframe that is the previous segment's C, never the C built from X_t) and the pose of view t
+    relative to that segment's keyframe view. It is the one-step forecast made at t-1, so it is computed
+    once: D_hat_t = D_next_{t-1}. Forecasts for h > 1 (t + h < T) are made after the loop, all (t, h)
+    pairs in one predictor call, from (D_t, C of t's segment, pose of view t + h vs t's keyframe view, h).
+    """
+
     @staticmethod
     def _pose(c2w: Optional[torch.Tensor], ref: int, t: int) -> Optional[torch.Tensor]:
         """Pose of view t in keyframe view ref's frame [B, 12]; None without poses or past the clip."""
@@ -219,7 +253,9 @@ class CDState(nn.Module):
     def forward(self, X: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor,
                 c2w: Optional[torch.Tensor] = None) -> dict:
         """X [B, T, N, dim], coords / mask [T, N, 4], c2w [B, T, 4, 4] for posed views (else None) ->
-        C [B, S, N, dim], seg [T] long, D / D_hat / D_next [B, T, M, d] (None when T == 1)."""
+        C [B, S, N, dim], seg [T] long, D / D_hat / D_next [B, T, M, d] and
+        D_fut {h: [B, T - h, M, d]} (index t = forecast made at t for frame t + h; horizons h < T only),
+        D_fut[1] = D_next[:, :T - 1]. D / D_hat / D_next / D_fut are None when T == 1."""
         B, T = X.shape[:2]
         K = self.cfg.keyframe_every
         S = math.ceil(T / K)
@@ -227,19 +263,39 @@ class CDState(nn.Module):
         Cs = [self.c_builder(X[:, s * K], coords[s * K], mask[s * K]) for s in range(S)]
         C = torch.stack(Cs, 1)
         if T == 1:
-            return dict(C=C, seg=seg, D=None, D_hat=None, D_next=None)
+            return dict(C=C, seg=seg, D=None, D_hat=None, D_next=None, D_fut=None)
         Ds, D_hats, D_nexts = [], [], []
-        D_prev = None
+        D_hat = self.d_state.init(B, X.dtype)
         for t in range(T):
             C_k = Cs[t // K]
-            # the prediction is made before X_t arrives, so it uses the C of frame t-1's segment;
-            # at a keyframe that is the previous segment's C, never the C built from X_t
-            D_hat = (self.d_state.init(B, X.dtype) if t == 0
-                     else self.d_state.predict(D_prev, Cs[(t - 1) // K], self._pose(c2w, ((t - 1) // K) * K, t)))
             D_t = self.d_state.correct(D_hat, X[:, t], C_k)
-            D_nexts.append(self.d_state.predict(D_t, C_k, self._pose(c2w, (t // K) * K, t + 1)))
+            # forecast made at t before X_{t+1} arrives = the in-loop prediction of D_{t+1}
+            D_next = self.d_state.predict(D_t, C_k, self._pose(c2w, (t // K) * K, t + 1))
             D_hats.append(D_hat)
             Ds.append(D_t)
-            D_prev = D_t
-        return dict(C=C, seg=seg, D=torch.stack(Ds, 1), D_hat=torch.stack(D_hats, 1),
-                    D_next=torch.stack(D_nexts, 1))
+            D_nexts.append(D_next)
+            D_hat = D_next
+        D, D_next = torch.stack(Ds, 1), torch.stack(D_nexts, 1)
+        return dict(C=C, seg=seg, D=D, D_hat=torch.stack(D_hats, 1), D_next=D_next,
+                    D_fut=self._forecasts(D, D_next, C, seg, c2w))
+
+    def _forecasts(self, D: torch.Tensor, D_next: torch.Tensor, C: torch.Tensor, seg: torch.Tensor,
+                   c2w: Optional[torch.Tensor]) -> dict:
+        """{h: D_hat(t + h) made at t, [B, T - h, M, d]} for every forecast horizon h < T."""
+        B, T = D.shape[:2]
+        K = self.cfg.keyframe_every
+        hs = [h for h in self.d_state.horizons if h < T]
+        out = {1: D_next[:, :T - 1]} if 1 in hs else {}
+        hs = [h for h in hs if h > 1]
+        if not hs:
+            return out
+        src = torch.cat([torch.arange(T - h, device=D.device) for h in hs])            # [P] frame t
+        hv = torch.cat([torch.full((T - h,), h, device=D.device, dtype=torch.long) for h in hs])
+        pose = None
+        if c2w is not None:                                       # view t + h vs t's keyframe view
+            pose = relative_pose(c2w[:, (src // K) * K], c2w[:, src + hv]).flatten(0, 1)
+        P = src.shape[0]
+        D_f = self.d_state.predict(D[:, src].flatten(0, 1), C[:, seg[src]].flatten(0, 1), pose,
+                                   hv.repeat(B)).unflatten(0, (B, P))
+        out.update(zip(hs, D_f.split([T - h for h in hs], 1)))
+        return out

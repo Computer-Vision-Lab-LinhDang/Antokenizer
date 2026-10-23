@@ -1,15 +1,26 @@
-"""MAVT on DINOv3, v0: the whole model and its training losses.
+"""MAVT on DINOv3: the whole model and its training losses (v0, plus the v1 phase-1 options of config.py).
 
   frames -> FrameEncoder (frozen DINOv3 + pixel stem) -> Trunk (in-frame + causal t-1 attention)
-         -> CDState (C at keyframes, D every frame) -> LatentHeads (z_r with KL) / SemanticPool (z_s)
-         -> QueryDecoder (reads z_r of C_k at (u, v) + delta(D_t), reads D_t by content)
+         -> CDState (C at keyframes, D every frame, forecasts of D) -> LatentHeads (z_r with KL) / SemanticPool (z_s)
+         -> QueryDecoder (reads z_r of C_k at (u, v) + delta(D_t), reads D_t by content, gate o)
 
 Input layout follows mavt.data: image [B, 3, H, W], video [B, 3, T, H, W], both in [-1, 1].
 Posed 3D views (modality "threed") use the video layout over views plus cam = dict(c2w [B,T,4,4]
 OpenCV camera-to-world, K [B,T,3,3] pixels at the model resolution): tokens and decoder queries get
-Plücker rays, and the prediction of view t+1 is conditioned on its pose (novel-view synthesis).
-Training: every frame t is decoded from (C of its keyframe, D_t)  -> L_rec; the prediction
-D_next_t made before X_{t+1} is decoded at frame t+1 against DINOv3 features -> L_fut.
+Plücker rays, and the forecast of view t+h is conditioned on its pose (novel-view synthesis).
+
+Training. Each kind of decode is ONE decoder call over rows = B * T' flattened frames, each row with
+its own query time (the decoder is batch-agnostic):
+  L_rec   every frame t from (C of its keyframe, D_t): rgb L1 + DINOv3 feature loss. rgb_head "linear":
+          a random subset of train_queries_per_frame queries per frame (v0); "conv": all N queries,
+          rgb L1 on the full image, feature loss on all queries.
+  L_fut   for each h in forecast_horizons and t + h < T: D_hat(t + h), made at t from D_t, the C of t's
+          segment and (posed views) the pose of view t + h, is decoded at frame t + h with the zc of t's
+          segment: feature loss (w_fut) + rgb L1 (w_fut_rgb, only when > 0). Horizons weigh the same.
+  L_warp  (w_warp > 0, video / views) non-key frames decoded with the gate locked to 1, so only C read at
+          (u, v) + Δ reaches the output: rgb L1. Forces Δ to carry the motion.
+  L_lpips / L_gram  (w_lpips / w_gram > 0) on at most lpips_max_frames full reconstructed frames, one VGG forward.
+  gate    gate_loss "mean": (1 - o).mean() (v0, drives o to 1); "hinge": relu(gate_floor - mean o).
 """
 from __future__ import annotations
 
@@ -27,6 +38,8 @@ from mavt.dino_v0.encoder import FrameEncoder
 from mavt.dino_v0.latent import LatentHeads, SemanticPool
 from mavt.dino_v0.rope import grid_coords, modality_mask
 from mavt.dino_v0.trunk import Trunk
+
+GRAM_DIST = "l1"          # distance between Gram matrices: "l1" | "mse"
 
 
 def to_frames(data: torch.Tensor, modality: str) -> torch.Tensor:
@@ -46,13 +59,24 @@ def _gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
 
 
-def _rays_t(e: dict, t: int) -> Optional[torch.Tensor]:
-    return None if e.get("rays") is None else e["rays"][:, t]
+def _psnr(pred: torch.Tensor, tgt: torch.Tensor, B: int) -> torch.Tensor:
+    """Rows [B * T', ...] (b-major) -> mean over the T' frames of PSNR (range 2), MSE pooled over the batch."""
+    mse = (pred.detach().float().clamp(-1, 1) - tgt.float()).pow(2).flatten(1).mean(1)
+    mse = mse.view(B, -1).mean(0)
+    return (10 * torch.log10(4.0 / mse.clamp_min(1e-10))).mean()
+
+
+def _split(x: Optional[torch.Tensor], B: int, sizes: list) -> list:
+    """Rows [B * sum(sizes), ...] (b-major) -> one [B * n, ...] tensor per size (None -> Nones)."""
+    if x is None:
+        return [None] * len(sizes)
+    return [c.flatten(0, 1) for c in x.unflatten(0, (B, sum(sizes))).split(sizes, 1)]
 
 
 class MAVTDinoV0(nn.Module):
     def __init__(self, cfg: DinoV0Config, use_checkpoint: bool = False):
         super().__init__()
+        assert cfg.gate_loss in ("mean", "hinge"), f"unknown gate_loss {cfg.gate_loss!r}"
         self.cfg = cfg
         self.encoder = FrameEncoder(cfg)
         self.trunk = Trunk(cfg, use_checkpoint=use_checkpoint)
@@ -61,7 +85,9 @@ class MAVTDinoV0(nn.Module):
         self.pool = SemanticPool(cfg)
         self.feat_dim = self.encoder.dino.out_dim
         self.decoder = QueryDecoder(cfg, feat_dim=self.feat_dim)
-        self.lpips = L.LPIPSLoss() if cfg.w_lpips > 0 else None
+        self.lpips = L.LPIPSLoss() if cfg.w_lpips > 0 or cfg.w_gram > 0 else None
+        if self.lpips is not None:                                      # frozen VGG: not in the state_dict
+            self.register_load_state_dict_post_hook(L.ignore_lpips_keys)
 
     # ------------------------------------------------------------------ encode
     def _coords(self, T: int, modality: str, device) -> tuple:
@@ -71,7 +97,11 @@ class MAVTDinoV0(nn.Module):
         return coords, mask
 
     def encode(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None) -> dict:
-        """Tiers A-D. Returns frame targets, C/D states and their latents."""
+        """Tiers A-D. Returns frame targets, C/D states and their latents.
+
+        Sequences also get zd [B, T, M, zr_d], zd_next [B, T, M, zr_d] (one-step forecast made at t, v0)
+        and zd_fut {h: [B, T - h, M, zr_d]} (index t = forecast made at t for frame t + h, horizons h < T;
+        zd_fut[1] is zd_next[:, :T - 1], the same sample)."""
         mm = _mm(modality)
         frames = to_frames(data, mm)
         B, T = frames.shape[:2]
@@ -94,6 +124,9 @@ class MAVTDinoV0(nn.Module):
             out["kl_d"] = (mu_d, lv_d)
             zn, _, _ = self.latent.encode_d(st["D_next"].flatten(0, 1))
             out["zd_next"] = zn.unflatten(0, (B, T))
+            out["zd_fut"] = {h: out["zd_next"][:, :T - 1] if h == 1
+                             else self.latent.encode_d(D_h.flatten(0, 1))[0].unflatten(0, (B, T - h))
+                             for h, D_h in st["D_fut"].items()}
         return out
 
     def semantic(self, e: dict) -> torch.Tensor:
@@ -105,30 +138,68 @@ class MAVTDinoV0(nn.Module):
         return self.pool(C_t.flatten(0, 1), D_up).unflatten(0, (B, T))
 
     # ------------------------------------------------------------------ decode
-    def decode_frame(self, zc: torch.Tensor, zd: Optional[torch.Tensor], t: float, modality: str,
-                     idx: Optional[torch.Tensor] = None, rays: Optional[torch.Tensor] = None) -> dict:
-        """Decode queries of one frame. zc [B,N,cc], zd [B,M,zr_d] | None, idx [B,Q] | None (all N),
-        rays [B,N,6] of the target view (posed views) | None."""
+    def decode_frame(self, zc: torch.Tensor, zd: Optional[torch.Tensor], t, modality: str,
+                     idx: Optional[torch.Tensor] = None, rays: Optional[torch.Tensor] = None,
+                     warp_only: bool = False) -> dict:
+        """Decode B rows in ONE decoder call; a row is one frame, rows may come from different frames / clips.
+
+        zc [B,N,cc], zd [B,M,zr_d] | None, t: float (every row) or tensor [B] (frame time of each row),
+        idx [B,Q] | None (all N queries in row-major order; the conv rgb head needs None),
+        rays [B,N,6] of the target view (posed views) | None, warp_only: gate locked to 1 (C read at
+        (u, v) + Δ only). Returns the decoder dict; "image" [B,3,H,W] is the conv head's output, or the
+        patches put together when idx is None (linear head), else None."""
         mm = _mm(modality)
         B = zc.shape[0]
-        qc = query_coords(self.cfg.grid, t, B, idx, device=zc.device)
+        if idx is not None and self.cfg.rgb_head == "conv":
+            raise ValueError("rgb_head 'conv' decodes the full grid: idx must be None")
+        if torch.is_tensor(t):
+            qc = query_coords(self.cfg.grid, 0.0, B, idx, device=zc.device)
+            qc[..., 0] = t.to(qc.device, qc.dtype).reshape(-1, 1)
+        else:
+            qc = query_coords(self.cfg.grid, float(t), B, idx, device=zc.device)
         qm = modality_mask(mm, qc.shape[1], device=zc.device).unsqueeze(0).expand(B, -1, -1)
         if rays is not None and idx is not None:
             rays = _gather(rays, idx)
-        return self.decoder(zc, zd, qc, qm, mm, q_rays=rays)
+        o = self.decoder(zc, zd, qc, qm, mm, q_rays=rays, warp_only=warp_only)
+        if o.get("image") is None:
+            o["image"] = patches_to_image(o["rgb"], self.cfg.grid, self.cfg.patch) if idx is None else None
+        return o
+
+    def _decode_set(self, e: dict, src: torch.Tensor, dst: torch.Tensor, zd: Optional[torch.Tensor],
+                    subset: bool, warp_only: bool = False) -> tuple:
+        """Decode frames dst [T'] of every clip in ONE decoder call, from the zc of src's [T'] segments and
+        zd [B, T', M, zr_d] | None, at query time dst. subset (linear head only): a random subset of
+        train_queries_per_frame queries per row (v0 training), else all N queries.
+        -> (decoder dict, targets dict(img [B*T',3,H,W], rgb [B*T',Q,p*p*3], feat [B*T',Q,F])), rows b-major."""
+        cfg = self.cfg
+        B, N = e["frames"].shape[0], cfg.n_patches
+        zc = e["zc"][:, e["state"]["seg"][src]].flatten(0, 1)
+        zd = None if zd is None else zd.flatten(0, 1)
+        rays = None if e["rays"] is None else e["rays"][:, dst].flatten(0, 1)
+        img = e["frames"][:, dst].flatten(0, 1)
+        feat = e["feat_target"][:, dst].flatten(0, 1)
+        idx = None
+        if subset and cfg.rgb_head == "linear" and cfg.train_queries_per_frame < N:
+            idx = torch.rand(zc.shape[0], N, device=zc.device).argsort(-1)[:, :cfg.train_queries_per_frame]
+        o = self.decode_frame(zc, zd, dst.float().repeat(B), e["modality"], idx, rays, warp_only)
+        rgb = image_to_patches(img, cfg.patch)
+        if idx is not None:
+            rgb, feat = _gather(rgb, idx), _gather(feat, idx)
+        return o, dict(img=img, rgb=rgb, feat=feat)
+
+    @staticmethod
+    def _rgb_pair(o: dict, tg: dict) -> tuple:
+        """(prediction, target) of the rgb L1: full images when decoded, else the query patches."""
+        return (o["image"], tg["img"]) if o["image"] is not None else (o["rgb"], tg["rgb"])
 
     @torch.no_grad()
     def reconstruct(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None) -> torch.Tensor:
-        """Full reconstruction in the input layout, in [-1, 1]."""
+        """Full reconstruction in the input layout, in [-1, 1]; all frames in one decoder call."""
         e = self.encode(data, modality, cam)
         B, T = e["frames"].shape[:2]
-        seg = e["state"]["seg"]
-        outs = []
-        for t in range(T):
-            zd = e["zd"][:, t] if "zd" in e else None
-            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, rays=_rays_t(e, t))
-            outs.append(patches_to_image(o["rgb"], self.cfg.grid, self.cfg.patch))
-        rec = torch.stack(outs, 1).clamp(-1, 1)
+        tt = torch.arange(T, device=data.device)
+        o, _ = self._decode_set(e, tt, tt, e.get("zd"), subset=False)
+        rec = o["image"].unflatten(0, (B, T)).clamp(-1, 1)
         return rec[:, 0] if _mm(modality) == "image" else rec.permute(0, 2, 1, 3, 4)
 
     # ------------------------------------------------------------------ train
@@ -137,42 +208,61 @@ class MAVTDinoV0(nn.Module):
         e = self.encode(data, modality, cam)
         frames, st = e["frames"], e["state"]
         B, T = frames.shape[:2]
-        N, p = cfg.n_patches, cfg.patch
-        Q = N if not self.training else min(cfg.train_queries_per_frame, N)
-        seg = st["seg"]
+        seq = e["modality"] != "image"
+        tt = torch.arange(T, device=data.device)
+        key = tt % cfg.keyframe_every == 0
         parts, diag = {}, {}
 
-        rgb_l, feat_l, gates, deltas, psnr = [], [], [], [], []
-        for t in range(T):
-            idx = torch.rand(B, N, device=data.device).argsort(-1)[:, :Q]
-            zd = e["zd"][:, t] if "zd" in e else None
-            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, idx, _rays_t(e, t))
-            tgt_rgb = _gather(image_to_patches(frames[:, t], p), idx)
-            tgt_feat = _gather(e["feat_target"][:, t], idx)
-            rgb_l.append(L.rgb_l1(o["rgb"], tgt_rgb))
-            feat_l.append(L.feat_loss(o["feat"], tgt_feat))
-            gates.append(o["gate"])
-            deltas.append(o["delta"])
-            with torch.no_grad():
-                mse = ((o["rgb"].float().clamp(-1, 1) - tgt_rgb.float()) ** 2).mean()
-                psnr.append(10 * torch.log10(4.0 / mse.clamp_min(1e-10)))
-        parts["rgb"] = torch.stack(rgb_l).mean()
-        parts["feat"] = torch.stack(feat_l).mean()
+        # ---- reconstruction: every frame from (C of its keyframe, D_t)
+        o, tg = self._decode_set(e, tt, tt, e.get("zd"), subset=self.training)
+        parts["rgb"] = L.rgb_l1(*self._rgb_pair(o, tg))
+        parts["feat"] = L.feat_loss(o["feat"], tg["feat"])
 
-        if "zd_next" in e and T > 1:
-            fut = []
-            for t in range(T - 1):
-                idx = torch.rand(B, N, device=data.device).argsort(-1)[:, :Q]
-                o = self.decode_frame(e["zc"][:, seg[t]], e["zd_next"][:, t], float(t + 1), modality, idx,
-                                      _rays_t(e, t + 1))
-                fut.append(L.feat_loss(o["feat"], _gather(e["feat_target"][:, t + 1], idx)))
+        # ---- forecasts: D_hat(t + h) made at t, decoded at frame t + h with the zc of t's segment
+        if seq and e.get("zd_fut"):
+            hs = list(e["zd_fut"])
+            sizes = [T - h for h in hs]
+            src = torch.cat([tt[:n] for n in sizes])
+            dst = torch.cat([tt[h:] for h in hs])
+            zd_f = torch.cat([e["zd_fut"][h] for h in hs], 1)
+            of, tf = self._decode_set(e, src, dst, zd_f, subset=self.training)
+            pred_f, tgt_f = self._rgb_pair(of, tf)
+            fut, fut_rgb = [], []
+            per_h = zip(hs, *(_split(x, B, sizes) for x in (of["feat"], tf["feat"], pred_f, tgt_f)))
+            for h, f, f_t, p, p_t in per_h:
+                fut.append(L.feat_loss(f, f_t))
+                fut_rgb.append(L.rgb_l1(p, p_t))
+                diag[f"psnr_fut_h{h}"] = _psnr(p, p_t, B)
             parts["fut"] = torch.stack(fut).mean()
+            if cfg.w_fut_rgb > 0:
+                parts["fut_rgb"] = torch.stack(fut_rgb).mean()
 
+        # ---- warp-only: non-key frames with the gate locked to 1 (D acts through Δ alone)
+        if seq and cfg.w_warp > 0 and not bool(key.all()):
+            nk = tt[~key]
+            ow, tw = self._decode_set(e, nk, nk, e["zd"][:, nk], subset=self.training, warp_only=True)
+            pred_w, tgt_w = self._rgb_pair(ow, tw)
+            parts["warp"] = L.rgb_l1(pred_w, tgt_w)
+            diag["psnr_warp"] = _psnr(pred_w, tgt_w, B)
+
+        # ---- LPIPS / Gram on a random subset of full reconstructed frames, one VGG forward
         if self.lpips is not None:
-            t = T - 1
-            zd = e["zd"][:, t] if "zd" in e else None
-            o = self.decode_frame(e["zc"][:, seg[t]], zd, float(t), modality, rays=_rays_t(e, t))
-            parts["lpips"] = self.lpips(patches_to_image(o["rgb"], cfg.grid, p), frames[:, t])
+            sel = torch.randperm(B * T, device=data.device)[:cfg.lpips_max_frames]
+            if o["image"] is not None:
+                pred_img, tgt_img = o["image"][sel], tg["img"][sel]
+            else:                                                       # query subset: decode those frames in full
+                b, t = sel // T, sel % T
+                zd = e["zd"][b, t] if "zd" in e else None
+                rays = None if e["rays"] is None else e["rays"][b, t]
+                pred_img = self.decode_frame(e["zc"][b, st["seg"][t]], zd, t.float(), modality, rays=rays)["image"]
+                tgt_img = frames[b, t]
+            lp, gr = self.lpips.lpips_gram(pred_img, tgt_img, with_gram=cfg.w_gram > 0, dist=GRAM_DIST)
+            if cfg.w_lpips > 0:
+                parts["lpips"] = lp
+            else:
+                diag["lpips"] = lp.detach()
+            if gr is not None:
+                parts["gram"] = gr
 
         kl = L.kl(*e["kl_c"])
         if "kl_d" in e:
@@ -181,21 +271,31 @@ class MAVTDinoV0(nn.Module):
         parts["var"] = L.var_cov(st["C"].flatten(0, 1).float())
         zs = self.semantic(e)
         parts["sem"] = L.sem_loss(zs.flatten(0, 1).float(), e["cls"].flatten(0, 1).float())
-        if _mm(modality) != "image":
-            parts["gate"] = L.gate_reg(torch.cat([g.flatten() for g in gates]))
+        if seq:
+            parts["gate"] = (L.gate_hinge(o["gate"], cfg.gate_floor) if cfg.gate_loss == "hinge"
+                             else L.gate_reg(o["gate"]))
         rel = self.trunk.relation_stats() if cfg.rgat_relations > 0 else None
         if rel is not None:                                             # R2 anti-collapse, weight inside
             parts["rel"] = -cfg.rgat_entropy_w * rel["marginal_entropy"]
 
-        w = dict(rgb=cfg.w_rgb, feat=cfg.w_feat, fut=cfg.w_fut, lpips=cfg.w_lpips, kl=cfg.w_kl,
-                 var=cfg.w_var, sem=cfg.w_sem, gate=cfg.w_gate, rel=1.0)
+        w = dict(rgb=cfg.w_rgb, feat=cfg.w_feat, fut=cfg.w_fut, fut_rgb=cfg.w_fut_rgb, warp=cfg.w_warp,
+                 lpips=cfg.w_lpips, gram=cfg.w_gram, kl=cfg.w_kl, var=cfg.w_var, sem=cfg.w_sem,
+                 gate=cfg.w_gate, rel=1.0)
         loss = sum(w[k] * v for k, v in parts.items())
         with torch.no_grad():
-            diag["psnr_queries"] = torch.stack(psnr).mean()
+            diag["psnr_queries"] = _psnr(o["rgb"], tg["rgb"], B)
+            if o["image"] is not None:                                  # full frames were decoded
+                diag["psnr"] = _psnr(o["image"], tg["img"], B)
             diag["mean_energy"] = e["mean_energy"].float()
-            diag["gate_mean"] = torch.cat([g.flatten() for g in gates]).float().mean()
+            diag["gate_mean"] = o["gate"].float().mean()
             if rel is not None:
                 diag["rel_marginal_entropy"] = rel["marginal_entropy"].detach().float()
                 diag["rel_edge_entropy"] = rel["edge_entropy"].float()
-            diag["delta_abs_cells"] = torch.cat([d.flatten() for d in deltas]).float().abs().mean() * cfg.grid
+            dcell = o["delta"].float().abs().mean(dim=(1, 2)) * cfg.grid        # per row [B*T]
+            diag["delta_abs_cells"] = dcell.mean()
+            if seq:
+                k_rows = key.repeat(B)
+                diag["delta_abs_cells_key"] = dcell[k_rows].mean()
+                if not bool(key.all()):
+                    diag["delta_abs_cells_nonkey"] = dcell[~k_rows].mean()
         return dict(loss=loss, parts={k: v.detach() for k, v in parts.items()}, diag=diag)
