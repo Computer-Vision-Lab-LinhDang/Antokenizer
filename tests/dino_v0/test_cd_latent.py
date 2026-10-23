@@ -18,8 +18,9 @@ def _inputs(cfg, B, T, requires_grad=False):
 
 
 def _grad_frames(out, X):
-    """Per-frame L1 norm of d(out.sum()) / dX -> [T]."""
-    (g,) = torch.autograd.grad(out.sum(), X, retain_graph=True, allow_unused=True)
+    """Per-frame L1 norm of d(<out, w>) / dX -> [T]; w is random because out.sum() of a LayerNorm output has ~0 gradient."""
+    w = torch.randn(out.shape, generator=torch.Generator().manual_seed(1))
+    (g,) = torch.autograd.grad((out * w).sum(), X, retain_graph=True, allow_unused=True)
     if g is None:
         return torch.zeros(X.shape[1])
     return g.abs().sum(dim=(0, 2, 3))
@@ -64,7 +65,7 @@ def test_mask_by_autograd():
     assert g[4] > 0 and torch.all(g[torch.arange(6) != 4] == 0)
 
     # C never reads D
-    (gd0,) = torch.autograd.grad(out["C"].sum(), m.d_state.d0, retain_graph=True, allow_unused=True)
+    (gd0,) = torch.autograd.grad((out["C"] * torch.randn_like(out["C"])).sum(), m.d_state.d0, retain_graph=True, allow_unused=True)
     assert gd0 is None or torch.all(gd0 == 0)
 
     # D_t is causal: no grad from X_{t'} with t' > t, and it does read X_t
@@ -94,7 +95,8 @@ def test_c_neighbourhood():
     N = cfg.n_patches
     x = torch.randn(1, N, cfg.dim, requires_grad=True)
     c = cb(x, grid_coords(cfg.grid), modality_mask("image", N))
-    (g,) = torch.autograd.grad(c[0, 0].sum(), x)          # cell (0, 0)
+    w = torch.randn(cfg.dim)                               # c ends in LayerNorm, so c.sum() has ~0 gradient
+    (g,) = torch.autograd.grad((c[0, 0] * w).sum(), x)    # cell (0, 0)
     g = g[0].abs().sum(-1).view(cfg.grid, cfg.grid)
     assert torch.all(g[:2, :2] > 0)
     assert torch.all(g[2:] == 0) and torch.all(g[:, 2:] == 0)
