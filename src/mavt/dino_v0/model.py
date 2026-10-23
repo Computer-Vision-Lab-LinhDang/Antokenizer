@@ -17,8 +17,11 @@ its own query time (the decoder is batch-agnostic):
   L_fut   for each h in forecast_horizons and t + h < T: D_hat(t + h), made at t from D_t, the C of t's
           segment and (posed views) the pose of view t + h, is decoded at frame t + h with the zc of t's
           segment: feature loss (w_fut) + rgb L1 (w_fut_rgb, only when > 0). Horizons weigh the same.
+          fut_frames_per_horizon > 0: only that many random source frames t per horizon per step (the same
+          frames for every clip of the batch); 0 decodes every pair.
   L_warp  (w_warp > 0, video / views) non-key frames decoded with the gate locked to 1, so only C read at
-          (u, v) + Δ reaches the output: rgb L1. Forces Δ to carry the motion.
+          (u, v) + Δ reaches the output: rgb L1. Forces Δ to carry the motion. warp_frames > 0: only that
+          many random non-key frames per step.
   L_lpips / L_gram  (w_lpips / w_gram > 0) on at most lpips_max_frames full reconstructed frames, one VGG forward.
   gate    gate_loss "mean": (1 - o).mean() (v0, drives o to 1); "hinge": relu(gate_floor - mean o).
 """
@@ -71,6 +74,14 @@ def _split(x: Optional[torch.Tensor], B: int, sizes: list) -> list:
     if x is None:
         return [None] * len(sizes)
     return [c.flatten(0, 1) for c in x.unflatten(0, (B, sum(sizes))).split(sizes, 1)]
+
+
+def _subset(n: int, k: int, device) -> torch.Tensor:
+    """Sorted random subset of k of range(n) (all of it when k <= 0 or k >= n). Drawn once per step and shared
+    by every clip of the batch, so the decoded row counts (and the compiled shapes) are the same every step."""
+    if k <= 0 or k >= n:
+        return torch.arange(n, device=device)
+    return torch.randperm(n, device=device)[:k].sort().values
 
 
 class MAVTDinoV0(nn.Module):
@@ -221,10 +232,11 @@ class MAVTDinoV0(nn.Module):
         # ---- forecasts: D_hat(t + h) made at t, decoded at frame t + h with the zc of t's segment
         if seq and e.get("zd_fut"):
             hs = list(e["zd_fut"])
-            sizes = [T - h for h in hs]
-            src = torch.cat([tt[:n] for n in sizes])
-            dst = torch.cat([tt[h:] for h in hs])
-            zd_f = torch.cat([e["zd_fut"][h] for h in hs], 1)
+            srcs = {h: _subset(T - h, cfg.fut_frames_per_horizon, data.device) for h in hs}   # source frames t
+            sizes = [int(s.numel()) for s in srcs.values()]
+            src = torch.cat([srcs[h] for h in hs])
+            dst = torch.cat([srcs[h] + h for h in hs])
+            zd_f = torch.cat([e["zd_fut"][h][:, srcs[h]] for h in hs], 1)
             of, tf = self._decode_set(e, src, dst, zd_f, subset=self.training)
             pred_f, tgt_f = self._rgb_pair(of, tf)
             fut, fut_rgb = [], []
@@ -240,6 +252,7 @@ class MAVTDinoV0(nn.Module):
         # ---- warp-only: non-key frames with the gate locked to 1 (D acts through Δ alone)
         if seq and cfg.w_warp > 0 and not bool(key.all()):
             nk = tt[~key]
+            nk = nk[_subset(int(nk.numel()), cfg.warp_frames, data.device)]
             ow, tw = self._decode_set(e, nk, nk, e["zd"][:, nk], subset=self.training, warp_only=True)
             pred_w, tgt_w = self._rgb_pair(ow, tw)
             parts["warp"] = L.rgb_l1(pred_w, tgt_w)

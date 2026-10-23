@@ -75,6 +75,11 @@ class DinoV0Config:
     w_fut_rgb: float = 0.0               # rgb L1 on forecast frames
     w_gram: float = 0.0                  # Gram loss on the LPIPS VGG features (AToken-style)
     lpips_max_frames: int = 64           # frames per step that get LPIPS / Gram (random subset)
+    # ---- v1 phase 2: speed (defaults keep the phase-1 behaviour) ----
+    fut_frames_per_horizon: int = 0      # 0: decode every forecast pair (t, t + h); k > 0: k random source frames per horizon per step
+    warp_frames: int = 0                 # 0: warp-only loss on every non-key frame; k > 0: k random non-key frames per step
+    conv_channels_last: bool = False     # conv rgb head (weights + input) in channels_last: no NCHW <-> NHWC transposes around MIOpen / cuDNN
+    window_read: str = "dense"           # decoder's C read: "dense" = masked SDPA over all N cells; "gather" = the (2r+1)^2 window cells per query
     extra: dict = field(default_factory=dict)
 
     @property

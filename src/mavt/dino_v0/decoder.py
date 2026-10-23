@@ -140,6 +140,11 @@ class _WindowCrossAttn(nn.Module):
         self.q, self.kv, self.o = nn.Linear(dim, dim), nn.Linear(dim, 2 * dim), nn.Linear(dim, dim)
         self.rope = rope
 
+    def read(self, x, c, win: tuple):
+        """win from QueryDecoder.forward: (bias, q_pos, q_m, c_pos, c_m) -> dense masked read (window_read
+        "dense"); (idx, valid, q_pos, k_pos, q_m, k_m) -> gathered window read (window_read "gather")."""
+        return self.forward(x, c, *win) if len(win) == 5 else self.forward_gather(x, c, *win)
+
     def forward(self, x, c, bias, q_pos, q_m, c_pos, c_m):
         # x [B,Q,D]; c [B,N,D]; bias [B,Q,N]; q_pos/q_m [B,Q,4]; c_pos/c_m [B,N,4]
         B, Q, D = x.shape
@@ -202,7 +207,7 @@ class DecoderBlock(nn.Module):
 
     def forward(self, h, c, d, win, q_coords, q_mask):
         hn = self.n_q(h)
-        rc = self.read_c(hn, self.n_c(c), *win)
+        rc = self.read_c.read(hn, self.n_c(c), win)
         if d is None:
             o = torch.ones_like(h[..., :1])
             h = h + rc
@@ -238,11 +243,16 @@ class ConvUpsampler(nn.Module):
     """[B, G*G, dim] tokens in row-major grid order -> image [B, 3, G * 2^S, G * 2^S], S = len(channels) - 1.
 
     channels[0] is the width at grid resolution, then one width per nearest-x2 stage. No output
-    activation (the v0 linear rgb head had none either; targets are in [-1, 1])."""
+    activation (the v0 linear rgb head had none either; targets are in [-1, 1]).
 
-    def __init__(self, dim: int, channels: tuple, res_blocks: int):
+    channels_last: the weights in channels_last and the token grid read as [B, G, G, D], which IS the NHWC
+    layout of [B, D, G, G] (a view, no copy), so every conv runs on NHWC tensors and MIOpen / cuDNN skip the
+    NCHW <-> NHWC transposes they insert around their NHWC kernels otherwise. The image comes back NCHW."""
+
+    def __init__(self, dim: int, channels: tuple, res_blocks: int, channels_last: bool = False):
         super().__init__()
         ch = list(channels)
+        self.channels_last = channels_last
         self.conv_in = nn.Conv2d(dim, ch[0], 3, padding=1)
         self.stages = nn.ModuleList([nn.Sequential(*[_ResBlock(ch[0]) for _ in range(res_blocks)])])
         for cin, cout in zip(ch[:-1], ch[1:]):
@@ -250,13 +260,20 @@ class ConvUpsampler(nn.Module):
                                              nn.Conv2d(cin, cout, 3, padding=1),
                                              *[_ResBlock(cout) for _ in range(res_blocks)]))
         self.n_out, self.conv_out = _gn(ch[-1]), nn.Conv2d(ch[-1], 3, 3, padding=1)
+        if channels_last:
+            self.to(memory_format=torch.channels_last)
 
     def forward(self, h: torch.Tensor, grid: int) -> torch.Tensor:
         B, N, D = h.shape
-        x = self.conv_in(h.transpose(1, 2).reshape(B, D, grid, grid))      # row n = r * G + c -> [r, c]
+        if self.channels_last:                                               # NHWC view of the token grid
+            x = h.reshape(B, grid, grid, D).permute(0, 3, 1, 2)
+        else:
+            x = h.transpose(1, 2).reshape(B, D, grid, grid)                  # row n = r * G + c -> [r, c]
+        x = self.conv_in(x)
         for st in self.stages:
             x = st(x)
-        return self.conv_out(F.silu(self.n_out(x)))
+        out = self.conv_out(F.silu(self.n_out(x)))
+        return out.contiguous() if self.channels_last else out
 
 
 class QueryDecoder(nn.Module):
@@ -269,6 +286,7 @@ class QueryDecoder(nn.Module):
         super().__init__()
         assert cfg.delta_mode in ("mean", "query"), f"unknown delta_mode {cfg.delta_mode!r}"
         assert cfg.rgb_head in ("linear", "conv"), f"unknown rgb_head {cfg.rgb_head!r}"
+        assert cfg.window_read in ("dense", "gather"), f"unknown window_read {cfg.window_read!r}"
         self.ray_q = ZeroLinear(6, cfg.dec_dim)        # query rays for posed views; zero at init
         d = cfg.dec_dim
         self.cfg, self.grid, self.r = cfg, cfg.grid, cfg.read_window
@@ -300,7 +318,7 @@ class QueryDecoder(nn.Module):
             assert self.grid * 2 ** stages == cfg.image_size, (
                 f"conv_channels gives {stages} x2 stages: grid {self.grid} * 2^{stages} != image_size "
                 f"{cfg.image_size} (need len(conv_channels) = log2(patch) + 1 = {int(math.log2(cfg.patch)) + 1})")
-            self.rgb_conv = ConvUpsampler(d, tuple(cfg.conv_channels), cfg.conv_res_blocks)
+            self.rgb_conv = ConvUpsampler(d, tuple(cfg.conv_channels), cfg.conv_res_blocks, cfg.conv_channels_last)
         self.feat_head = nn.Linear(d, feat_dim)
 
     def compute_delta(self, d: Optional[torch.Tensor], q_coords: torch.Tensor,
@@ -346,11 +364,18 @@ class QueryDecoder(nn.Module):
         uv = torch.tensor(UV_MASK, device=q_mask.device, dtype=q_mask.dtype)
         q_m = q_mask * uv                                                      # (u, v) bits only
         q_pos = torch.cat([q_coords[..., :1], centre, q_coords[..., 3:]], -1)
-        N = c.shape[1]
-        c_pos = grid_coords(self.grid, 0.0, device=q_coords.device).to(q_coords.dtype)
-        c_pos = torch.cat([q_coords[:, :1, :1].expand(-1, N, -1), c_pos[None, :, 1:].expand(B, -1, -1)], -1)
-        c_m = q_m[:, :1].expand(-1, N, -1)                                     # cells share the queries' mask
-        win = (window_bias(centre, self.grid, self.r, c.dtype), q_pos, q_m, c_pos, c_m)
+        if self.cfg.window_read == "gather":                                   # the (2r+1)^2 cells per query
+            idx, valid, cell = gather_window(centre, self.grid, self.r)
+            W = idx.shape[-1]
+            k_pos = torch.cat([q_coords[..., :1].unsqueeze(2).expand(-1, -1, W, -1), cell.to(q_coords.dtype),
+                               torch.zeros(*cell.shape[:-1], 1, device=cell.device, dtype=q_coords.dtype)], -1)
+            win = (idx, valid, q_pos, k_pos, q_m, q_m.unsqueeze(2).expand(-1, -1, W, -1))
+        else:                                                                  # dense over all N cells, masked
+            N = c.shape[1]
+            c_pos = grid_coords(self.grid, 0.0, device=q_coords.device).to(q_coords.dtype)
+            c_pos = torch.cat([q_coords[:, :1, :1].expand(-1, N, -1), c_pos[None, :, 1:].expand(B, -1, -1)], -1)
+            c_m = q_m[:, :1].expand(-1, N, -1)                                 # cells share the queries' mask
+            win = (window_bias(centre, self.grid, self.r, c.dtype), q_pos, q_m, c_pos, c_m)
 
         h = self.query.expand(B, Q, -1).to(c.dtype)
         if q_rays is not None:

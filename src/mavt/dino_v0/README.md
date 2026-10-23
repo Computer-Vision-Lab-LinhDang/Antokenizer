@@ -32,7 +32,7 @@ Rules that define the C/D split (do not break them):
 
 | File | What it holds |
 |---|---|
-| `config.py` | `DinoV0Config`: every hyper-parameter; v1 flags in the "v1 phase 1" block; `tiny_config()` for CPU tests |
+| `config.py` | `DinoV0Config`: every hyper-parameter; v1 flags in the "v1 phase 1" and "v1 phase 2" blocks; `tiny_config()` for CPU tests |
 | `encoder.py` | frozen DINOv3 (local HF dir) + pixel stem; DINOv3 patch features are the `feat` targets |
 | `rope.py` | masked axial RoPE on (t, u, v, z); cos/sin tables built once per forward |
 | `trunk.py` | 8-layer trunk (in-frame + causal t-1 window attention); optional R2 learned relations (`rgat_relations`, off) |
@@ -69,6 +69,26 @@ Not in phase 1 (planned, see the v1 doc): a temporal objective for z_s on video,
 C_{k-K} -> C_k, ray-based global reads for novel 3D views, the event memory S (needs long clips, v2).
 They wait until dropping D costs at least ~2 dB on OpenVid at stride 4, i.e. until D is really used.
 
+## v1 phase 2: speed options (`configs/dino_v0/v1b_alpha.yaml`)
+
+The phase-1 model, unchanged; only how much of it runs per step. A phase-1 step decodes 688 full frames per
+GPU at 128 images + 16 clips x 8 frames + 16 objects x 4 views: 320 reconstructions, 224 forecasts (every
+(t, h) pair for h = 1 and 4) and 144 warp-only frames, each through the 4 decoder blocks and the conv head.
+Tests: `tests/dino_v0/test_speed_v1b.py` (old vs new outputs and gradients; defaults keep phase 1 bit-identical).
+
+| Flag | phase 1 (default) | phase 2 | What it does |
+|---|---|---|---|
+| `fut_frames_per_horizon` | 0 (every pair) | 2 | forecast loss on 2 random source frames per horizon per step (one draw per step, shared by the batch, so shapes are constant for `torch.compile`) |
+| `warp_frames` | 0 (every non-key frame) | 2 | warp-only loss on 2 random non-key frames per step |
+| `conv_channels_last` | false | true | conv rgb head and its input in channels_last: the token grid `[B, G, G, D]` already is the NHWC layout of `[B, D, G, G]`, so the convs run NHWC end to end and MIOpen / cuDNN skip the NCHW <-> NHWC transposes they otherwise insert around their NHWC kernels |
+| `window_read` | `dense` | `dense` | how the decoder reads the 5x5 C window: `dense` = masked SDPA over all 256 cells; `gather` = the 25 window cells gathered per query (the reference implementation, kept for tests) |
+
+`scripts/bench_window_read.py` measures the C read at training shapes (688 rows, 12 heads, bf16, fwd + bwd):
+on an MI355X the dense masked read takes 18.3 ms / 7.1 GB, within 5% of the same SDPA with no mask at all
+(17.4 ms), while the gathered read takes 196 ms / 69 GB (25 copies of k / v and their scatter-add backward).
+So the window read is not where the time goes and `dense` stays the default; `gather` is a correctness
+reference only.
+
 ## Commands
 
 ```bash
@@ -93,6 +113,10 @@ PYTHONPATH=src python scripts/eval_dino_v0.py --ckpt <run>/last.pt --device cuda
 # profile one GPU (step time, memory, top kernels); --modality image|video|threed|mixed
 PYTHONPATH=src python scripts/profile_dino_v0.py --config configs/dino_v0/v1_alpha.yaml --modality mixed \
     --batch-image 128 --batch-video 16 --batch-3d 16 --compile
+# the same with the phase-2 speed options: --config configs/dino_v0/v1b_alpha.yaml
+
+# the decoder's C read at training shapes: dense masked SDPA vs gathered window (fwd + bwd, bf16)
+PYTHONPATH=src python scripts/bench_window_read.py --rows 688
 ```
 
 Training logs (`<out>/log.jsonl`, one line per 20 steps) carry unweighted loss parts per modality
