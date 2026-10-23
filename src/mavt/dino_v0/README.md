@@ -115,6 +115,82 @@ Something-Something v2 (train split as unlabeled video; validation only for prob
 The v1 speed work roughly halved step time and memory of the v0 model on AMD MI355X: v0 passed 5-D
 tensors to SDPA and never reached the fused attention kernels.
 
+## Related papers
+
+Ids of the tokenizers, DINOv3, RAE, CMD, iVideoGPT, DCVC and Kimi Linear were checked on arXiv on
+23/10/2026; the others are long-standing references.
+
+**Closest tokenizers (baselines / positioning)**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| AToken: A Unified Tokenizer for Vision | [2509.14476](https://arxiv.org/abs/2509.14476) | one tokenizer for images, video, 3D; our budget (12,288 per image) and main baseline |
+| VideoTok4D: A 4D-Aware Video Tokenizer for Compact World Representation | [2609.12874](https://arxiv.org/abs/2609.12874) | static / dynamic query branches + track attention; closest to the C/D split |
+| VTok: A Unified Video Tokenizer with Decoupled Spatial-Temporal Latents | [2602.04202](https://arxiv.org/abs/2602.04202) | keyframe + temporal residual latents |
+| VidTok: A Versatile and Open-Source Video Tokenizer | [2412.13061](https://arxiv.org/abs/2412.13061) | video tokenizer baseline |
+| An Image is Worth 32 Tokens for Reconstruction and Generation (TiTok) | [2406.07550](https://arxiv.org/abs/2406.07550) | compact 1D image tokens |
+| HYDRA-X: Native Unified Multimodal Models with Holistic Visual Tokenizers | [2606.13289](https://arxiv.org/abs/2606.13289) | unified visual tokenizer for multimodal models |
+
+**Frozen features and semantic latents**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| DINOv3 | [2508.10104](https://arxiv.org/abs/2508.10104) | the frozen encoder (ViT-L/16) and the feat / CLS targets |
+| DINOv2: Learning Robust Visual Features without Supervision | [2304.07193](https://arxiv.org/abs/2304.07193) | predecessor; feature-space targets |
+| Reconstruction vs. Generation: Taming Optimization Dilemma in Latent Diffusion Models (VA-VAE) | [2501.01423](https://arxiv.org/abs/2501.01423) | aligning the latent to foundation features (planned for z_r) |
+| Diffusion Transformers with Representation Autoencoders (RAE) | [2510.11690](https://arxiv.org/abs/2510.11690) | decoding straight from frozen representation encoders |
+| High-Resolution Image Synthesis with Latent Diffusion Models (SD-VAE) | [2112.10752](https://arxiv.org/abs/2112.10752) | reconstruction target (~26 dB) and the conv decoder style |
+
+**Content vs motion, latent actions, codecs**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| Efficient Video Diffusion Models via Content-Frame Motion-Latent Decomposition (CMD) | [2403.14148](https://arxiv.org/abs/2403.14148) | content frame + motion latent, like C + D |
+| iVideoGPT: Interactive VideoGPTs are Scalable World Models | [2405.15223](https://arxiv.org/abs/2405.15223) | future frames tokenized conditioned on context frames |
+| Genie: Generative Interactive Environments | [2402.15391](https://arxiv.org/abs/2402.15391) | latent actions: D as an action-like bottleneck |
+| Deep Contextual Video Compression (DCVC) | [2109.15047](https://arxiv.org/abs/2109.15047) | neural codec: motion + residual (the hybrid fallback) |
+
+**Temporal objectives, world models, memory**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| Revisiting Feature Prediction for Learning Visual Representations from Video (V-JEPA) | [2404.08471](https://arxiv.org/abs/2404.08471) | feature prediction; planned temporal objective for video z_s |
+| V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning | [2506.09985](https://arxiv.org/abs/2506.09985) | same, at scale |
+| DINO-WM: World Models on Pre-trained Visual Features | [2411.04983](https://arxiv.org/abs/2411.04983) | forecasting in a frozen DINO space |
+| Mastering Diverse Domains through World Models (DreamerV3) | [2301.04104](https://arxiv.org/abs/2301.04104) | stochastic latent state |
+| Kimi Linear: An Expressive, Efficient Attention Architecture (KDA) | [2510.26692](https://arxiv.org/abs/2510.26692) | event memory S (v2) |
+| Gated Delta Networks: Improving Mamba2 with Delta Rule | [2412.06464](https://arxiv.org/abs/2412.06464) | delta-rule linear attention behind KDA |
+
+**Views and rays (3D)**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| LVSM: A Large View Synthesis Model with Minimal 3D Inductive Bias | [2410.17242](https://arxiv.org/abs/2410.17242) | global ray-conditioned reads for novel views (planned) |
+| Light Field Networks | [2106.02634](https://arxiv.org/abs/2106.02634) | Plücker ray embedding |
+
+**Building blocks, losses, diagnostics**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| RoFormer: Enhanced Transformer with Rotary Position Embedding | [2104.09864](https://arxiv.org/abs/2104.09864) | axial RoPE on (t, u, v, z) |
+| Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (MMDiT) | [2403.03206](https://arxiv.org/abs/2403.03206) | joint attention with per-stream weights (considered for C / D) |
+| VICReg | [2105.04906](https://arxiv.org/abs/2105.04906) | variance / covariance loss on C |
+| The Unreasonable Effectiveness of Deep Features as a Perceptual Metric (LPIPS) | [1801.03924](https://arxiv.org/abs/1801.03924) | perceptual loss and metric |
+| A Neural Algorithm of Artistic Style (Gram loss) | [1508.06576](https://arxiv.org/abs/1508.06576) | Gram texture loss |
+| RAFT: Recurrent All-Pairs Field Transforms for Optical Flow | [2003.12039](https://arxiv.org/abs/2003.12039) | flow reference to check Δ (eval only) |
+| FlashAttention | [2205.14135](https://arxiv.org/abs/2205.14135) | fused attention kernels (SDPA) |
+
+**Data**
+
+| Paper | arXiv | Why it matters here |
+|---|---|---|
+| OpenVid-1M | [2407.02371](https://arxiv.org/abs/2407.02371) | training video at original resolution |
+| The "something something" video database (SSv2) | [1706.04261](https://arxiv.org/abs/1706.04261) | unlabeled training video (train split) + temporal probes (val) |
+| Objaverse: A Universe of Annotated 3D Objects | [2212.08051](https://arxiv.org/abs/2212.08051) | posed object views |
+
+Not verified: "Co4DGen" (asymmetric static / dynamic attention routing, cited in VideoTok4D Fig. 3) and
+"TivTok" (named in our early notes); no arXiv entry found under these names. ImageNet: Deng et al., CVPR 2009.
+
 ## Working rules for people and agents
 
 - Develop on the PR branch; keep v0 behaviour bit-identical when the v1 flags are off (tests check it).
