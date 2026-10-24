@@ -82,6 +82,10 @@ class DinoV0Config:
     window_read: str = "dense"           # decoder's C read: "dense" = masked SDPA over all N cells; "gather" = the (2r+1)^2 window cells per query
     # ---- v1 phase 3: variable-length D by nested dropout (default off) ----
     d_nested: bool = False               # train: each clip keeps a random prefix of 0..M D tokens (fixed order) per step, the rest are masked in every read of D; a learned null token makes the empty prefix a valid code
+    # ---- spike: D tokens anchored to nodes of the C grid (graph), default off ----
+    d_drop: str = "prefix"               # with d_nested: "prefix" (nested dropout) | "bernoulli" (per clip keep rate p ~ U(0, 1), each token kept with p, shared by the clip's frames)
+    d_anchor: int = 0                    # 0: off; a > 0: D token k lives on node k of an a x a grid over the C cells (d_tokens == a * a); a query reads only the tokens of its node's neighbourhood, D-D attention runs along node edges, D reads X / C only near its node
+    d_anchor_radius: int = 1             # node neighbourhood (Chebyshev radius on the a x a node grid)
     extra: dict = field(default_factory=dict)
 
     @property

@@ -78,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--resume", default="auto", help="auto (out/last.pt if present) | none | <path>")
+    p.add_argument("--init-from", default=None,
+                   help="checkpoint whose model weights start a NEW run (fresh optimizer and schedule at step 0); "
+                        "ignored once the run has its own checkpoint to resume")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
     # ---- speed: mixed-modality steps, DDP, compile
@@ -234,6 +237,16 @@ def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None) -> int:
         for g, f in zip(opt.param_groups, sched.lr_lambdas):
             g["initial_lr"] = lr
             g["lr"] = lr * f(sched.last_epoch)
+    return int(ck["step"])
+
+
+def load_weights(path: str, model) -> int:
+    """--init-from: model weights only (strict except the frozen encoder); returns the source step."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+    missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+    if missing or unexpected:
+        raise RuntimeError(f"checkpoint mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
     return int(ck["step"])
 
 
@@ -480,6 +493,9 @@ def main(argv=None) -> int:
         step = load_ckpt(resume, model, opt, sched, lr=args.lr)
         set_fused(opt, fused)
         log(f"resumed from {resume} at step {step}")
+    elif args.init_from:
+        src_step = load_weights(args.init_from, model)
+        log(f"weights from {args.init_from} (step {src_step}); optimizer and schedule start at step 0")
     use_amp = args.bf16 and dev.type == "cuda"
     mixed = args.mix_modalities
 

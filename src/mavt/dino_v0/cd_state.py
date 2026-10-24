@@ -85,6 +85,23 @@ def neighbourhood_mask(grid: int, radius: int = 1, device=None) -> torch.Tensor:
     return ((row[:, None] - row[None, :]).abs() <= radius) & ((col[:, None] - col[None, :]).abs() <= radius)
 
 
+def anchor_neighbours(cfg: DinoV0Config, device=None) -> torch.Tensor:
+    """d_anchor: [a*a, a*a] bool node edges (Chebyshev radius d_anchor_radius on the a x a node grid);
+    D token k sits on node k = row * a + col."""
+    a = cfg.d_anchor
+    if cfg.d_tokens != a * a or cfg.grid % a:
+        raise ValueError(f"d_anchor {a}: needs d_tokens == {a * a} and grid {cfg.grid} divisible by {a}")
+    return neighbourhood_mask(a, cfg.d_anchor_radius, device)
+
+
+def anchor_cells(cfg: DinoV0Config, device=None) -> torch.Tensor:
+    """d_anchor: [a*a, N] bool, token k may read cell j iff j's node is a neighbour of k's node."""
+    a, g = cfg.d_anchor, cfg.grid
+    r = torch.arange(g, device=device) // (g // a)
+    cell_node = r.repeat_interleave(g) * a + r.repeat(g)                 # [N] node of each cell
+    return anchor_neighbours(cfg, device)[:, cell_node]
+
+
 # ----------------------------------------------------------------------------------------
 # C: built at each keyframe from X_k only
 # ----------------------------------------------------------------------------------------
@@ -150,15 +167,22 @@ class DBlock(nn.Module):
         self.nq, self.cross = nn.LayerNorm(d), Attention(d, h)
         self.nm, self.mlp = nn.LayerNorm(d), MLP(d, cfg.mlp_ratio)
 
-    def forward(self, D: torch.Tensor, ctx: list, include_self: bool) -> torch.Tensor:
+    def forward(self, D: torch.Tensor, ctx: list, include_self: bool,
+                ctx_mask: Optional[torch.Tensor] = None, dd_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # d_anchor: ctx_mask [M, N] bool (same for every ctx), dd_mask [M, M] bool; None = full attention
         if self.self_first:
             h = self.ns(D)
-            D = D + self.self_attn(h, h)
+            D = D + self.self_attn(h, h, attn_mask=dd_mask)
         h = self.nq(D)
         kv = [p(n(x)) for x, n, p in zip(ctx, self.ctx_norm, self.ctx_proj)]
+        mask = None
+        if ctx_mask is not None:
+            mask = [ctx_mask] * len(kv)
         if include_self:
             kv.append(h)
-        D = D + self.cross(h, torch.cat(kv, 1))
+            if mask is not None:
+                mask.append(dd_mask)
+        D = D + self.cross(h, torch.cat(kv, 1), attn_mask=None if mask is None else torch.cat(mask, 1))
         return D + self.mlp(self.nm(D))
 
 
@@ -194,6 +218,11 @@ class DState(nn.Module):
         else:
             self.register_parameter("h_emb", None)
         self.fut_out = ZeroLinear(cfg.d_dim, cfg.d_dim) if self.residual else None
+        if cfg.d_anchor:                                         # D on graph nodes: edges only, not saved
+            self.register_buffer("dd_mask", anchor_neighbours(cfg), persistent=False)
+            self.register_buffer("dc_mask", anchor_cells(cfg), persistent=False)
+        else:
+            self.dd_mask = self.dc_mask = None
 
     def init(self, B: int, dtype=None) -> torch.Tensor:
         D = self.d0.unsqueeze(0).expand(B, -1, -1)
@@ -211,14 +240,14 @@ class DState(nn.Module):
         if self.h_emb is not None:
             e = self.h_emb[h].to(x.dtype)                        # [d] or [B, d]
             x = x + (e.unsqueeze(1) if e.dim() == 2 else e)
-        y = self.pred(x, [C_k], include_self=False)
+        y = self.pred(x, [C_k], include_self=False, ctx_mask=self.dc_mask, dd_mask=self.dd_mask)
         return D_prev + self.fut_out(y) if self.residual else y
 
     def correct(self, D_hat: torch.Tensor, x_t: torch.Tensor, C_k: torch.Tensor) -> torch.Tensor:
         """D_hat [B, M, d], x_t / C_k [B, N, dim] -> D_t [B, M, d] (attn over [X_t ; C_k ; D])."""
         D = D_hat
         for blk in self.corr:
-            D = blk(D, [x_t, C_k], include_self=True)
+            D = blk(D, [x_t, C_k], include_self=True, ctx_mask=self.dc_mask, dd_mask=self.dd_mask)
         return D
 
     def up(self, D: torch.Tensor) -> torch.Tensor:

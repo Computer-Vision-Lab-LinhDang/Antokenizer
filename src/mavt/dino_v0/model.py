@@ -158,7 +158,8 @@ class MAVTDinoV0(nn.Module):
         idx [B,Q] | None (all N queries in row-major order; the conv rgb head needs None),
         rays [B,N,6] of the target view (posed views) | None, warp_only: gate locked to 1 (C read at
         (u, v) + Δ only), zd_len [B] long | None: each row reads only its first zd_len D tokens (nested
-        dropout; 0 needs cfg.d_nested). Returns the decoder dict; "image" [B,3,H,W] is the conv head's
+        dropout; 0 needs cfg.d_nested), or [B, M] bool: the D tokens each row keeps (d_drop "bernoulli").
+        Returns the decoder dict; "image" [B,3,H,W] is the conv head's
         output, or the patches put together when idx is None (linear head), else None."""
         mm = _mm(modality)
         B = zc.shape[0]
@@ -188,7 +189,7 @@ class MAVTDinoV0(nn.Module):
         B, N = e["frames"].shape[0], cfg.n_patches
         zc = e["zc"][:, e["state"]["seg"][src]].flatten(0, 1)
         zd = None if zd is None else zd.flatten(0, 1)
-        rows_len = None if zd_len is None or zd is None else zd_len.repeat_interleave(int(dst.numel()))
+        rows_len = None if zd_len is None or zd is None else zd_len.repeat_interleave(int(dst.numel()), dim=0)
         rays = None if e["rays"] is None else e["rays"][:, dst].flatten(0, 1)
         img = e["frames"][:, dst].flatten(0, 1)
         feat = e["feat_target"][:, dst].flatten(0, 1)
@@ -227,10 +228,14 @@ class MAVTDinoV0(nn.Module):
         key = tt % cfg.keyframe_every == 0
         parts, diag = {}, {}
 
-        # ---- nested dropout: one D prefix length per clip and step, used by every decode of the step
+        # ---- nested dropout: one D prefix length (or keep mask) per clip and step, used by every decode of the step
         zd_len = None
         if cfg.d_nested and self.training and seq and e.get("zd") is not None:
-            zd_len = torch.randint(0, cfg.d_tokens + 1, (B,), device=data.device)
+            if cfg.d_drop == "bernoulli":                                       # keep rate p ~ U(0, 1) per clip
+                p = torch.rand(B, 1, device=data.device)
+                zd_len = torch.rand(B, cfg.d_tokens, device=data.device) < p
+            else:
+                zd_len = torch.randint(0, cfg.d_tokens + 1, (B,), device=data.device)
             mu = e["kl_d"][0].detach().float()                                      # [B*T, M, zr_d]
             en, q = mu.pow(2).mean((0, 2)), max(1, cfg.d_tokens // 4)             # energy by token order
             diag["zd_energy_head"], diag["zd_energy_tail"] = en[:q].mean(), en[-q:].mean()

@@ -39,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .camera import ZeroLinear
+from .cd_state import anchor_neighbours
 from .config import DinoV0Config
 from .rope import AxialRoPE, grid_coords
 
@@ -184,14 +185,14 @@ class _Attn(nn.Module):
         self.rope = rope
 
     def forward(self, x, ctx, q_pos=None, q_m=None, k_pos=None, k_m=None, k_valid=None):
-        # k_valid [B, N] bool | None: the keys each row may attend to (a prefix of the D tokens)
+        # k_valid [B, N] or [B, Q, N] bool | None: the keys each row (or each query) may attend to
         B, Q, D = x.shape
         N = ctx.shape[1]
         q = self.q(x).view(B, Q, self.h, self.hd).transpose(1, 2)
         k, v = self.kv(ctx).view(B, N, 2, self.h, self.hd).permute(2, 0, 3, 1, 4)
         if self.rope is not None and q_pos is not None:
             q, k = self.rope(q, q_pos, q_m), self.rope(k, k_pos, k_m)
-        mask = None if k_valid is None else k_valid[:, None, None, :]
+        mask = None if k_valid is None else (k_valid[:, None, None, :] if k_valid.dim() == 2 else k_valid[:, None])
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.o(out.transpose(1, 2).reshape(B, Q, D))
 
@@ -207,7 +208,8 @@ class DecoderBlock(nn.Module):
         self.n_s, self.self_attn = nn.LayerNorm(d), _Attn(d, cfg.dec_heads, rope)
         self.n_m, self.mlp = nn.LayerNorm(d), _MLP(d, cfg.mlp_ratio)
 
-    def forward(self, h, c, d, win, q_coords, q_mask, d_valid=None):
+    def forward(self, h, c, d, win, q_coords, q_mask, d_valid=None, qq_valid=None):
+        # qq_valid [B, Q, Q] bool | None (d_anchor): the queries each query's self-attention may read
         hn = self.n_q(h)
         rc = self.read_c.read(hn, self.n_c(c), win)
         if d is None:
@@ -218,7 +220,7 @@ class DecoderBlock(nn.Module):
             o = torch.sigmoid(self.gate(torch.cat([hn, rc], -1)))
             h = h + o * rc + (1 - o) * rd
         hs = self.n_s(h)
-        h = h + self.self_attn(hs, hs, q_coords, q_mask, q_coords, q_mask)
+        h = h + self.self_attn(hs, hs, q_coords, q_mask, q_coords, q_mask, k_valid=qq_valid)
         h = h + self.mlp(self.n_m(h))
         return h, o
 
@@ -297,6 +299,8 @@ class QueryDecoder(nn.Module):
         self.in_d = nn.Linear(cfg.zr_d, d)
         if cfg.d_nested:                               # always-visible null token: the empty prefix reads it alone
             self.d_null = nn.Parameter(torch.zeros(1, 1, d))
+        if cfg.d_anchor:                               # node i may read token k: [a*a, a*a] bool, not saved
+            self.register_buffer("d_nbr", anchor_neighbours(cfg), persistent=False)
         self.query = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.n_fourier = 8
         nf = 2 + 4 * self.n_fourier
@@ -339,12 +343,33 @@ class QueryDecoder(nn.Module):
         if zd_len is None:
             return d, None
         zd_len = zd_len.to(d.device)
-        if null is None and bool((zd_len <= 0).any()):
+        if zd_len.dtype == torch.bool:                                     # [B, M] keep mask (d_drop "bernoulli")
+            valid = zd_len
+            empty = ~valid.any(1)
+        else:
+            valid = torch.arange(M, device=d.device)[None] < zd_len[:, None]   # [B,M]
+            empty = zd_len <= 0
+        if null is None and bool(empty.any()):
             raise ValueError("an empty D prefix needs d_nested (the null token): without it a row has no key to read")
-        valid = torch.arange(M, device=d.device)[None] < zd_len[:, None]   # [B,M]
         if null is not None:
             valid = torch.cat([valid, valid.new_ones(B, 1)], 1)
         return d, valid
+
+    def anchor_masks(self, valid: Optional[torch.Tensor], q_coords: torch.Tensor, M: int) -> tuple:
+        """d_anchor -> (d_valid [B, Q, M (+1)], qq_valid [B, Q, Q]) bool. Query q may read token k iff k's node is in
+        the neighbourhood of the node holding q's cell (u, v) and `valid` [B, M (+1)] | None keeps k (the null token
+        stays visible); query q may read query j in self-attention iff their nodes are neighbours, so a token's
+        effect travels only along node edges."""
+        a = self.cfg.d_anchor
+        uv = (q_coords[..., 1:3].float() * a).floor().long().clamp(0, a - 1)   # [B,Q,2] (col, row)
+        node = uv[..., 1] * a + uv[..., 0]
+        qq = self.d_nbr[node[:, :, None], node[:, None, :]]
+        m = self.d_nbr[node]                                                    # [B,Q,a*a]
+        if valid is not None:
+            m = m & valid[:, None, :m.shape[-1]]
+        if M > m.shape[-1]:                                                     # null token
+            m = torch.cat([m, m.new_ones(*m.shape[:2], M - m.shape[-1])], -1)
+        return m, qq
 
     def compute_delta(self, d: Optional[torch.Tensor], q_coords: torch.Tensor,
                       q_rays: Optional[torch.Tensor] = None, d_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -356,6 +381,9 @@ class QueryDecoder(nn.Module):
         if self.cfg.delta_mode == "mean":
             if d_valid is None:
                 dm = d.mean(1, keepdim=True)
+            elif d_valid.dim() == 3:                                           # per-query mask (d_anchor)
+                w = d_valid.to(d.dtype)
+                dm = (w @ d) / w.sum(-1, keepdim=True)
             else:
                 w = d_valid.to(d.dtype).unsqueeze(-1)
                 dm = (d * w).sum(1, keepdim=True) / w.sum(1, keepdim=True)
@@ -389,6 +417,9 @@ class QueryDecoder(nn.Module):
             assert zc.shape[-1] == self.cfg.zr_c_video, "video zc must have zr_c_video channels"
             c = self.in_c_video(zc)
         d, d_valid = self.d_tokens(zd, zd_len)
+        qq_valid = None
+        if d is not None and self.cfg.d_anchor:                                # images (no D) keep full self-attention
+            d_valid, qq_valid = self.anchor_masks(d_valid, q_coords, d.shape[1])
         delta = self.compute_delta(d, q_coords, q_rays, d_valid) if delta_override is None else delta_override
 
         # window read of C at the shifted centre (computed once, shared by all blocks)
@@ -415,7 +446,7 @@ class QueryDecoder(nn.Module):
         d_blk = None if warp_only else d                                       # warp-only: D acts via Δ alone
         gate = None
         for blk in self.blocks:
-            h, gate = blk(h, c, d_blk, win, q_coords, q_mask, d_valid)
+            h, gate = blk(h, c, d_blk, win, q_coords, q_mask, d_valid, qq_valid)
         h = self.norm(h)
         if self.cfg.rgb_head == "linear":
             rgb, image = self.rgb_head(h), None
