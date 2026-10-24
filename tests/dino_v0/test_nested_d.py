@@ -218,6 +218,15 @@ def test_video_pass_sweeps_the_prefix_length():
     assert not any(k.startswith("psnr_dlen") for k in plain)
 
 
+def test_video_pass_sweeps_given_prefix_lengths():
+    cfg = _v1(d_nested=True)
+    m = _model(cfg).eval()
+    v = E.video_pass(m, E.make_loader(_Clips(2), 2), "cpu", prefix_lens=[2, 0, 1])
+    assert sorted(k for k in v if k.startswith("psnr_dlen") and k[9:].isdigit()) == ["psnr_dlen0", "psnr_dlen1", "psnr_dlen2"]
+    with pytest.raises(AssertionError):
+        E.video_pass(m, E.make_loader(_Clips(2), 2), "cpu", prefix_lens=[cfg.d_tokens + 1])
+
+
 # ---------------------------------------------------------------------------- the run config
 def test_v1c_alpha_yaml():
     yaml = pytest.importorskip("yaml")

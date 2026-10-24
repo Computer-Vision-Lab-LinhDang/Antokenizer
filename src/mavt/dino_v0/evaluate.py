@@ -349,7 +349,8 @@ KINDS = ("", "_key", "_nonkey")       # all frames, keyframes (t % K == 0), the 
 
 @torch.no_grad()
 def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Optional[int] = None,
-               log: Optional[Logger] = None, per_clip: bool = True) -> dict:
+               log: Optional[Logger] = None, per_clip: bool = True,
+               prefix_lens: Optional[Sequence[int]] = None) -> dict:
     """Per-frame reconstruction, C/D split diagnostics and forecasts on video clips [B, 3, T, H, W].
 
     Every per-frame metric m is averaged over all frames (m), keyframes (m_key) and the other frames
@@ -368,7 +369,11 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
     if not can_warp:
         skipped["warp"] = "psnr_warp skipped: model.decode_frame has no warp_only"
     # distortion vs D prefix length (nested dropout): every frame decoded with 0 .. M D tokens
-    lens = prefix_lengths(cfg.d_tokens) if getattr(cfg, "d_nested", False) and accepts_kwarg(model.decode_frame, "zd_len") else []
+    # prefix_lens: the lengths to sweep (default prefix_lengths(M)); 0 needs the null token of d_nested
+    lens = prefix_lengths(cfg.d_tokens) if prefix_lens is None else sorted(set(int(n) for n in prefix_lens))
+    assert all(0 <= n <= cfg.d_tokens for n in lens), f"D prefix lengths {lens} outside 0..{cfg.d_tokens}"
+    if not (getattr(cfg, "d_nested", False) and accepts_kwarg(model.decode_frame, "zd_len")):
+        lens = []
     horizons, strides = set(), set()
 
     def dec(zc, zd, t, **kw):
@@ -636,7 +641,8 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
              video_limit: Optional[int] = None, knn_k: int = 20, knn_t: float = 0.07,
              num_classes: Optional[int] = None, probe_epochs: int = 10,
              probe_lrs: Sequence[float] = (1e-3, 3e-3, 1e-2, 3e-2), use_lpips: bool = True,
-             use_fid: bool = True, extra_video: Optional[dict] = None, log: Optional[Logger] = None) -> dict:
+             use_fid: bool = True, extra_video: Optional[dict] = None, log: Optional[Logger] = None,
+             prefix_lens: Optional[Sequence[int]] = None) -> dict:
     """Run every eval whose dataset (or ready DataLoader) is given. extra_video: {name: dataset | None}."""
     log = log or Logger()
     cfg: DinoV0Config = model.cfg
@@ -671,7 +677,7 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
 
     if video is not None:
         res["video_recon"] = video_pass(model, as_loader(video, video_batch_size, num_workers), device,
-                                        amp=amp, limit=video_limit, log=log)
+                                        amp=amp, limit=video_limit, log=log, prefix_lens=prefix_lens)
         note_skipped("video_recon")
         log(f"video recon: {json.dumps({k: v for k, v in res['video_recon'].items() if k != 'per_clip'})}",
             force=True)
@@ -682,7 +688,7 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
             log(msg, force=True)
             continue
         res[f"video_{name}"] = video_pass(model, as_loader(ds, video_batch_size, num_workers), device,
-                                          amp=amp, limit=video_limit, log=log)
+                                          amp=amp, limit=video_limit, log=log, prefix_lens=prefix_lens)
         note_skipped(f"video_{name}")
     return res
 

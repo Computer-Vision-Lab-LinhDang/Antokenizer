@@ -159,6 +159,9 @@ def main():
                     help="fixed frame stride of every video eval (e.g. 2, 4, 8)")
     ap.add_argument("--ssv2", default=None, help="SSv2 manifest jsonl (OpenVid format); skipped if absent")
     ap.add_argument("--kinetics", default=None, help="Kinetics manifest jsonl (OpenVid format); skipped if absent")
+    ap.add_argument("--d-prefix-lens", default=None,
+                    help="d_nested models: comma list of D prefix lengths to sweep, e.g. 0,1,2,4,8 "
+                         "(default 0, M/8, M/4, M/2, 3M/4, M)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -207,7 +210,8 @@ def main():
                      amp=args.amp, limit=args.limit, video_limit=args.video_limit, knn_k=args.knn_k,
                      knn_t=args.knn_t, num_classes=1000 if image_train is not None else None,
                      probe_epochs=args.probe_epochs, probe_lrs=[float(x) for x in args.probe_lrs.split(",")],
-                     use_lpips=not args.no_lpips, use_fid=not args.no_fid, extra_video=extra)
+                     use_lpips=not args.no_lpips, use_fid=not args.no_fid, extra_video=extra,
+                     prefix_lens=None if args.d_prefix_lens is None else [int(x) for x in args.d_prefix_lens.split(",")])
     for name, ds in (("openvid", video), *extra.items()):
         msg = short_clip_note(name, ds, args.video_frames, args.frame_stride) if ds is not None else None
         if msg:
