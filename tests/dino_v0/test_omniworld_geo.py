@@ -104,6 +104,18 @@ def test_dynamic_targets_follow_the_chained_flow():
     assert tg["valid"][0, 1, 0, 0] and np.allclose(tg["corr"][0, 1, 0, 0], 0)   # static cells: no shift
 
 
+def test_moving_mask_flags_undetected_movers_but_not_depth_edges():
+    h = w = 16
+    depth = np.full((h, w), 2.0, np.float32)
+    depth[:, 8:] = 6.0                                              # a depth edge between columns 7 and 8
+    flow = np.zeros((h, w, 2), np.float32)                          # camera still: rigid flow is 0
+    flow[2:6, 2:6, 0] = 5.0                                         # a mover gdino missed
+    flow[:, 7:9, 1] = 4.0                                           # flow noise on the depth edge
+    K, P = _cam(), _pose()
+    mv = O.moving_mask(depth, flow, K, P, K, P)
+    assert mv[2:6, 2:6].all() and not mv[:, 7:9].any() and mv.sum() == 16
+
+
 # ---------------------------------------------------------------------------- dataset on a tiny pack
 def _tiny_pack(root, F=12, H=64, W=96):
     from PIL import Image
@@ -144,6 +156,10 @@ def test_dataset_clip_layout(tmp_path):
     for i in range(len(ds)):                                        # the broken pair (9 -> 10) is never in a clip
         si, j0, ps = ds._draw(i, random.Random(i)) or (None, 0, 1)
         assert si is None or not (j0 <= 9 < j0 + 3 * ps)
+    small = O.OmniWorldClips(root, "train", n_frames=4, frame_stride="2,4", size=64, cell=16, keyframe_every=2,
+                             cache_segments=0)
+    small[0]
+    assert len(small._cache) == 0                                   # bounded cache: maps are released
     train = O.OmniWorldClips(root, "train", n_frames=4, frame_stride="2,4", size=64, cell=16, keyframe_every=2)
     offs = {int(round(47.5 - float(train[0]["K"][0, 0, 2]))) for _ in range(20)}
     assert offs <= {0, 16, 32} and len(offs) > 1                     # random crops on the cell grid

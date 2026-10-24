@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 import math
 import os
 import random
@@ -48,6 +49,8 @@ MAX_PAIR_ABSREL = 0.05           # v6: broken cameras show 9-30 % median depth A
 MIN_STATIC = 8                   # of the AUX x AUX = 16 pixels of a cell (at cell = 16 px)
 MIN_DYN = 4
 MAX_SPREAD = 16.0                # px: landed samples of one dynamic cell must agree within one cell
+MOVE_PX = 2.0                    # a pixel whose flow differs from the rigid flow by more than this moves (moving_mask)
+EDGE_LOG_DEPTH = 0.1             # |log z| jump to a 4-neighbour that marks a depth edge (flow sampling is unreliable there)
 
 
 # ---------------------------------------------------------------------------- source decoding (packer)
@@ -166,6 +169,28 @@ def depth_absrel(depth_a: np.ndarray, K_a, c2w_a, depth_b: np.ndarray, K_b, c2w_
     return float(np.median(np.abs(zb[ok][inside][hit] - ref[hit]) / ref[hit]))
 
 
+def moving_mask(depth: np.ndarray, flow: np.ndarray, K_a, c2w_a, K_b, c2w_b, offset: int = 0) -> np.ndarray:
+    """[h, w] bool: pixels of view a whose flow to view b differs from the rigid (camera-only) flow by > MOVE_PX,
+    away from depth edges. gdino masks miss some movers: on 8 scenes 5 % of its 'static' pixels disagree, 67 % of
+    them on depth edges (aux-grid sampling) and 25 % in clusters off edges (movers). depth [h, w] on a crop starting
+    offset px into the frame of flow [h, W', 2]; K for the crop."""
+    h, w = depth.shape
+    xs, ys = aux_centres(h, w)
+    xb, yb, zb = project(xs, ys, depth.astype(np.float64), K_a, c2w_a, K_b, c2w_b)
+    a0 = offset // AUX
+    f = np.asarray(flow[:, a0:a0 + w], np.float32)
+    ok = (depth > 0) & (zb > 1e-6) & np.isfinite(f).all(-1)
+    err = np.linalg.norm(np.nan_to_num(f) - np.stack([xb - xs, yb - ys], -1), axis=-1)
+    lz = np.log(np.maximum(depth.astype(np.float64), 1e-3))
+    g = np.zeros_like(lz)
+    dx, dy = np.abs(np.diff(lz, axis=1)), np.abs(np.diff(lz, axis=0))
+    for sl_a, sl_b, d in (((slice(None), slice(1, None)), (slice(None), slice(None, -1)), dx),
+                          ((slice(1, None),), (slice(None, -1),), dy)):
+        np.maximum(g[sl_a], d, out=g[sl_a])                         # both pixels of each jump are on the edge
+        np.maximum(g[sl_b], d, out=g[sl_b])
+    return ok & (err > MOVE_PX) & (g <= EDGE_LOG_DEPTH)
+
+
 # ---------------------------------------------------------------------------- geometry targets (dataset)
 def chain_flow(flows: Sequence[np.ndarray], x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Move image-px points (x, y) through consecutive forward flows (each [h, w, 2] on the aux grid, image px).
@@ -266,7 +291,7 @@ class OmniWorldClips(Dataset):
 
     def __init__(self, root: str, split: str = "train", n_frames: int = 8, frame_stride=2, size: int = 256,
                  cell: int = 16, keyframe_every: int = 4, train: bool = True, chunk: int = 16, max_retries: int = 20,
-                 eval_stride: Optional[int] = None):
+                 eval_stride: Optional[int] = None, cache_segments: int = 64):
         from .data import parse_strides
         self.root = os.path.join(root, split)
         with open(os.path.join(self.root, "pack.json")) as f:
@@ -295,20 +320,28 @@ class OmniWorldClips(Dataset):
         if not self.items:
             raise RuntimeError(f"no clips under {self.root}")
         self._rng = random.Random()
-        self._cache: dict = {}
+        self._cache: OrderedDict = OrderedDict()                  # LRU: each segment holds 3 open memory maps
+        self.cache_segments = cache_segments
 
     def __len__(self) -> int:
         return len(self.items)
 
     def _seg(self, si: int) -> dict:
-        if si not in self._cache:                                   # memory-mapped: only the clip's frames are read
-            uid, name = self.segs[si]
-            d = os.path.join(self.root, uid, name)
-            m = np.load(os.path.join(d, "meta.npz"))
-            self._cache[si] = dict(uid=uid, meta={k: m[k] for k in m.files},
-                                   **{k: np.load(os.path.join(d, f"{k}.npy"), mmap_mode="r")
-                                      for k in ("depth", "dyn", "flow")})
-        return self._cache[si]
+        """A segment's meta and memory-mapped arrays (only the clip's frames are read). The cache is bounded:
+        3 open maps per segment, and the 3,609 train segments would pass a 1024 open-file limit."""
+        if si in self._cache:
+            self._cache.move_to_end(si)
+            return self._cache[si]
+        uid, name = self.segs[si]
+        d = os.path.join(self.root, uid, name)
+        with np.load(os.path.join(d, "meta.npz")) as m:
+            meta = {k: m[k] for k in m.files}
+        seg = dict(uid=uid, meta=meta, **{k: np.load(os.path.join(d, f"{k}.npy"), mmap_mode="r")
+                                          for k in ("depth", "dyn", "flow")})
+        self._cache[si] = seg
+        while len(self._cache) > self.cache_segments:
+            self._cache.popitem(last=False)
+        return seg
 
     def _draw(self, i: int, rng: random.Random) -> Optional[tuple]:
         si, a = self.items[i]
@@ -352,6 +385,12 @@ class OmniWorldClips(Dataset):
         a0, a1 = off // AUX, (off + S) // AUX
         depth = np.asarray(s["depth"][idx][:, :S // AUX, a0:a1], np.float32)
         dyn = np.asarray(s["dyn"][idx][:, :S // AUX, a0:a1], np.float32) / 255.0
+        Kf, F = meta["K"].copy(), len(meta["frames"])
+        Kf[:, 0, 2] -= off
+        for t, p in enumerate(idx):                                 # movers gdino missed: flow vs rigid flow
+            if p + 1 < F and np.isfinite(meta["pair_epe"][p]):
+                mv = moving_mask(depth[t], s["flow"][p], Kf[p], meta["c2w"][p], Kf[p + 1], meta["c2w"][p + 1], off)
+                dyn[t] = np.maximum(dyn[t], mv)
         keys = list(range(0, self.n_frames, self.K))
         chains = {}
         if np.isfinite(meta["pair_epe"][j0:idx[-1]]).all():         # flow known for every step of the clip
