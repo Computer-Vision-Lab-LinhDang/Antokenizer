@@ -201,6 +201,30 @@ class MAVTDinoV0(nn.Module):
             rgb, feat = _gather(rgb, idx), _gather(feat, idx)
         return o, dict(img=img, rgb=rgb, feat=feat)
 
+    def _geo(self, o: dict, src: torch.Tensor, dst: torch.Tensor, geo: dict) -> tuple:
+        """Decoder-shift loss of rows (b, src, dst), b-major, against geo['corr'] of keyframe (src // K) at frame dst
+        (omniworld.py), plus diags (cells): epe on static / dynamic valid cells, valid shares."""
+        cfg, G = self.cfg, self.cfg.grid
+        k = torch.div(src, cfg.keyframe_every, rounding_mode="floor")
+        tgt = geo["corr"][:, k, dst].flatten(0, 1).flatten(1, 2)                 # [B*T', N, 2]
+        val = geo["valid"][:, k, dst].flatten(0, 1).flatten(1, 2)
+        dyn = geo["dyncell"][:, dst].flatten(0, 1).flatten(1, 2)
+        loss = L.geo_delta(o["delta"], tgt, val, G, cfg.geo_huber)
+        with torch.no_grad():
+            err = ((o["delta"].float() - tgt.float()) * G).norm(dim=-1)
+            st, dy = val & ~dyn, val & dyn
+            mean = lambda m: (err * m).sum() / m.sum().clamp_min(1)              # noqa: E731
+            diag = dict(epe_static=mean(st), epe_dyn=mean(dy), valid=val.float().mean(), valid_dyn=dy.float().mean(),
+                        target_cells=(tgt.float().norm(dim=-1) * G * val).sum() / val.sum().clamp_min(1))
+        return loss, diag
+
+    def _depth_loss(self, o: dict, geo: dict, B: int, T: int) -> torch.Tensor:
+        """Scale-invariant loss of the depth head on the reconstruction rows against geo['depth'] [B,T,h,h]."""
+        G, sub = self.cfg.grid, self.cfg.patch // 4
+        gt = geo["depth"].unflatten(-2, (G, sub)).unflatten(-1, (G, sub))        # [B,T,G,sub,G,sub]
+        gt = gt.permute(0, 1, 2, 4, 3, 5).reshape(B * T, -1)                    # rows, (cell, sub-cell) row-major
+        return L.silog(o["depth"].flatten(1), gt)
+
     @staticmethod
     def _rgb_pair(o: dict, tg: dict) -> tuple:
         """(prediction, target) of the rgb L1: full images when decoded, else the query patches."""
@@ -217,7 +241,10 @@ class MAVTDinoV0(nn.Module):
         return rec[:, 0] if _mm(modality) == "image" else rec.permute(0, 2, 1, 3, 4)
 
     # ------------------------------------------------------------------ train
-    def forward(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None) -> dict:
+    def forward(self, data: torch.Tensor, modality: str, cam: Optional[dict] = None,
+                geo: Optional[dict] = None) -> dict:
+        """geo (modality 'world', omniworld.py): corr [B,nK,T,G,G,2], valid [B,nK,T,G,G], dyncell [B,T,G,G],
+        depth [B,T,h,h]; drives the w_geo / w_depth losses when they are on."""
         cfg = self.cfg
         e = self.encode(data, modality, cam)
         frames, st = e["frames"], e["state"]
@@ -239,6 +266,12 @@ class MAVTDinoV0(nn.Module):
         o, tg = self._decode_set(e, tt, tt, e.get("zd"), subset=self.training, zd_len=zd_len)
         parts["rgb"] = L.rgb_l1(*self._rgb_pair(o, tg))
         parts["feat"] = L.feat_loss(o["feat"], tg["feat"])
+        full = o["delta"].shape[1] == cfg.n_patches                            # every query decoded
+        if geo is not None and seq and full:
+            parts["geo"], d = self._geo(o, tt, tt, geo)
+            diag.update({f"geo_{k}": v for k, v in d.items()})
+        if geo is not None and "depth" in o:
+            parts["depth"] = self._depth_loss(o, geo, B, T)
 
         # ---- forecasts: D_hat(t + h) made at t, decoded at frame t + h with the zc of t's segment
         if seq and e.get("zd_fut"):
@@ -257,6 +290,9 @@ class MAVTDinoV0(nn.Module):
                 fut_rgb.append(L.rgb_l1(p, p_t))
                 diag[f"psnr_fut_h{h}"] = _psnr(p, p_t, B)
             parts["fut"] = torch.stack(fut).mean()
+            if geo is not None and of["delta"].shape[1] == cfg.n_patches:
+                parts["geo_fut"], d = self._geo(of, src, dst, geo)
+                diag["geo_fut_epe_static"], diag["geo_fut_epe_dyn"] = d["epe_static"], d["epe_dyn"]
             if cfg.w_fut_rgb > 0:
                 parts["fut_rgb"] = torch.stack(fut_rgb).mean()
 
@@ -305,7 +341,7 @@ class MAVTDinoV0(nn.Module):
 
         w = dict(rgb=cfg.w_rgb, feat=cfg.w_feat, fut=cfg.w_fut, fut_rgb=cfg.w_fut_rgb, warp=cfg.w_warp,
                  lpips=cfg.w_lpips, gram=cfg.w_gram, kl=cfg.w_kl, var=cfg.w_var, sem=cfg.w_sem,
-                 gate=cfg.w_gate, rel=1.0)
+                 gate=cfg.w_gate, rel=1.0, geo=cfg.w_geo, geo_fut=cfg.w_geo, depth=cfg.w_depth)
         loss = sum(w[k] * v for k, v in parts.items())
         with torch.no_grad():
             diag["psnr_queries"] = _psnr(o["rgb"], tg["rgb"], B)

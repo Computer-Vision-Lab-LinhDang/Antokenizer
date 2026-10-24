@@ -324,6 +324,8 @@ class QueryDecoder(nn.Module):
                 f"{cfg.image_size} (need len(conv_channels) = log2(patch) + 1 = {int(math.log2(cfg.patch)) + 1})")
             self.rgb_conv = ConvUpsampler(d, tuple(cfg.conv_channels), cfg.conv_res_blocks, cfg.conv_channels_last)
         self.feat_head = nn.Linear(d, feat_dim)
+        if cfg.w_depth > 0:                                         # log-depth of each query's 4 x 4 sub-cells
+            self.depth_head = nn.Linear(d, (cfg.patch // 4) ** 2)
 
     def d_tokens(self, zd: Optional[torch.Tensor], zd_len: Optional[torch.Tensor] = None) -> tuple:
         """Projected D tokens [B, M (+1), dim] and the keys each row may read, [B, M (+1)] bool | None.
@@ -422,4 +424,7 @@ class QueryDecoder(nn.Module):
         else:
             image = self.rgb_conv(h, self.grid)
             rgb = image_to_patches(image, self.cfg.patch)
-        return dict(rgb=rgb, image=image, feat=self.feat_head(h), delta=delta, gate=gate)
+        out = dict(rgb=rgb, image=image, feat=self.feat_head(h), delta=delta, gate=gate)
+        if hasattr(self, "depth_head"):
+            out["depth"] = self.depth_head(h)
+        return out

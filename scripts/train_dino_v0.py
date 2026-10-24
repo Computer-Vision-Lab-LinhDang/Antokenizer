@@ -37,6 +37,7 @@ import torch.distributed as dist  # noqa: E402
 from mavt.dino_v0.config import DinoV0Config, tiny_config  # noqa: E402
 
 FROZEN_PREFIX = "encoder.dino.model."          # frozen DINOv3 weights: reloaded from dino_repo, not saved
+NEW_HEADS = ("decoder.depth_head.",)            # --init-from may lack these (w_depth > 0 creates them)
 
 
 # ---------------------------------------------------------------------------- args / config
@@ -47,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--imagenet", default=None, help="ImageNet-1k HF parquet root")
     p.add_argument("--openvid", default=None, help="OpenVid jsonl manifest")
     p.add_argument("--objaverse", default=None, help="Objaverse render root (manifest.lvis_full.jsonl + renders/)")
+    p.add_argument("--omniworld", default=None,
+                   help="OmniWorld-Game pack (scripts/pack_omniworld_dino.py; its train/ split): modality 'world', "
+                        "posed dynamic clips with geometry targets")
     p.add_argument("--steps", type=int, default=200_000)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.05, help="cosine floor as a fraction of --lr")
@@ -55,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-image", type=int, default=32, help="per GPU")
     p.add_argument("--batch-video", type=int, default=4, help="per GPU")
     p.add_argument("--batch-3d", type=int, default=4, help="per GPU, objects of --n-views views")
+    p.add_argument("--batch-world", type=int, default=4, help="per GPU, OmniWorld clips of --n-frames frames")
     p.add_argument("--n-views", type=int, default=4)
     p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
     p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
@@ -78,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--resume", default="auto", help="auto (out/last.pt if present) | none | <path>")
+    p.add_argument("--init-from", default=None,
+                   help="checkpoint whose model weights start a NEW run (fresh optimizer and schedule at step 0); "
+                        "ignored once the run has its own checkpoint to resume. Heads of new flags (NEW_HEADS) may "
+                        "be missing from it and keep their init")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
     # ---- speed: mixed-modality steps, DDP, compile
@@ -237,6 +246,17 @@ def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None) -> int:
     return int(ck["step"])
 
 
+def load_weights(path: str, model) -> tuple:
+    """--init-from: model weights only, strict except the frozen encoder and NEW_HEADS. -> (source step, missing)."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+    missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+    bad = [k for k in missing if not k.startswith(NEW_HEADS)]
+    if bad or unexpected:
+        raise RuntimeError(f"checkpoint mismatch: missing={bad[:8]} unexpected={unexpected[:8]}")
+    return int(ck["step"]), missing
+
+
 # ---------------------------------------------------------------------------- data
 def orbit_cams(B: int, T: int, size: int) -> dict:
     """Synthetic OpenCV cameras on a circle of radius 2 looking at the origin (dry-run)."""
@@ -255,14 +275,25 @@ def orbit_cams(B: int, T: int, size: int) -> dict:
     return dict(c2w=c2w, K=K)
 
 
+def synthetic_geo(batch: int, cfg: DinoV0Config, n_frames: int, g: torch.Generator) -> dict:
+    """Random geometry targets shaped like OmniWorldClips' (dry run, probe of unused parameters)."""
+    G, nK, h = cfg.grid, -(-n_frames // cfg.keyframe_every), cfg.grid * (cfg.patch // 4)
+    return dict(geo_corr=(torch.rand(batch, nK, n_frames, G, G, 2, generator=g) - 0.5) * 0.1,
+                geo_valid=torch.rand(batch, nK, n_frames, G, G, generator=g) > 0.3,
+                geo_dyncell=torch.rand(batch, n_frames, G, G, generator=g) > 0.7,
+                geo_depth=torch.rand(batch, n_frames, h, h, generator=g) * 10)
+
+
 def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, seed: int):
     g = torch.Generator().manual_seed(seed)
     s = cfg.image_size
     shape = (batch, 3, s, s) if modality == "image" else (batch, 3, n_frames, s, s)
     while True:
         b = dict(data=torch.rand(shape, generator=g) * 2 - 1, modality=modality)
-        if modality == "threed":
+        if modality in ("threed", "world"):
             b.update(orbit_cams(batch, n_frames, s))
+        if modality == "world":
+            b.update(synthetic_geo(batch, cfg, n_frames, g))
         yield b
 
 
@@ -270,6 +301,8 @@ def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dic
     from mavt.dino_v0.data import infinite, mixed_loaders
     lds = mixed_loaders(args.imagenet, args.openvid, args.objaverse, batch_image=args.batch_image,
                         batch_video=args.batch_video, batch_3d=args.batch_3d, size=cfg.image_size,
+                        omniworld=getattr(args, "omniworld", None), batch_world=getattr(args, "batch_world", 4),
+                        cell=cfg.patch, keyframe_every=cfg.keyframe_every,
                         n_frames=args.n_frames, frame_stride=args.frame_stride, n_views=args.n_views,
                         video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
                         num_workers=args.num_workers, rank=rank, world=world, seed=seed,
@@ -296,7 +329,7 @@ def parse_weights(spec: str) -> dict:
         if part.strip():
             k, v = part.split(":")
             w[k.strip()] = float(v)
-    bad = set(w) - {"image", "video", "threed"}
+    bad = set(w) - set(ALL_MODALITIES)
     if bad:
         raise SystemExit(f"unknown modalities in --modality-weights: {sorted(bad)}")
     return w
@@ -324,6 +357,7 @@ def bench_data(args, cfg, rank, world) -> None:
 
 # ---------------------------------------------------------------------------- mixed step / compile
 MODALITIES = ("image", "video", "threed")
+ALL_MODALITIES = MODALITIES + ("world",)        # + OmniWorld clips (--omniworld): posed dynamic video with geometry
 COMPILE_REGIONS = ("TrunkLayer", "CBlock", "DBlock", "DecoderBlock")   # repeated blocks, by class name
 
 
@@ -332,7 +366,7 @@ class MixedStep(torch.nn.Module):
     and one all-reduce per step and every parameter is used each step (no find_unused_parameters).
 
     forward(batches {modality: (x, cam)}) runs model(x, modality, cam) for each modality present (fixed
-    order image, video, threed) and returns loss = sum_m weights[m] * loss_m, parts {'<m>/loss': loss_m,
+    order image, video, threed, world) and returns loss = sum_m weights[m] * loss_m, parts {'<m>/loss': loss_m,
     '<m>/loss_<k>': ...} and diag {'<m>/diag_<k>': ...}. No parameters of its own: checkpoints hold the
     inner model, keys unchanged."""
 
@@ -342,11 +376,11 @@ class MixedStep(torch.nn.Module):
 
     def forward(self, batches: dict) -> dict:
         loss, parts, diag = 0.0, {}, {}
-        for m in MODALITIES:
+        for m in ALL_MODALITIES:
             if m not in batches:
                 continue
-            x, cam = batches[m]
-            out = self.model(x, m, cam)
+            x, cam, *geo = batches[m]
+            out = self.model(x, m, cam, *geo)
             loss = loss + self.weights[m] * out["loss"]
             parts[f"{m}/loss"] = out["loss"].detach()
             parts.update({f"{m}/loss_{k}": v for k, v in out["parts"].items()})
@@ -358,8 +392,8 @@ def mixed_weights(spec: Optional[str], available) -> dict:
     """Loss weights of a mixed step over the available modalities, normalised to sum 1 so the step loss
     stays on the scale of a one-modality step (--grad-clip keeps its meaning). spec None: equal; a
     modality missing from spec or at 0 is not run."""
-    w = parse_weights(spec) if spec else {m: 1.0 for m in MODALITIES}
-    w = {m: w.get(m, 0.0) for m in MODALITIES if m in available and w.get(m, 0.0) > 0}
+    w = parse_weights(spec) if spec else {m: 1.0 for m in ALL_MODALITIES}
+    w = {m: w.get(m, 0.0) for m in ALL_MODALITIES if m in available and w.get(m, 0.0) > 0}
     if not w:
         raise SystemExit("--modality-loss-weights selects no available modality")
     tot = sum(w.values())
@@ -367,11 +401,15 @@ def mixed_weights(spec: Optional[str], available) -> dict:
 
 
 def to_inputs(b: dict, modality: str, dev) -> tuple:
-    """Loader batch -> (x, cam) on dev; cam = dict(c2w, K) for posed views, else None."""
+    """Loader batch -> (x, cam) on dev; cam = dict(c2w, K) for posed views and world clips, else None.
+    World clips add a third item, geo = dict(corr, valid, dyncell, depth) (the batch's geo_* tensors)."""
     x = b["data"].to(dev, non_blocking=True)
     cam = None
-    if modality == "threed":
+    if modality in ("threed", "world"):
         cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
+    if modality == "world":
+        geo = {k[4:]: v.to(dev, non_blocking=True) for k, v in b.items() if k.startswith("geo_")}
+        return x, cam, geo
     return x, cam
 
 
@@ -480,6 +518,10 @@ def main(argv=None) -> int:
         step = load_ckpt(resume, model, opt, sched, lr=args.lr)
         set_fused(opt, fused)
         log(f"resumed from {resume} at step {step}")
+    elif args.init_from:
+        src_step, new = load_weights(args.init_from, model)
+        log(f"weights from {args.init_from} (step {src_step}); optimizer and schedule start at step 0"
+            + (f"; new heads keep their init: {sorted({k.rsplit('.', 1)[0] for k in new})}" if new else ""))
     use_amp = args.bf16 and dev.type == "cuda"
     mixed = args.mix_modalities
 
@@ -585,10 +627,10 @@ def main(argv=None) -> int:
         for micro in range(args.grad_accum):
             if mixed:                                           # one batch of every modality, one module call
                 batches = {m: to_inputs(fetch(m), m, dev) for m in step_mod.weights}
-                inputs, n_clips = (batches,), sum(x.shape[0] for x, _ in batches.values())
+                inputs, n_clips = (batches,), sum(v[0].shape[0] for v in batches.values())
             else:
-                x, cam = to_inputs(fetch(modality), modality, dev)
-                inputs, n_clips = (x, modality, cam), x.shape[0]
+                x, cam, *geo = to_inputs(fetch(modality), modality, dev)
+                inputs, n_clips = (x, modality, cam, *geo), x.shape[0]
             sync = micro == args.grad_accum - 1
             ctx = ddp.no_sync() if (is_dist() and not sync) else _null()
             with ctx:

@@ -45,6 +45,27 @@ def gate_reg(gate: torch.Tensor) -> torch.Tensor:
     return (1 - gate.float()).mean()
 
 
+def geo_delta(delta: torch.Tensor, target: torch.Tensor, valid: torch.Tensor, grid: int,
+              beta: float = 1.0) -> torch.Tensor:
+    """Huber (smooth L1, transition beta) of the decoder shift against its target, both [R, N, 2] in (u, v)
+    units, measured in cells and summed over (u, v); mean over the valid [R, N] queries."""
+    err = F.smooth_l1_loss(delta.float() * grid, target.float() * grid, beta=beta, reduction="none").sum(-1)
+    w = valid.float()
+    return (err * w).sum() / w.sum().clamp_min(1.0)
+
+
+def silog(pred_log: torch.Tensor, depth: torch.Tensor, lam: float = 0.85) -> torch.Tensor:
+    """Scale-invariant log-depth loss: pred_log [R, P] log depth, depth [R, P] (0 = invalid); per row
+    mean(d^2) - lam mean(d)^2 with d = pred_log - log depth, mean over rows with a valid pixel."""
+    m = depth > 0
+    d = torch.where(m, pred_log.float() - depth.float().clamp_min(1e-6).log(), torch.zeros_like(pred_log.float()))
+    n = m.sum(-1)
+    k = n.clamp_min(1)
+    loss = (d * d).sum(-1) / k - lam * (d.sum(-1) / k) ** 2
+    ok = n > 0
+    return loss[ok].mean() if bool(ok.any()) else pred_log.float().sum() * 0
+
+
 def gate_hinge(gate: torch.Tensor, floor: float) -> torch.Tensor:
     """v1: relu(floor - mean(o)); zero while C carries at least `floor` of the read on average,
     so it penalises only D taking over, not D being used."""

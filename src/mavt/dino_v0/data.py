@@ -562,6 +562,9 @@ def collate(batch: list[dict]) -> dict:
             out[k] = torch.stack([b[k] for b in batch])
     if "stride" in batch[0]:                                      # frame stride of each clip [B]
         out["stride"] = torch.tensor([int(b["stride"]) for b in batch], dtype=torch.long)
+    for k in batch[0]:
+        if k.startswith("geo_"):                                  # OmniWorld geometry targets
+            out[k] = torch.stack([b[k] for b in batch])
     if "label" in batch[0]:
         labs = [b["label"] for b in batch]
         out["label"] = torch.tensor(labs) if all(isinstance(l, int) for l in labs) else labs
@@ -646,7 +649,8 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                   eval_frame_stride: Optional[int] = None, n_views: int = 4, video_tail: int = 1000,
                   objaverse_holdout: int = 500, num_workers: int = 8, rank: int = 0, world: int = 1,
                   seed: int = 0, split: str = "train", ssv2: Optional[str] = None,
-                  ssv2_weight: float = 0.3) -> dict:
+                  ssv2_weight: float = 0.3, omniworld: Optional[str] = None, batch_world: int = 4,
+                  cell: int = 16, keyframe_every: int = 4) -> dict:
     """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
     Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
     DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
@@ -656,7 +660,8 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
     format, used whole as unlabeled video: labels are never read) mixed into the video stream: each
     video sample is SSv2 with probability ssv2_weight (MixtureSampler, rank-sharded). With OpenVid,
     ssv2_weight <= 0 leaves SSv2 out and >= 1 leaves OpenVid out; without OpenVid, SSv2 is the
-    whole video stream."""
+    whole video stream. omniworld: an OmniWorld-Game pack (omniworld.py), its `split` directory ('heldout'
+    reads val/): modality 'world', clips of n_frames with camera and geometry targets."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -690,6 +695,13 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
         ds = ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout)
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
         out["threed"] = (DataLoader(ds, batch_size=batch_3d, sampler=smp, drop_last=True, **common), smp)
+    if omniworld:
+        from .omniworld import OmniWorldClips
+        ds = OmniWorldClips(omniworld, "train" if train else "val", n_frames=n_frames, frame_stride=frame_stride,
+                            size=size, cell=cell, keyframe_every=keyframe_every, train=train,
+                            eval_stride=eval_frame_stride)
+        smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
+        out["world"] = (DataLoader(ds, batch_size=batch_world, sampler=smp, drop_last=True, **common), smp)
     return out
 
 

@@ -82,6 +82,10 @@ class DinoV0Config:
     window_read: str = "dense"           # decoder's C read: "dense" = masked SDPA over all N cells; "gather" = the (2r+1)^2 window cells per query
     # ---- v1 phase 3: variable-length D by nested dropout (default off) ----
     d_nested: bool = False               # train: each clip keeps a random prefix of 0..M D tokens (fixed order) per step, the rest are masked in every read of D; a learned null token makes the empty prefix a valid code
+    # ---- geometry from OmniWorld-Game (modality "world", omniworld.py; default off) ----
+    w_geo: float = 0.0                   # Huber (cells) of the decoder shift Δ against the correspondence targets, on reconstruction and forecast decodes
+    geo_huber: float = 1.0               # Huber transition, in cells
+    w_depth: float = 0.0                 # > 0 adds a depth head (log-depth of the 4 x 4 sub-cells of each query) with a scale-invariant loss
     extra: dict = field(default_factory=dict)
 
     @property

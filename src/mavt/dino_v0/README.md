@@ -44,6 +44,7 @@ Rules that define the C/D split (do not break them):
 | `data.py` | ImageNet parquet, OpenVid / SSv2 clips (PyAV, random stride), Objaverse posed views, mixed loaders |
 | `evaluate.py` | PSNR/SSIM/LPIPS/rFID, C/D split metrics, PSNR vs D prefix length by motion tercile, forecasts vs copy baselines, kNN / linear probes |
 | `camera.py` | Plücker rays and relative poses for posed views |
+| `omniworld.py` | OmniWorld-Game: packed format, `OmniWorldClips` (modality `world`: posed dynamic clips), the correspondence targets of the decoder shift (rigid projection + chained flow) |
 
 Scripts: `scripts/train_dino_v0.py` (torchrun DDP), `scripts/eval_dino_v0.py`, `scripts/profile_dino_v0.py`.
 Configs: `configs/dino_v0/v0_alpha.yaml`, `v1_alpha.yaml`, `v1b_alpha.yaml` (speed), `v1c_alpha.yaml`
@@ -134,6 +135,26 @@ static clips do not), D carries what changes and its length can follow the innov
 in any bucket, D is still unused and the budget has to move first. The training log adds
 `diag_zd_energy_head` / `_tail`, the mean squared z_r(D) of the first and the last quarter of the tokens, to
 see whether the information concentrates in the prefix.
+
+## OmniWorld-Game geometry (`configs/dino_v0/v1e_geo_alpha.yaml`)
+
+A fourth modality, `world`: OmniWorld-Game clips (synthetic game video with metric depth, camera, forward optical
+flow and dynamic-object masks), packed by `scripts/pack_omniworld_dino.py` (every 2nd raw frame, 256 x 448, depth /
+mask / flow on a quarter-resolution grid, the raw flows chained between kept frames; format in `omniworld.py`).
+A clip goes through the posed-sequence path (rays, pose-conditioned forecasts) with its camera made relative to
+the first frame and scaled by its median depth, and brings geometry targets for two losses:
+
+| Flag | default | v1e | What it does |
+|---|---|---|---|
+| `w_geo`, `geo_huber` | 0, 1.0 | 0.1, 1.0 | Huber (cells) of the decoder shift Δ of every reconstruction and forecast decode against where the frame's content sits in its keyframe: rigid projection of the frame's depth for static cells (visibility test in the keyframe), the OmniWorld flow chained from the keyframe for dynamic cells |
+| `w_depth` | 0 | 0.1 | a depth head (log-depth of each query's 4 x 4 sub-cells) with a scale-invariant loss |
+
+Conventions checked on 3 scenes before packing: the flow decodes with range [-300, 300] (the README snippet's
+default is wrong) and points forward t -> t + 1; on static pixels it matches the rigid flow from depth + cameras
+within 0.03-0.97 px at 1280 x 720. Clips with a camera pair above 5 % depth reprojection AbsRel are redrawn (v6's
+rule). Training logs `geo_epe_static` / `geo_epe_dyn` (cells) and the share of cells with a target. `--init-from`
+starts a run from another checkpoint's weights (the depth head keeps its init). Tests:
+`tests/dino_v0/test_omniworld_geo.py`.
 
 ## Commands
 

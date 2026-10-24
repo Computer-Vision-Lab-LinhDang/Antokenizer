@@ -1,0 +1,106 @@
+# MAVT on DINOv3 + OmniWorld-Game geometry: the v1c model with a fourth modality "world" (posed dynamic clips,
+# src/mavt/dino_v0/omniworld.py) that adds two losses on its decodes:
+#   w_geo   the decoder shift Δ of every reconstruction and forecast decode against the correspondence of the
+#           clip's keyframe (rigid projection for static cells, chained OmniWorld flow for dynamic ones), Huber in cells
+#   w_depth a depth head (4 x 4 log-depth per query), scale-invariant loss against OmniWorld depth
+# Data: scripts/pack_omniworld_dino.py -> /scratch/vunguyen13/data/omniworld-game-dino-v1 (train / val by uid hash).
+# Warm start: --init-from <v1c last.pt> (the depth head starts fresh). Tests: tests/dino_v0/test_omniworld_geo.py.
+# ---- input
+image_size: 256
+patch: 16
+# ---- tier A: frozen DINOv3 ViT-L/16 (local HF dir) + pixel stem
+dino_repo: /scratch/vunguyen13/mavt/weights/dinov3-vitl16
+dino_dim: 1024
+dino_registers: 4
+pix_dim: 256
+# ---- tier B: trunk
+dim: 1024
+heads: 16
+trunk_layers: 8
+mlp_ratio: 4.0
+temporal_window: 1
+# ---- tier C: C at keyframes / D every frame
+keyframe_every: 4
+c_blocks: 2
+d_tokens: 64             # nested dropout: a 64-step ladder of D tokens per frame (v1: 16)
+d_dim: 128
+d_blocks: 2
+use_track: false
+use_event_memory: false
+# ---- tier D: latent (budget 12 288 per image / per 4-frame segment)
+zr_c_image: 48           # image: 256 x 48 = 12 288
+zr_c_video: 24           # video: 256 x 24 + 4 x 64 x 24 = 6 144 + 6 144 = 12 288 (v1: 256 x 32 + 4 x 16 x 64)
+zr_d: 24                 # 64 tokens x 24: half the segment budget in D, read as a prefix of any length
+zs_dim: 1024
+# ---- tier E: query decoder
+dec_dim: 768
+dec_heads: 12
+dec_blocks: 4
+read_window: 2
+gate_init_bias: 1.0      # o = sigmoid(.) starts at ~0.73: D is read from the start (v0: 4.0, ~0.98)
+train_queries_per_frame: 256   # all N: the conv rgb head decodes full frames
+delta_mode: query        # each query reads D for its own Δ (v0: one Δ field from the mean of D)
+rgb_head: conv           # full-grid conv upsampler instead of the per-patch Linear (no patch grid)
+conv_channels: [640, 384, 192, 96, 64]   # width at 16^2, then per x2 stage up to 256^2 (29.4 M params, 42 GMAC / frame)
+conv_res_blocks: 2
+# ---- v1 phase 2: speed (model math unchanged; see tests/dino_v0/test_speed_v1b.py)
+fut_frames_per_horizon: 2  # forecast loss on 2 random source frames per horizon per step (phase 1: every pair, 7 + 4 per clip)
+warp_frames: 2             # warp-only loss on 2 random non-key frames per step (phase 1: all 6 per clip)
+conv_channels_last: false  # measured on MI355X + inductor (README, "v1 phase 2"): no gain, the transposes around MIOpen stay; the eager NHWC head is +23% time / +46% memory
+window_read: dense         # scripts/bench_window_read.py on MI355X: dense 18 ms vs gather 196 ms per fwd+bwd at 688 rows; gather is the test reference only
+# ---- v1 phase 3: variable-length D
+d_nested: true             # each clip keeps a random prefix of 0..64 D tokens per step (the rest masked in every read of D); a null token makes the empty prefix a code
+# ---- OmniWorld geometry (modality "world")
+w_geo: 0.1                 # Huber in cells summed over (u, v): ~3-5 at the start (targets 2-5 cells, v1c's Δ ~0.3) -> ~0.3-0.5
+geo_huber: 1.0
+w_depth: 0.1               # scale-invariant log-depth, ~0.5 at the start
+# ---- loss weights
+w_rgb: 1.0
+w_lpips: 0.5             # rgb L1 at init measured 0.52 (this decoder, natural 256^2 image); LPIPS-VGG of a near-flat
+                         # output ~0.6-0.8 (estimate: VGG16 weights not reachable in the sandbox) -> ~0.3-0.4
+w_gram: 50.0             # Gram L1 (normalised by C*H*W, mean over the 5 VGG layers) ~3e-3-1e-2 at init (estimate) -> ~0.15-0.5
+lpips_max_frames: 64     # LPIPS / Gram on at most 64 random full frames per step and GPU
+w_feat: 1.0
+w_fut: 0.5
+w_fut_rgb: 0.5           # rgb L1 on the forecast frames
+w_warp: 0.5              # non-key frames decoded with the gate locked to 1: Δ must carry the motion
+w_var: 0.1
+w_kl: 1.0e-6
+w_sem: 0.5
+w_gate: 1.0              # hinge: zero while mean o >= gate_floor, so a large weight only bites when D takes over
+gate_loss: hinge         # relu(gate_floor - mean o): only penalise D taking over (v0 "mean" pushed o to 1)
+gate_floor: 0.5
+# ---- forecasts of D
+forecast_horizons: [1, 4]      # D_hat(t + 1) and D_hat(t + 4), each made at t (t + h < T)
+forecast_residual: true        # D_hat = D_t + f(.), f zero-init: starts as copy-last
+
+train:
+  imagenet: /scratch/vunguyen13/data/imagenet-1k
+  openvid: /scratch/vunguyen13/data/dino_v0_data/openvid1m   # dir -> its manifest.jsonl or all *.jsonl
+  objaverse: /scratch/vunguyen13/data/objaverse-lvis-subset-v1
+  omniworld: /scratch/vunguyen13/data/omniworld-game-dino-v1
+  batch_world: 8            # per GPU, clips of n_frames frames (profile before raising)
+  video_tail: 1000         # last 1000 OpenVid manifest lines -> eval only (<out>/openvid_heldout.txt)
+  objaverse_holdout: 500   # last 500 non-blank uids -> eval only (<out>/objaverse_heldout.txt)
+  ssv2_train: /scratch/vunguyen13/data/dino_v0_data/ssv2/ssv2_train_manifest.jsonl   # train split only (168,913 clips)
+  ssv2_weight: 0.3         # share of video clips drawn from SSv2 (unlabeled; labels are never read)
+  steps: 16000             # ~7.7 h at ~0.58 it/s on 4 GPUs (run of 23/10/2026)
+  lr: 2.0e-4
+  wd: 0.05
+  warmup: 2000
+  # per GPU, tuned on MI355X (288 GB): v1 peak 231 GB, v1b 188 GB with --compile (eager OOMs); re-profile with 64 D tokens.
+  # 256 / 32 / 32 OOMs even with --use-checkpoint (conv head decodes full frames).
+  batch_image: 128
+  batch_video: 16          # clips of n_frames frames
+  batch_3d: 16             # objects of n_views posed views
+  n_views: 4
+  n_frames: 8
+  frame_stride: "2,4,8"    # one stride drawn per clip: Δ and the forecasts see slow and fast motion
+  mix_modalities: true     # image + video + 3D in every step, one backward (DDP: no unused params, static graph)
+  compile: true            # regional torch.compile: -15% step time, -34% memory on MI355X
+  grad_accum: 1
+  bf16: true
+  grad_clip: 1.0
+  ckpt_every: 1000
+  log_every: 20
+  num_workers: 8
