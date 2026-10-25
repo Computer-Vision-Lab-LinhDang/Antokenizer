@@ -52,7 +52,9 @@ def merge_heads(x: torch.Tensor) -> torch.Tensor:
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None):
     """SDPA on [..., H, N, hd] with any number of batch dims (flattened to 4-D so the fused kernels apply);
-    mask bool, broadcastable to [..., H, Nq, Nk], True = may attend."""
+    mask bool (True = may attend) or additive float, broadcastable to [..., H, Nq, Nk]."""
+    if mask is not None and mask.dtype != torch.bool and mask.dtype != q.dtype:
+        mask = mask.to(q.dtype)
     if q.dim() == 4:
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
     batch = q.shape[:-3]

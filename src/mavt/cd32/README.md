@@ -110,6 +110,32 @@ content.
 - Choosing L by a distortion threshold at inference. `forward(..., L=...)` takes explicit lengths.
 - LPIPS (`w_lpips > 0`) reuses the v0 module and has not been tested here.
 
+## Vanilla variant (`vanilla.py`, `vanilla_model.py`, `scripts/train_cdv.py`)
+
+The same latent, budget and forward projection on one plain transformer, with the reconstruction branch
+on. It exists to test the idea quickly before the two-stream design is trained at scale.
+
+| | two-stream (`model.py`) | vanilla (`vanilla_model.py`) |
+|---|---|---|
+| backbone | C and D blocks, DINO memory re-read per layer, 3-axis RoPE | one pre-LN transformer, learned positions, the 4 DINO layers summed into the input |
+| tokens of a segment | C: 257; D per frame: 273 (+ link) | C: 257; D per frame: 256 cells + pose + 16 flow + L_max slots = 355 |
+| the asymmetric mask | by construction of the key sets | an attention mask: C reads C; D_t reads C, D_t, D_{t-1} (`causal_d`) |
+| innovation | Enc_R after a trial decode (residual) | the slot tokens of the same pass (mu, logvar), nested dropout |
+| decoder | geometric read, prediction blocks, previous-frame read, innovation branch | geometric read, `dec_blocks` x (self-attention, cross-attention to [null ; r[:L]], MLP), all frames of a segment in one pass |
+| pixels | conv upsampler | linear unpatchify + one 3 x 3 conv (`rgb_head: linear`), or the conv upsampler |
+| losses | as above | `rec_rgb` L1 + `lpips` (0.5) + `rec_feat` (0.25), `geo_*` (L = 0 decode), `flow_l1`, `smooth`, `kl_*`, depth terms |
+| not there | | link, L_pred, previous-frame read, cross-view rho refinement |
+
+`geometry: false` (`--set geometry=false`) is the ablation at the same budget: identity projection for every
+frame, so D_innov has to carry all change. `--init <ckpt>` starts a stage from the weights of the previous
+one (optimizer and schedule fresh): images, then + video, then + posed views.
+
+    python scripts/train_cdv.py --dry-run --out /tmp/cdv_dry
+    torchrun --standalone --nproc_per_node <gpus> scripts/train_cdv.py --config configs/cd32/vanilla.yaml \
+        --imagenet <parquet root> --out <stage 1>
+    ... --imagenet <root> --openvid <manifest> --n-frames 4 --init <stage 1>/last.pt --out <stage 2>
+    ... --objaverse <render root> --objaverse-depth --init <stage 2>/last.pt --out <stage 3>
+
 ## Depth
 
 `rho` is log inverse depth per cell. Still images and video only know it up to a shift (median depth 1),
@@ -148,6 +174,9 @@ cell and per pixel, and on held-out Objaverse objects also without scaling.
 | `enc_r.py` | residual encoder |
 | `decoder.py` | geometric read, prediction blocks, innovation branch, feature and RGB heads |
 | `model.py` | `MAVTCD32.forward(x, modality, cam)`, the same interface as `MAVTDinoV0`; `load_model()` |
+| `regs.py` | the C regularisers shared by both models: KL, smoothness, depth probe / rendered depth / distill |
+| `vanilla.py` | `CDVConfig`, the one-transformer backbone with the mask, vanilla decoder, pixel head |
+| `vanilla_model.py` | `MAVTCDV.forward(x, modality, cam)`, same interface; `load_cdv()` |
 | `depth.py` | cell depth targets, SILog / SSI / ordinal losses, depth metrics, the depth probe |
 | `depth_data.py` | depth manifests: reading depth files, crops that keep invalid pixels invalid |
 

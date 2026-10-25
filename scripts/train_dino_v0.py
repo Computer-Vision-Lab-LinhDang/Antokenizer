@@ -80,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--resume", default="auto", help="auto (out/last.pt if present) | none | <path>")
+    p.add_argument("--init", default=None, metavar="CKPT",
+                   help="start from the model weights of this checkpoint (optimizer and schedule fresh); "
+                        "for staged training; ignored when the run resumes")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
     # ---- speed: mixed-modality steps, DDP, compile
@@ -221,6 +224,17 @@ def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args) 
     torch.save(dict(model=trainable_state(model), optim=opt.state_dict(), sched=sched.state_dict(),
                     step=step, cfg=dataclasses.asdict(cfg), args=vars(args)), tmp)
     os.replace(tmp, path)
+
+
+def init_weights(path: str, model) -> int:
+    """Model weights of another run (strict except the frozen DINO prefix), nothing else -> its step."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+    if missing or unexpected:
+        raise RuntimeError(f"--init mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
+    return int(ck.get("step", -1))
 
 
 def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None) -> int:
@@ -494,6 +508,9 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
         step = load_ckpt(resume, model, opt, sched, lr=args.lr)
         set_fused(opt, fused)
         log(f"resumed from {resume} at step {step}")
+    elif args.init:
+        step0 = init_weights(args.init, model)
+        log(f"initialised from {args.init} (step {step0}); optimizer and schedule start fresh")
     use_amp = args.bf16 and dev.type == "cuda"
     mixed = args.mix_modalities
 

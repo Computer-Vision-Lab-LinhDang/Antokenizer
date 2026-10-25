@@ -36,6 +36,22 @@ def _inv_softplus(x: float) -> float:
     return math.log(math.expm1(x))
 
 
+def forward_project(cfg: CD32Config, uq: torch.Tensor, rho, K_src, R, tau, m=None, K_dst=None, scale=None) -> tuple:
+    """Keyframe cells (centres uq [N, 2], log inverse depth rho [B, N]) -> (p [B, N, 2], z [B, N], valid [B, N],
+    cull [B, N] or None) in the target camera: unproject with K_src, move by (R, tau) [+ m, x scale], project
+    with K_dst (K_src if None). The bản 3.2 forward projection, in float32."""
+    f32 = lambda t: None if t is None else t.float()
+    with geo.fp32(rho.device):
+        rho, K_src, R, tau, m, K_dst, scale = map(f32, (rho, K_src, R, tau, m, K_dst, scale))
+        P = geo.unproject(rho, K_src, uq)
+        P1 = geo.transform(P if m is None else P + m, R, tau, scale)
+        p, z, valid = geo.project(P1, K_src if K_dst is None else K_dst, cfg.z_eps)
+        cull = None
+        if cfg.backface_kappa > 0:
+            cull = geo.backface_bias(geo.cell_normals(P, cfg.grid), R, P1, cfg.backface_kappa)
+    return p, z, valid, cull
+
+
 class GeomRead(nn.Module):
     def __init__(self, cfg: CD32Config):
         super().__init__()
@@ -60,7 +76,7 @@ class GeomRead(nn.Module):
     def forward(self, c: torch.Tensor, kind: str, p, z, valid, cull, dt: float,
                 rays: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """c [B, N, d_c]; p [B, N, 2], z, valid [B, N] projected keyframe cells; cull [B, N] or None;
-        dt = (t - t_k) / K. -> (h [B, N, D], d_min [B, N])."""
+        dt = (t - t_k) / K, a float or a tensor [B]. -> (h [B, N, D], d_min [B, N])."""
         cfg = self.cfg
         B, N = p.shape[:2]
         idx, d2, R2, pj = geo.knn_read(self.uq, p, valid, cfg.knn)                 # [B, N, k]
@@ -72,7 +88,10 @@ class GeomRead(nn.Module):
         cj = torch.gather(cv.unsqueeze(1).expand(-1, N, -1, -1), 2,
                           idx.unsqueeze(-1).expand(-1, -1, -1, cv.shape[-1]))      # [B, N, k, D]
         off = self.uq.view(1, N, 1, 2) - pj
-        tt = torch.full_like(off[..., :1], float(dt))
+        if torch.is_tensor(dt):                                                     # per-sample dt [B]
+            tt = dt.to(off.dtype).view(B, 1, 1, 1).expand(-1, N, off.shape[2], 1)
+        else:
+            tt = torch.full_like(off[..., :1], float(dt))
         e = torch.cat([cj, geo.fourier(off, cfg.n_freq).to(cj.dtype), geo.fourier(tt, cfg.n_freq).to(cj.dtype)], -1)
         k, v = self.e_mlp(e).chunk(2, -1)
         H = self.heads
@@ -169,17 +188,7 @@ class Decoder(nn.Module):
 
     def project(self, rho, K_src, R, tau, m=None, K_dst=None, scale=None) -> tuple:
         """Keyframe cells -> (p, z, valid, cull) in the target camera (bản 3.2 forward projection)."""
-        cfg = self.cfg
-        f32 = lambda t: None if t is None else t.float()
-        with geo.fp32(rho.device):
-            rho, K_src, R, tau, m, K_dst, scale = map(f32, (rho, K_src, R, tau, m, K_dst, scale))
-            P = geo.unproject(rho, K_src, self.read.uq)
-            P1 = geo.transform(P if m is None else P + m, R, tau, scale)
-            p, z, valid = geo.project(P1, K_src if K_dst is None else K_dst, cfg.z_eps)
-            cull = None
-            if cfg.backface_kappa > 0:
-                cull = geo.backface_bias(geo.cell_normals(P, cfg.grid), R, P1, cfg.backface_kappa)
-        return p, z, valid, cull
+        return forward_project(self.cfg, self.read.uq, rho, K_src, R, tau, m, K_dst, scale)
 
     def predict(self, c, kind: str, proj: tuple, dt: float, rays=None, prev: Optional[torch.Tensor] = None):
         """-> (h_geom, h_prev or None, d_min). h_geom: geometric read + self-attention blocks."""
