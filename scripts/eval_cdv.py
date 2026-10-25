@@ -13,7 +13,8 @@ doing nothing?), and the PSNR-vs-L curve: every frame after a keyframe decoded w
 each L of --L-list (0 = geometry only: C + pose + flow; max = L_max), with the numbers a segment then costs.
 Diagnostics from the same pass: xi_rot_deg, xi_trans, flow_l1, rho_std, fov_deg. Posed views (Objaverse
 hold-out, view 0 = keyframe, --n-views views): the same curve; with --objaverse-depth also rho_gt_corr, the
-Pearson correlation of rho with the rendered depth. Outputs are clamped to [-1, 1] before scoring.
+Pearson correlation of rho with the rendered depth. --omniworld <pack root> adds the OmniWorld-Game val split
+(posed frames of real scenes at --omniworld-stride, metric depth, frame 0 = keyframe) with the same numbers. Outputs are clamped to [-1, 1] before scoring.
 The checkpoint kind is read from its config (`dec_blocks` = vanilla). Writes <out>/<stem>.json and .md.
 """
 from __future__ import annotations
@@ -59,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--objaverse-limit", type=int, default=200, help="objects")
     p.add_argument("--n-views", type=int, default=4)
     p.add_argument("--batch-3d", type=int, default=16)
+    p.add_argument("--omniworld", default=None, help="OmniWorld-Game pack root (val split, posed frames of scenes)")
+    p.add_argument("--omniworld-stride", type=int, default=16, help="raw frame stride of the OmniWorld clips")
+    p.add_argument("--omniworld-limit", type=int, default=200, help="clips")
     p.add_argument("--L-list", default="0,1,2,4,8,16,32,max", help="innovation lengths of the curve")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
@@ -259,6 +263,14 @@ def objaverse_loader(args, size: int):
                                        collate_fn=collate, pin_memory=torch.cuda.is_available())
 
 
+def omniworld_loader(args, size: int):
+    from mavt.dino_v0.data import OmniWorldViews, collate
+    ds = OmniWorldViews(args.omniworld, "val", n_views=args.n_views, frame_stride=args.omniworld_stride, size=size,
+                        train=False, depth=True, eval_stride=args.omniworld_stride)
+    return torch.utils.data.DataLoader(ds, batch_size=args.batch_3d, shuffle=False, num_workers=args.num_workers,
+                                       collate_fn=collate, pin_memory=torch.cuda.is_available())
+
+
 def synthetic_loader(modality: str, cfg, n_frames: int, batch: int, n_batches: int, seed: int):
     from train_dino_v0 import synthetic_iter
     return list(itertools.islice(synthetic_iter(modality, batch, cfg, n_frames, seed, depth=True), n_batches))
@@ -314,6 +326,11 @@ def to_markdown(res: dict) -> str:
         L += ["", f"## Posed views: Objaverse hold-out (n = {v['n_clips']} objects of {v['n_frames']} views; "
                   f"view 0 is the keyframe)"]
         L += _curve_md(v)
+    if "omniworld" in res:
+        v = res["omniworld"]
+        L += ["", f"## Posed views: OmniWorld-Game val (n = {v['n_clips']} clips of {v['n_frames']} frames, stride "
+                  f"{res.get('omniworld_stride')}; frame 0 is the keyframe, depth median-scaled to 1)"]
+        L += _curve_md(v)
     notes = [n for n in res.get("notes", []) if n]
     if notes:
         L += ["", *[f"- {n}" for n in notes]]
@@ -352,6 +369,11 @@ def main(argv=None) -> int:
                                                                          args.seed), "video", dev, amp, 0, L_list, lp)}
         res["threed"] = eval_clips(model, synthetic_loader("threed", cfg, args.n_views, bs, n, args.seed), "threed",
                                    dev, amp, 0, L_list, lp)
+        if args.omniworld:                                            # a tiny pack (tests)
+            args.num_workers = 0
+            res["omniworld"] = eval_clips(model, omniworld_loader(args, cfg.image_size), "threed", dev, amp,
+                                          args.omniworld_limit, L_list, lp)
+            res["omniworld_stride"] = args.omniworld_stride
     else:
         if args.imagenet:
             ld = imagenet_loader(args.imagenet, cfg.image_size, args.batch, args.num_workers, args.image_limit, args.seed)
@@ -368,6 +390,11 @@ def main(argv=None) -> int:
             res["threed"] = eval_clips(model, objaverse_loader(args, cfg.image_size), "threed", dev, amp,
                                        args.objaverse_limit, L_list, lp)
             print(f"threed: {json.dumps(res['threed']['curve'])}", flush=True)
+        if args.omniworld:
+            res["omniworld"] = eval_clips(model, omniworld_loader(args, cfg.image_size), "threed", dev, amp,
+                                          args.omniworld_limit, L_list, lp)
+            res["omniworld_stride"] = args.omniworld_stride
+            print(f"omniworld: {json.dumps(res['omniworld']['curve'])}", flush=True)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, args.stem + ".json"), "w") as f:
         json.dump(res, f, indent=1)

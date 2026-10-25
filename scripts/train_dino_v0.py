@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-views", type=int, default=4)
     p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
     p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
+    p.add_argument("--omniworld", default=None,
+                   help="OmniWorld-Game pack root (scripts/pack_omniworld_dino.py): posed frames of real scenes as a "
+                        "second source of posed views (split train; the model sees them as 'threed')")
+    p.add_argument("--omniworld-stride", default="8,16,32",
+                   help="raw frame strides of OmniWorld posed clips (multiples of the pack's base stride)")
+    p.add_argument("--omniworld-weight", type=float, default=0.5,
+                   help="with --objaverse: share of posed-view samples that come from OmniWorld")
     p.add_argument("--objaverse-depth", action=argparse.BooleanOptionalAction, default=False,
                    help="posed views also load their rendered depth (cam['depth']; used by the cd32 model)")
     p.add_argument("--n-frames", type=int, default=8)
@@ -292,7 +299,10 @@ def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dic
                         video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
                         num_workers=args.num_workers, rank=rank, world=world, seed=seed,
                         ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3),
-                        objaverse_depth=getattr(args, "objaverse_depth", False))
+                        objaverse_depth=getattr(args, "objaverse_depth", False),
+                        omniworld=getattr(args, "omniworld", None),
+                        omniworld_stride=getattr(args, "omniworld_stride", "8,16,32"),
+                        omniworld_weight=getattr(args, "omniworld_weight", 0.5))
     return {m: infinite(ld, smp) for m, (ld, smp) in lds.items()}
 
 

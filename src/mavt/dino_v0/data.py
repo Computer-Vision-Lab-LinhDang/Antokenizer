@@ -577,6 +577,140 @@ class ObjaverseViews(Dataset):
         raise RuntimeError(f"ObjaverseViews: {self.max_retries} consecutive broken objects")
 
 
+class OmniWorldViews(Dataset):
+    """n_views posed frames of one OmniWorld-Game scene as posed views (modality 'threed', frame 0 = keyframe):
+    real cameras, metric depth and a camera that moves, for the geometry of the C-D tokenizer on scenes.
+
+    Pack of scripts/pack_omniworld_dino.py: <root>/<split>/pack.json (image_height, image_width, base_stride),
+    <split>/<uid>/scene.json (segments [{name, frames}]), <uid>/rgb/<frame>.jpg at H x W, <uid>/<seg>/meta.npz
+    (frames [F], K [F,3,3] at H x W, c2w [F,4,4] OpenCV camera -> world in metres, pair_absrel [F-1]),
+    <uid>/<seg>/depth.npy [F, H/a, W/a] float16 camera z in metres (0 = invalid), dyn.npy [F, H/a, W/a] uint8
+    share of dynamic-object pixels x 255.
+
+    A sample is n_views frames at one raw stride of `frame_stride` (multiples of the pack's base stride; train:
+    a random one that fits, eval: `eval_stride` or the first), cropped to size x size at a horizontal offset
+    (a multiple of `cell`; train random, eval centre). The camera translations and the depth are divided by the
+    median valid depth of frame 0, so the scene has median depth 1 (Objaverse objects sit at about 2) and rho
+    stays O(1) in the metric posed-view path. Depth of dynamic pixels (share >= 0.5) is set to 0 (invalid): the
+    scene is read as rigid. A clip with a camera pair over `max_pair_absrel` (the pack's depth-reprojection
+    check) is redrawn. Returns {'data': [3,V,S,S] in [-1, 1], 'modality': 'threed', 'c2w' [V,4,4], 'K' [V,3,3],
+    'label': uid} plus 'depth' [V,S,S] (nearest-upsampled from the pack's grid) when depth=True."""
+
+    def __init__(self, root: str, split: str = "train", n_views: int = 4, frame_stride: StrideSpec = "8,16,32",
+                 size: int = 256, train: bool = True, depth: bool = False, cell: int = 16, chunk: int = 16,
+                 max_retries: int = 20, eval_stride: Optional[int] = None, max_pair_absrel: float = 0.05):
+        self.root = os.path.join(root, split)
+        with open(os.path.join(self.root, "pack.json")) as f:
+            self.info = json.load(f)
+        self.H, self.W = int(self.info["image_height"]), int(self.info["image_width"])
+        self.base = int(self.info["base_stride"])
+        strides = parse_strides(frame_stride)
+        self.pstrides = sorted({s // self.base for s in strides if s % self.base == 0 and s >= self.base})
+        if not self.pstrides:
+            raise ValueError(f"no frame stride in {strides} is a multiple of the pack's base stride {self.base}")
+        self.eval_ps = (int(eval_stride) // self.base) if eval_stride else self.pstrides[0]
+        if self.H != size or (self.W - size) % cell or self.W < size:
+            raise ValueError(f"pack is {self.H} x {self.W}: needs height {size} and a width that crops to {size} "
+                             f"in steps of {cell}")
+        self.n_views, self.size, self.cell, self.train, self.depth = n_views, size, cell, train, depth
+        self.chunk, self.max_retries, self.max_pair_absrel = chunk, max_retries, max_pair_absrel
+        self.segs, self.items = [], []
+        min_span = (n_views - 1) * min(self.pstrides) + 1
+        for uid in sorted(os.listdir(self.root)):
+            f = os.path.join(self.root, uid, "scene.json")
+            if not os.path.exists(f):
+                continue
+            with open(f) as fh:
+                sc = json.load(fh)
+            for seg in sc.get("segments", []):
+                name = seg["name"] if isinstance(seg, dict) else seg
+                F = int(seg["frames"]) if isinstance(seg, dict) and "frames" in seg else \
+                    len(np.load(os.path.join(self.root, uid, name, "meta.npz"))["frames"])
+                if F < min_span:
+                    continue
+                si = len(self.segs)
+                self.segs.append((uid, name))
+                self.items += [(si, a) for a in range(0, F - min_span + 1, chunk)]
+        if not self.items:
+            raise RuntimeError(f"no posed clips under {self.root}")
+        self._rng = random.Random()
+        self._cache: dict = {}
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _seg(self, si: int) -> dict:
+        if si not in self._cache:                                    # memory-mapped: only the clip's frames are read
+            uid, name = self.segs[si]
+            d = os.path.join(self.root, uid, name)
+            with np.load(os.path.join(d, "meta.npz")) as m:
+                meta = {k: m[k] for k in m.files}
+            aux = {k: np.load(os.path.join(d, f"{k}.npy"), mmap_mode="r") for k in ("depth", "dyn")
+                   if os.path.exists(os.path.join(d, f"{k}.npy"))}
+            self._cache[si] = dict(uid=uid, meta=meta, **aux)
+        return self._cache[si]
+
+    def _draw(self, i: int, rng: random.Random) -> Optional[tuple]:
+        si, a = self.items[i]
+        s = self._seg(si)
+        F = len(s["meta"]["frames"])
+        fits = [p for p in self.pstrides if a + (self.n_views - 1) * p < F]
+        if not fits:
+            return None
+        ps = rng.choice(fits) if self.train else (self.eval_ps if self.eval_ps in fits else fits[0])
+        span = (self.n_views - 1) * ps + 1
+        j0 = a + (rng.randint(0, min(self.chunk - 1, F - span - a)) if self.train else 0)
+        bad = s["meta"].get("pair_absrel")
+        if bad is not None and not np.all(np.nan_to_num(bad[j0:j0 + span - 1], nan=1.0) <= self.max_pair_absrel):
+            return None
+        return si, j0, ps
+
+    def __getitem__(self, i: int) -> dict:
+        rng = self._rng if self.train else random.Random(i)
+        for _ in range(self.max_retries):
+            got = self._draw(i, rng)
+            if got is not None:
+                return self._load(*got, rng)
+            i = rng.randrange(len(self.items)) if self.train else (i + 1) % len(self.items)
+        raise RuntimeError("OmniWorldViews: no clip with valid cameras after max_retries draws")
+
+    def _load(self, si: int, j0: int, ps: int, rng: random.Random) -> dict:
+        from PIL import Image
+        s = self._seg(si)
+        meta = s["meta"]
+        idx = j0 + ps * np.arange(self.n_views)
+        S, cell = self.size, self.cell
+        n_off = (self.W - S) // cell
+        off = cell * (rng.randint(0, n_off) if self.train else n_off // 2)
+        imgs = []
+        for f in meta["frames"][idx]:
+            im = Image.open(os.path.join(self.root, s["uid"], "rgb", f"{int(f)}.jpg")).convert("RGB")
+            imgs.append(np.asarray(im)[:S, off:off + S])
+        data = torch.from_numpy(np.stack(imgs)).permute(3, 0, 1, 2).float() / 127.5 - 1.0     # [3, V, S, S]
+        K = np.asarray(meta["K"][idx], np.float64).copy()
+        K[:, 0, 2] -= off
+        c2w = np.asarray(meta["c2w"][idx], np.float64).copy()
+        depth, scale = None, 1.0
+        if "depth" in s:
+            a = self.H // s["depth"].shape[1]                        # image px per depth px
+            d = np.asarray(s["depth"][idx][:, :S // a, off // a:(off + S) // a], np.float32)
+            if "dyn" in s:
+                dyn = np.asarray(s["dyn"][idx][:, :S // a, off // a:(off + S) // a])
+                d = np.where(dyn >= 128, 0.0, d).astype(np.float32)
+            d = np.where(np.isfinite(d) & (d > 0), d, 0.0).astype(np.float32)
+            z0 = d[0][d[0] > 0]
+            scale = float(np.median(z0)) if z0.size else 1.0
+            depth = np.repeat(np.repeat(d / scale, a, 1), a, 2)        # [V, S, S], nearest
+        c2w[:, :3, 3] /= scale
+        out = dict(data=data, modality="threed", c2w=torch.from_numpy(c2w).float(), K=torch.from_numpy(K).float(),
+                   label=s["uid"])
+        if self.depth:
+            if depth is None:
+                raise RuntimeError(f"depth=True but the pack has no depth.npy under {self.root}")
+            out["depth"] = torch.from_numpy(depth)
+        return out
+
+
 # ---------------------------------------------------------------------------- loaders
 def collate(batch: list[dict]) -> dict:
     out = dict(data=torch.stack([b["data"] for b in batch]), modality=batch[0]["modality"])
@@ -669,7 +803,8 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                   eval_frame_stride: Optional[int] = None, n_views: int = 4, video_tail: int = 1000,
                   objaverse_holdout: int = 500, num_workers: int = 8, rank: int = 0, world: int = 1,
                   seed: int = 0, split: str = "train", ssv2: Optional[str] = None,
-                  ssv2_weight: float = 0.3, objaverse_depth: bool = False) -> dict:
+                  ssv2_weight: float = 0.3, objaverse_depth: bool = False, omniworld: Optional[str] = None,
+                  omniworld_stride: StrideSpec = "8,16,32", omniworld_weight: float = 0.5) -> dict:
     """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
     Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
     DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
@@ -679,7 +814,10 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
     format, used whole as unlabeled video: labels are never read) mixed into the video stream: each
     video sample is SSv2 with probability ssv2_weight (MixtureSampler, rank-sharded). With OpenVid,
     ssv2_weight <= 0 leaves SSv2 out and >= 1 leaves OpenVid out; without OpenVid, SSv2 is the
-    whole video stream. objaverse_depth: posed views also carry their rendered depth ('depth')."""
+    whole video stream. objaverse_depth: posed views also carry their rendered depth ('depth').
+    omniworld: an OmniWorld-Game pack (OmniWorldViews, split train / val) as a second source of posed views at
+    raw strides omniworld_stride, each threed sample from it with probability omniworld_weight when Objaverse
+    is given too (MixtureSampler); it carries depth whenever objaverse_depth is set."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -709,10 +847,24 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
         log.info("video mixture: %s", ", ".join(f"{len(d)} clips x {w:.2f}" for d, w in vids))
     if vids:
         out["video"] = (DataLoader(ds, batch_size=batch_video, sampler=smp, drop_last=True, **common), smp)
-    if objaverse:
-        ds = ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout,
-                            depth=objaverse_depth)
+    posed = []                                                      # (dataset, weight)
+    w_omni = min(max(float(omniworld_weight), 0.0), 1.0) if omniworld else 0.0
+    if objaverse and (w_omni < 1.0 or not omniworld):
+        posed.append((ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout,
+                                     depth=objaverse_depth), 1.0 - w_omni))
+    if omniworld and (w_omni > 0 or not objaverse):
+        posed.append((OmniWorldViews(omniworld, "train" if train else "val", n_views=n_views,
+                                     frame_stride=omniworld_stride, size=size, train=train, depth=objaverse_depth),
+                      w_omni if objaverse else 1.0))
+    if len(posed) == 1:
+        ds = posed[0][0]
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
+    elif posed:
+        ds = ConcatDataset([d for d, _ in posed])
+        smp = MixtureSampler([len(d) for d, _ in posed], [w for _, w in posed], num_replicas=world, rank=rank,
+                             seed=seed, shuffle=train)
+        log.info("posed-view mixture: %s", ", ".join(f"{type(d).__name__} {len(d)} x {w:.2f}" for d, w in posed))
+    if posed:
         out["threed"] = (DataLoader(ds, batch_size=batch_3d, sampler=smp, drop_last=True, **common), smp)
     return out
 

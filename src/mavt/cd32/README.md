@@ -136,6 +136,13 @@ one (optimizer and schedule fresh): images, then + video, then + posed views.
     ... --imagenet <root> --openvid <manifest> --n-frames 4 --init <stage 1>/last.pt --out <stage 2>
     ... --objaverse <render root> --objaverse-depth --init <stage 2>/last.pt --out <stage 3>
 
+Posed views come from Objaverse renders (`--objaverse`) and, for real scenes with a moving camera, from an
+OmniWorld-Game pack (`--omniworld <pack root>`, `OmniWorldViews` in `src/mavt/dino_v0/data.py`): `n_views`
+frames at a raw stride of `--omniworld-stride` (default 8,16,32) with the pack's cameras and metric depth, the
+scene median-scaled to depth 1, dynamic pixels marked invalid. With both sources, `--omniworld-weight` is the
+share of posed-view samples that are scenes. Scenes give the geometry branch real parallax: with known poses
+and a large baseline, a wrong `rho` projects wrongly, which short-baseline video clips never enforce.
+
 Held-out numbers of a stage (either model kind; the checkpoint's config says which): `scripts/eval_cdv.py`
 scores ImageNet validation (PSNR, SSIM, LPIPS, rFID), the held-out tail of each video manifest and the
 Objaverse hold-out views. For video and posed views it reports the key frames (C only) apart from the frames
@@ -144,7 +151,7 @@ PSNR-vs-numbers curve of one checkpoint comes out of one run; with `--objaverse-
 `rho_gt_corr`. Outputs are clamped to [-1, 1] before scoring, unlike the training-batch PSNR in the logs.
 
     python scripts/eval_cdv.py --ckpt <stage>/last.pt --imagenet <parquet root> --openvid <manifest>[,<manifest>] \
-        --objaverse <render root> --objaverse-depth --dino-repo <local copy> --out <stage>/eval
+        --objaverse <render root> --objaverse-depth --omniworld <pack root> --dino-repo <local copy> --out <stage>/eval
 
 ## Depth
 
