@@ -1,5 +1,9 @@
 # MAVT — Memory-Augmented Vision Tokenizer
 
+> **Current work (since 22/10/2026): MAVT on a frozen DINOv3, v0 and v1, in
+> [`src/mavt/dino_v0/README.md`](src/mavt/dino_v0/README.md).** The rest of this file describes the
+> older SigLIP2 / slot pipeline, which is paused.
+
 A unified visual tokenizer for images, videos, and 3D assets operating in a shared 4D latent space. MAVT combines two architectural decisions:
 
 - **4D Relational Graph Attention (RGAT)** — injects typed geometric relationships (spatial, temporal, cross-plane) directly into Transformer attention, replacing the implicit all-pairs weighting of standard self-attention with explicit structural priors.
