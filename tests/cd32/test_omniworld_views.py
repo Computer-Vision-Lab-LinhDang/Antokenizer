@@ -52,7 +52,7 @@ def write_pack(root, split: str, n_scenes: int = 2, F: int = 14, dyn_scene: int 
         depth[:, 0, 0] = 0.0                                                 # one invalid pixel
         dyn = np.zeros((F, H // AUX, W // AUX), np.uint8)
         if si == dyn_scene:
-            dyn[:, 2:4, 10:14] = 255                                         # a moving object
+            dyn[:, 0:4, 8:16] = 255                                          # a moving object (2 cells of the crop)
         absrel = np.full(F - 1, 0.01, np.float32)
         np.savez(os.path.join(seg, "meta.npz"), frames=frames.astype(np.int64), K=K.astype(np.float32), c2w=c2w,
                  pair_absrel=absrel, pair_epe=np.full(F - 1, np.nan, np.float32))
@@ -131,3 +131,101 @@ def test_eval_on_the_pack(pack, tmp_path):
     v = res["omniworld"]
     assert v["n_clips"] == 1 and v["n_frames"] == 4 and np.isfinite(v["curve"][0]["psnr"])
     assert "rho_gt_corr" in v["diag"] and "OmniWorld-Game val" in (out / "eval.md").read_text()
+
+
+# ------------------------------------------------------------------------------------------- 4D: world clips
+def _world_inputs(B=2, T=8, size=64):
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    from train_dino_v0 import orbit_cams
+    cam = orbit_cams(B, T, size)
+    cam["depth"] = 2.0 - torch.rand(B, T, size, size) * 0.2
+    cam["dyn"] = torch.zeros(B, T, size, size)
+    cam["dyn"][:, :, :32, :32] = 1.0
+    return torch.rand(B, 3, T, size, size) * 2 - 1, cam
+
+
+def test_world_step_finite_and_backward():
+    torch.manual_seed(0)
+    m = MAVTCDV(tiny_cdv_config(w_depth_gt=0.5))
+    x, cam = _world_inputs()
+    out = m(x, "world", cam, return_outputs=True)
+    assert torch.isfinite(out["loss"]) and all(torch.isfinite(v) for v in out["parts"].values())
+    out["loss"].backward()
+    o, d = out["outputs"], out["diag"]
+    assert o["rgb"].shape == (2, 8, 3, 64, 64) and o["M"].shape[:2] == (4, 3)      # 2 clips x 2 segments
+    assert {"flow_dyn", "flow_static", "dyn_frac", "rho_gt_corr", "L_mean"} <= set(d)
+    assert d["dyn_frac"].item() == pytest.approx(0.25) and "depth_gt" in out["parts"]
+    assert d["numbers"].item() <= m.cfg.budget
+    grads = {n for n, p in m.named_parameters() if p.grad is not None and p.grad.abs().sum() > 0}
+    assert "heads.flow.weight" in grads and "heads.slot_out.weight" in grads and "heads.rho.fc2.weight" in grads
+    assert "heads.pose.weight" not in grads                     # the camera is known: no predicted pose
+
+
+def test_world_uses_the_known_camera_causally():
+    """Moving frame 2's camera changes frame 2's decode and leaves frame 1 and C as they were."""
+    torch.manual_seed(0)
+    m = MAVTCDV(tiny_cdv_config()).eval()
+    x, cam = _world_inputs(B=1, T=4)
+    cam2 = {k: v.clone() for k, v in cam.items()}
+    cam2["c2w"][:, 2, :3, 3] += torch.tensor([0.3, -0.2, 0.1])
+    with torch.no_grad():
+        a = m(x, "world", cam, return_outputs=True)["outputs"]
+        b = m(x, "world", cam2, return_outputs=True)["outputs"]
+    assert torch.allclose(a["c"], b["c"], atol=1e-5) and torch.allclose(a["rho"], b["rho"], atol=1e-5)
+    assert torch.allclose(a["rgb"][:, 1], b["rgb"][:, 1], atol=1e-5)
+    assert not torch.allclose(a["rgb"][:, 2], b["rgb"][:, 2], atol=1e-5)
+    with pytest.raises(ValueError):
+        m(torch.rand(1, 3, 6, 64, 64), "world", _world_inputs(B=1, T=6)[1])     # not a multiple of K
+
+
+def test_world_geometry_ablation():
+    torch.manual_seed(0)
+    m = MAVTCDV(tiny_cdv_config(geometry=False))
+    x, cam = _world_inputs(B=1, T=4)
+    out = m(x, "world", cam)
+    assert torch.isfinite(out["loss"]) and out["parts"]["flow_l1"].item() == 0
+
+
+def test_world_clips_from_the_pack(pack):
+    ds = OmniWorldViews(pack, "train", n_views=4, frame_stride="4", size=H, train=False, depth=True,
+                        modality="world")
+    it = ds[0]
+    assert it["modality"] == "world" and it["dyn"].shape == (4, H, H)
+    off = 16 * ((W - H) // 16 // 2)
+    cols = slice((10 * AUX - off), (14 * AUX - off))
+    assert (it["dyn"][0, 2 * AUX:4 * AUX, cols] == 1).all() and (it["depth"][0, 2 * AUX:4 * AUX, cols] > 0).all()
+    assert torch.equal(it["data"], OmniWorldViews(pack, "train", n_views=4, frame_stride="4", size=H, train=False,
+                                                  depth=True)[0]["data"])               # same frames, same order
+    assert len(OmniWorldViews(pack, "train", n_views=4, frame_stride="4", size=H, max_scenes=1).uids) == 1
+    with pytest.raises(ValueError):
+        OmniWorldViews(pack, "train", frame_stride="4", size=H, modality="video")
+    lds = mixed_loaders(omniworld=pack, omniworld_modality="world", batch_world=2, n_frames=4, size=H,
+                        num_workers=0, omniworld_stride="4,8", omniworld_scenes=2)
+    assert set(lds) == {"world"}
+    b = next(iter(lds["world"][0]))
+    assert b["data"].shape == (2, 3, 4, H, H) and b["dyn"].shape == (2, 4, H, H) and b["depth"].shape == (2, 4, H, H)
+    torch.manual_seed(0)
+    out = MAVTCDV(tiny_cdv_config())(b["data"], "world", {k: b[k] for k in ("c2w", "K", "depth", "dyn")})
+    assert torch.isfinite(out["loss"]) and "flow_static" in out["diag"] and "dyn_frac" in out["diag"]
+
+
+def test_trainer_dry_run_has_world_and_eval_on_world_clips(pack, tmp_path):
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    spec = importlib.util.spec_from_file_location("train_cdv", os.path.join(ROOT, "scripts", "train_cdv.py"))
+    tr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tr)
+    run = tmp_path / "s3"
+    assert tr.main(["--dry-run", "--mix-modalities", "--out", str(run)]) == 0
+    recs = [json.loads(l) for l in (run / "log.jsonl").read_text().splitlines()]
+    assert "world/loss" in recs[0] and np.isfinite(recs[0]["world/loss"])
+    spec = importlib.util.spec_from_file_location("eval_cdv", os.path.join(ROOT, "scripts", "eval_cdv.py"))
+    ev = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ev)
+    out = tmp_path / "ev"
+    assert ev.main(["--dry-run", "--ckpt", str(run / "last.pt"), "--omniworld", pack, "--omniworld-modality", "world",
+                    "--omniworld-stride", "4", "--batch-3d", "1", "--L-list", "0,max", "--out", str(out)]) == 0
+    res = json.loads((out / "eval.json").read_text())
+    v = res["world"]
+    assert v["n_clips"] == 1 and v["n_frames"] == 4 and np.isfinite(v["key"]["psnr"])
+    assert {"flow_dyn", "flow_static", "rho_gt_corr"} <= set(v["diag"])
+    assert "4D world clips" in (out / "eval.md").read_text()

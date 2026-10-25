@@ -4,6 +4,10 @@ the interface of MAVTDinoV0 and MAVTCD32, so scripts/train_cdv.py is the v0 trai
   image   [B, 3, H, W]      C only; identity projection; L = 0
   video   [B, 3, T, H, W]   T = S * K; per segment C at the keyframe (+ focal), (xi, M, r[:L]) at the others
   threed  [B, 3, V, H, W]   posed views, cam = dict(c2w, K [, depth]); view 0 = keyframe, xi from the cameras
+  world   [B, 3, T, H, W]   4D: a clip in time with known cameras, cam = dict(c2w, K [, depth, dyn]); T = S * K;
+                            per segment C at the keyframe, the camera of frame t from c2w (as threed) and the
+                            3D flow M_t predicted (as video) for what moves; r[:L] as everywhere. threed is the
+                            case M = 0, dt = 0; video the case where the camera is predicted (xi, focal)
 
 All frames of a segment are decoded in one batched pass of the decoder.
 """
@@ -13,6 +17,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..dino_v0.camera import patch_rays
 from ..dino_v0.losses import ignore_lpips_keys
@@ -22,11 +27,12 @@ from .losses import charbonnier, feat_loss, gaussian_sample, kl_masked, psnr, rg
 from .regs import DepthRegs
 from .vanilla import CDVConfig, VanillaBackbone, VanillaDecoder, VanillaHeads
 
-MODALITIES = ("image", "video", "threed")
+MODALITIES = ("image", "video", "threed", "world")
 
 
 class MAVTCDV(DepthRegs, nn.Module):
     COMPILE_REGIONS = ("StreamBlock", "DecBlock")
+    MODALITIES = MODALITIES                                     # the trainer's dry run feeds each of them
 
     def __init__(self, cfg: CDVConfig, use_checkpoint: bool = False):
         super().__init__()
@@ -249,6 +255,70 @@ class MAVTCDV(DepthRegs, nn.Module):
                                    "threed", depth_gt)
         return loss, dict(rgb=rgb.view(B, V, *rgb.shape[1:]), c=hd["mu"], rho=rho, order=order)
 
+    def _world(self, frames, cam, parts, diag, L_given=None):
+        """4D clip: known cameras + predicted 3D flow. frames [B, T, 3, H, W], cam c2w [B,T,4,4], K [B,T,3,3]
+        (+ depth [B,T,H,W], dyn [B,T,H,W] in 0..1). Each segment of K frames is coded in its keyframe's camera."""
+        cfg = self.cfg
+        B, T = frames.shape[:2]
+        K, G, N, dev = cfg.keyframe_every, cfg.grid, cfg.n_cells, frames.device
+        if T % K:
+            raise ValueError(f"world clip length {T} must be a multiple of keyframe_every={K}")
+        Bp = B * (T // K)
+        seg = lambda t: t.reshape(Bp, K, *t.shape[2:])
+        img, c2w, Kpix = seg(frames), seg(cam["c2w"].float()), seg(cam["K"].float())
+        with geo.fp32(dev):
+            rel = torch.linalg.inv(c2w[:, :1]) @ c2w                                      # frames in camera k
+            rays = patch_rays(rel, Kpix, cfg.image_size, G)                               # [Bp, K, N, 6]
+            T_v = torch.linalg.inv(rel)                                                   # camera k -> camera t
+        enc = self.encoder(img.flatten(0, 1), rays.flatten(0, 1))
+        sv = lambda t: t.reshape(Bp, K, *t.shape[1:])
+        x, tgt = sv(self._tokens(enc)), sv(enc["feat_target"])
+        hd = self.heads(self.backbone(x[:, 0], x[:, 1:]), "threed")
+        c, rho = gaussian_sample(hd["mu"], hd["logvar"], self.training), hd["rho"]   # metric: cameras are known
+        Kc = geo.intrinsics_to_cells(Kpix, cfg.patch)
+        w_flow = self.flow_w(c)
+        R0, t0 = self._identity(Bp, dev)
+        projs, ms = [self.decoder.project(rho, Kc[:, 0], R0, t0)], []
+        for j in range(1, K):
+            if cfg.geometry:
+                m = geo.convex_upsample(hd["M"][:, j - 1], w_flow, G)
+                projs.append(self.decoder.project(rho, Kc[:, 0], T_v[:, j, :3, :3], T_v[:, j, :3, 3], m, Kc[:, j]))
+            else:
+                m = torch.zeros(Bp, N, 3, device=dev)
+                projs.append(projs[0])
+            ms.append(m)
+        tokens, L_all, keep = self._innovation(hd, Bp, K - 1, L_given)
+        dts = [j / K for j in range(K)]
+        H = self._decode(c, "video", projs, dts, tokens, L_all, rays)
+        loss, rgb = self._rec(H, tgt, img, parts, diag)
+        if cfg.w_geo > 0:
+            loss = loss + self._geo(c, "video", projs[1:], dts[1:], tgt[:, 1:], img[:, 1:], parts, diag, rays[:, 1:])
+        M = torch.stack(ms, 1)                                                            # [Bp, K-1, N, 3]
+        fl = M.abs().mean()
+        parts["flow_l1"] = fl.detach()
+        loss = loss + cfg.w_flow * fl
+        kd = kl_masked(hd["r_mu"].flatten(0, 1), hd["r_logvar"].flatten(0, 1), keep.flatten(0, 1))
+        parts["kl_d"] = kd.detach()
+        loss = loss + cfg.w_kl_d * kd
+        depth_gt = seg(cam["depth"].float())[:, 0] if cam.get("depth") is not None else None
+        loss = loss + self._c_regs(hd, rho, tgt[:, 0], parts, diag, [sv(f)[:, 0] for f in enc["layers"]],
+                                   "threed", depth_gt)
+        L = L_all[:, 1:].float()
+        diag["L_mean"] = L.mean()
+        diag["numbers"] = cfg.c_numbers("threed") + (K - 1) * 3 * cfg.n_flow + (L * cfg.d_r).sum(1).mean()
+        if cam.get("dyn") is not None:                    # does the flow go to what moves? (keyframe's mask)
+            share = F.adaptive_avg_pool2d(seg(cam["dyn"].float())[:, 0].unsqueeze(1), G).flatten(1)   # [Bp, N]
+            mov = M.detach().norm(dim=-1).mean(1)                                         # [Bp, N]
+            dyn = share >= 0.5
+            diag["dyn_frac"] = dyn.float().mean()
+            if dyn.any():
+                diag["flow_dyn"] = mov[dyn].mean()
+            if (~dyn).any():
+                diag["flow_static"] = mov[~dyn].mean()
+        outputs = dict(rgb=rgb.view(B, T, *rgb.shape[1:]), c=hd["mu"], rho=rho, M=hd["M"], tokens=tokens[:, 1:],
+                       L=L.long())
+        return loss, outputs
+
     # ------------------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, modality: str, cam: Optional[dict] = None,
                 L: Optional[torch.Tensor] = None, return_outputs: bool = False) -> dict:
@@ -263,8 +333,11 @@ class MAVTCDV(DepthRegs, nn.Module):
             loss, outputs = self._video(frames, parts, diag, L)
         else:
             if cam is None:
-                raise ValueError("threed needs cam = dict(c2w, K)")
-            loss, outputs = self._threed(frames, cam, parts, diag, L)
+                raise ValueError(f"{modality} needs cam = dict(c2w, K)")
+            if modality == "world":
+                loss, outputs = self._world(frames, cam, parts, diag, L)
+            else:
+                loss, outputs = self._threed(frames, cam, parts, diag, L)
         d = self.decoder.read
         diag["lam_d"] = torch.nn.functional.softplus(d.lam_d).detach().mean()
         diag["lam_z"] = torch.nn.functional.softplus(d.lam_z).detach().mean()

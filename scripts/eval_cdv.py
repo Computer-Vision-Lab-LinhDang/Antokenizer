@@ -14,7 +14,9 @@ each L of --L-list (0 = geometry only: C + pose + flow; max = L_max), with the n
 Diagnostics from the same pass: xi_rot_deg, xi_trans, flow_l1, rho_std, fov_deg. Posed views (Objaverse
 hold-out, view 0 = keyframe, --n-views views): the same curve; with --objaverse-depth also rho_gt_corr, the
 Pearson correlation of rho with the rendered depth. --omniworld <pack root> adds the OmniWorld-Game val split
-(posed frames of real scenes at --omniworld-stride, metric depth, frame 0 = keyframe) with the same numbers. Outputs are clamped to [-1, 1] before scoring.
+(posed frames of real scenes at --omniworld-stride, metric depth, frame 0 = keyframe) with the same numbers;
+with --omniworld-modality world the clips are 4D (time order, known cameras, predicted flow) and the report
+adds flow_dyn / flow_static, the mean predicted 3D flow on cells with and without moving objects. Outputs are clamped to [-1, 1] before scoring.
 The checkpoint kind is read from its config (`dec_blocks` = vanilla). Writes <out>/<stem>.json and .md.
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ import torch  # noqa: E402
 from mavt.dino_v0 import evaluate as E  # noqa: E402
 
 DIAG_KEYS = ("L_mean", "xi_rot_deg", "xi_trans", "fov_deg", "rho_std", "rho_gt_corr", "rho_probe_corr",
-             "psnr_geo", "lam_d", "lam_z")
+             "flow_dyn", "flow_static", "dyn_frac", "psnr_geo", "lam_d", "lam_z")
 PART_KEYS = ("rec_rgb", "rec_feat", "geo_rgb", "geo_feat", "flow_l1", "smooth", "depth_gt", "kl_c", "kl_d")
 
 
@@ -63,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--omniworld", default=None, help="OmniWorld-Game pack root (val split, posed frames of scenes)")
     p.add_argument("--omniworld-stride", type=int, default=16, help="raw frame stride of the OmniWorld clips")
     p.add_argument("--omniworld-limit", type=int, default=200, help="clips")
+    p.add_argument("--omniworld-modality", choices=("threed", "world"), default="threed",
+                   help="threed: frames as posed views of a rigid scene; world: 4D clips of --n-frames frames")
     p.add_argument("--L-list", default="0,1,2,4,8,16,32,max", help="innovation lengths of the curve")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
@@ -189,11 +193,12 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
         B, T = x.shape[0], x.shape[2]
         cam = None
         t = torch.arange(T, device=dev)
+        if modality in ("threed", "world"):
+            cam = {k: b[k].to(dev) for k in ("c2w", "K", "depth", "dyn") if k in b}
         if modality == "threed":
-            cam = {k: b[k].to(dev) for k in ("c2w", "K", "depth") if k in b}
             key_of = torch.zeros_like(t)
             L_shape = (B, T - 1)
-        else:
+        else:                                                         # video and world: a keyframe every K
             key_of = t - t % K
             L_shape = (B * (T // K), K - 1)
         is_key = key_of == t
@@ -265,8 +270,10 @@ def objaverse_loader(args, size: int):
 
 def omniworld_loader(args, size: int):
     from mavt.dino_v0.data import OmniWorldViews, collate
-    ds = OmniWorldViews(args.omniworld, "val", n_views=args.n_views, frame_stride=args.omniworld_stride, size=size,
-                        train=False, depth=True, eval_stride=args.omniworld_stride)
+    world = args.omniworld_modality == "world"
+    ds = OmniWorldViews(args.omniworld, "val", n_views=args.n_frames if world else args.n_views,
+                        frame_stride=args.omniworld_stride, size=size, train=False, depth=True,
+                        eval_stride=args.omniworld_stride, modality=args.omniworld_modality)
     return torch.utils.data.DataLoader(ds, batch_size=args.batch_3d, shuffle=False, num_workers=args.num_workers,
                                        collate_fn=collate, pin_memory=torch.cuda.is_available())
 
@@ -331,6 +338,12 @@ def to_markdown(res: dict) -> str:
         L += ["", f"## Posed views: OmniWorld-Game val (n = {v['n_clips']} clips of {v['n_frames']} frames, stride "
                   f"{res.get('omniworld_stride')}; frame 0 is the keyframe, depth median-scaled to 1)"]
         L += _curve_md(v)
+    if "world" in res:
+        v = res["world"]
+        L += ["", f"## 4D world clips (n = {v['n_clips']} clips of {v['n_frames']} frames, stride "
+                  f"{res.get('omniworld_stride', '-')}; known cameras, predicted flow; flow_dyn / flow_static = "
+                  f"mean |M| on cells with / without moving objects)"]
+        L += _curve_md(v)
     notes = [n for n in res.get("notes", []) if n]
     if notes:
         L += ["", *[f"- {n}" for n in notes]]
@@ -369,10 +382,14 @@ def main(argv=None) -> int:
                                                                          args.seed), "video", dev, amp, 0, L_list, lp)}
         res["threed"] = eval_clips(model, synthetic_loader("threed", cfg, args.n_views, bs, n, args.seed), "threed",
                                    dev, amp, 0, L_list, lp)
+        if "world" in getattr(model, "MODALITIES", ()):
+            res["world"] = eval_clips(model, synthetic_loader("world", cfg, cfg.keyframe_every, bs, n, args.seed),
+                                      "world", dev, amp, 0, L_list, lp)
         if args.omniworld:                                            # a tiny pack (tests)
             args.num_workers = 0
-            res["omniworld"] = eval_clips(model, omniworld_loader(args, cfg.image_size), "threed", dev, amp,
-                                          args.omniworld_limit, L_list, lp)
+            key = "world" if args.omniworld_modality == "world" else "omniworld"
+            res[key] = eval_clips(model, omniworld_loader(args, cfg.image_size), args.omniworld_modality, dev, amp,
+                                  args.omniworld_limit, L_list, lp)
             res["omniworld_stride"] = args.omniworld_stride
     else:
         if args.imagenet:
@@ -391,10 +408,11 @@ def main(argv=None) -> int:
                                        args.objaverse_limit, L_list, lp)
             print(f"threed: {json.dumps(res['threed']['curve'])}", flush=True)
         if args.omniworld:
-            res["omniworld"] = eval_clips(model, omniworld_loader(args, cfg.image_size), "threed", dev, amp,
-                                          args.omniworld_limit, L_list, lp)
+            key = "world" if args.omniworld_modality == "world" else "omniworld"
+            res[key] = eval_clips(model, omniworld_loader(args, cfg.image_size), args.omniworld_modality, dev, amp,
+                                  args.omniworld_limit, L_list, lp)
             res["omniworld_stride"] = args.omniworld_stride
-            print(f"omniworld: {json.dumps(res['omniworld']['curve'])}", flush=True)
+            print(f"{key}: {json.dumps(res[key]['curve'])}", flush=True)
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, args.stem + ".json"), "w") as f:
         json.dump(res, f, indent=1)

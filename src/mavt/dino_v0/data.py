@@ -578,8 +578,11 @@ class ObjaverseViews(Dataset):
 
 
 class OmniWorldViews(Dataset):
-    """n_views posed frames of one OmniWorld-Game scene as posed views (modality 'threed', frame 0 = keyframe):
-    real cameras, metric depth and a camera that moves, for the geometry of the C-D tokenizer on scenes.
+    """n_views posed frames of one OmniWorld-Game scene, frame 0 = keyframe: real cameras, metric depth and a
+    camera that moves, for the geometry of the C-D tokenizer on scenes. modality='threed': posed views of a
+    rigid scene (dynamic pixels have no depth). modality='world' (4D): the same frames as a clip in time order,
+    dynamic pixels keep their depth and 'dyn' [V,S,S] (share of dynamic-object pixels, 0..1) is returned too.
+    max_scenes > 0 keeps only the first max_scenes scenes (sorted by uid): a small fixed slice of the pack.
 
     Pack of scripts/pack_omniworld_dino.py: <root>/<split>/pack.json (image_height, image_width, base_stride),
     <split>/<uid>/scene.json (segments [{name, frames}]), <uid>/rgb/<frame>.jpg at H x W, <uid>/<seg>/meta.npz
@@ -598,7 +601,11 @@ class OmniWorldViews(Dataset):
 
     def __init__(self, root: str, split: str = "train", n_views: int = 4, frame_stride: StrideSpec = "8,16,32",
                  size: int = 256, train: bool = True, depth: bool = False, cell: int = 16, chunk: int = 16,
-                 max_retries: int = 20, eval_stride: Optional[int] = None, max_pair_absrel: float = 0.05):
+                 max_retries: int = 20, eval_stride: Optional[int] = None, max_pair_absrel: float = 0.05,
+                 modality: str = "threed", max_scenes: int = 0):
+        if modality not in ("threed", "world"):
+            raise ValueError(f"OmniWorldViews modality must be 'threed' or 'world', got {modality!r}")
+        self.modality = modality
         self.root = os.path.join(root, split)
         with open(os.path.join(self.root, "pack.json")) as f:
             self.info = json.load(f)
@@ -616,10 +623,12 @@ class OmniWorldViews(Dataset):
         self.chunk, self.max_retries, self.max_pair_absrel = chunk, max_retries, max_pair_absrel
         self.segs, self.items = [], []
         min_span = (n_views - 1) * min(self.pstrides) + 1
-        for uid in sorted(os.listdir(self.root)):
+        uids = [u for u in sorted(os.listdir(self.root)) if os.path.exists(os.path.join(self.root, u, "scene.json"))]
+        if max_scenes > 0:
+            uids = uids[:max_scenes]
+        self.uids = uids
+        for uid in uids:
             f = os.path.join(self.root, uid, "scene.json")
-            if not os.path.exists(f):
-                continue
             with open(f) as fh:
                 sc = json.load(fh)
             for seg in sc.get("segments", []):
@@ -690,20 +699,24 @@ class OmniWorldViews(Dataset):
         K = np.asarray(meta["K"][idx], np.float64).copy()
         K[:, 0, 2] -= off
         c2w = np.asarray(meta["c2w"][idx], np.float64).copy()
-        depth, scale = None, 1.0
+        depth, scale, dyn_up = None, 1.0, None
         if "depth" in s:
             a = self.H // s["depth"].shape[1]                        # image px per depth px
             d = np.asarray(s["depth"][idx][:, :S // a, off // a:(off + S) // a], np.float32)
             if "dyn" in s:
                 dyn = np.asarray(s["dyn"][idx][:, :S // a, off // a:(off + S) // a])
-                d = np.where(dyn >= 128, 0.0, d).astype(np.float32)
+                dyn_up = np.repeat(np.repeat(dyn.astype(np.float32) / 255.0, a, 1), a, 2)
+                if self.modality == "threed":                         # rigid views: moving pixels have no depth
+                    d = np.where(dyn >= 128, 0.0, d).astype(np.float32)
             d = np.where(np.isfinite(d) & (d > 0), d, 0.0).astype(np.float32)
             z0 = d[0][d[0] > 0]
             scale = float(np.median(z0)) if z0.size else 1.0
             depth = np.repeat(np.repeat(d / scale, a, 1), a, 2)        # [V, S, S], nearest
         c2w[:, :3, 3] /= scale
-        out = dict(data=data, modality="threed", c2w=torch.from_numpy(c2w).float(), K=torch.from_numpy(K).float(),
-                   label=s["uid"])
+        out = dict(data=data, modality=self.modality, c2w=torch.from_numpy(c2w).float(),
+                   K=torch.from_numpy(K).float(), label=s["uid"])
+        if self.modality == "world":
+            out["dyn"] = torch.from_numpy(dyn_up) if dyn_up is not None else torch.zeros(self.n_views, S, S)
         if self.depth:
             if depth is None:
                 raise RuntimeError(f"depth=True but the pack has no depth.npy under {self.root}")
@@ -714,7 +727,7 @@ class OmniWorldViews(Dataset):
 # ---------------------------------------------------------------------------- loaders
 def collate(batch: list[dict]) -> dict:
     out = dict(data=torch.stack([b["data"] for b in batch]), modality=batch[0]["modality"])
-    for k in ("c2w", "K", "depth"):
+    for k in ("c2w", "K", "depth", "dyn"):
         if k in batch[0]:
             out[k] = torch.stack([b[k] for b in batch])
     if "stride" in batch[0]:                                      # frame stride of each clip [B]
@@ -804,7 +817,8 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                   objaverse_holdout: int = 500, num_workers: int = 8, rank: int = 0, world: int = 1,
                   seed: int = 0, split: str = "train", ssv2: Optional[str] = None,
                   ssv2_weight: float = 0.3, objaverse_depth: bool = False, omniworld: Optional[str] = None,
-                  omniworld_stride: StrideSpec = "8,16,32", omniworld_weight: float = 0.5) -> dict:
+                  omniworld_stride: StrideSpec = "8,16,32", omniworld_weight: float = 0.5,
+                  omniworld_modality: str = "threed", omniworld_scenes: int = 0, batch_world: int = 4) -> dict:
     """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
     Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
     DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
@@ -817,7 +831,9 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
     whole video stream. objaverse_depth: posed views also carry their rendered depth ('depth').
     omniworld: an OmniWorld-Game pack (OmniWorldViews, split train / val) as a second source of posed views at
     raw strides omniworld_stride, each threed sample from it with probability omniworld_weight when Objaverse
-    is given too (MixtureSampler); it carries depth whenever objaverse_depth is set."""
+    is given too (MixtureSampler); it carries depth whenever objaverse_depth is set. omniworld_modality='world'
+    makes it its own 'world' stream instead (4D clips of n_frames frames in time order, batch_world per GPU,
+    always with depth and dynamic masks); omniworld_scenes > 0 uses only that many scenes."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -847,6 +863,13 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
         log.info("video mixture: %s", ", ".join(f"{len(d)} clips x {w:.2f}" for d, w in vids))
     if vids:
         out["video"] = (DataLoader(ds, batch_size=batch_video, sampler=smp, drop_last=True, **common), smp)
+    if omniworld and omniworld_modality == "world":
+        ds = OmniWorldViews(omniworld, "train" if train else "val", n_views=n_frames, frame_stride=omniworld_stride,
+                            size=size, train=train, depth=True, modality="world", max_scenes=omniworld_scenes)
+        smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
+        out["world"] = (DataLoader(ds, batch_size=batch_world, sampler=smp, drop_last=True, **common), smp)
+        log.info("world (4D) clips: %d from %d scenes", len(ds), len(ds.uids))
+        omniworld = None                                              # not a posed-view source as well
     posed = []                                                      # (dataset, weight)
     w_omni = min(max(float(omniworld_weight), 0.0), 1.0) if omniworld else 0.0
     if objaverse and (w_omni < 1.0 or not omniworld):
@@ -854,8 +877,8 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                                      depth=objaverse_depth), 1.0 - w_omni))
     if omniworld and (w_omni > 0 or not objaverse):
         posed.append((OmniWorldViews(omniworld, "train" if train else "val", n_views=n_views,
-                                     frame_stride=omniworld_stride, size=size, train=train, depth=objaverse_depth),
-                      w_omni if objaverse else 1.0))
+                                     frame_stride=omniworld_stride, size=size, train=train, depth=objaverse_depth,
+                                     max_scenes=omniworld_scenes), w_omni if objaverse else 1.0))
     if len(posed) == 1:
         ds = posed[0][0]
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)

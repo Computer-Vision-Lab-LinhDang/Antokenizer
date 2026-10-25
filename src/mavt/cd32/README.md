@@ -143,6 +143,15 @@ scene median-scaled to depth 1, dynamic pixels marked invalid. With both sources
 share of posed-view samples that are scenes. Scenes give the geometry branch real parallax: with known poses
 and a large baseline, a wrong `rho` projects wrongly, which short-baseline video clips never enforce.
 
+**4D (`world`).** `--omniworld <pack> --omniworld-modality world` turns the OmniWorld pack into a modality of
+its own: clips of `--n-frames` frames in time order (`--batch-world` per GPU, `--omniworld-scenes N` for a small
+slice), with the cameras, metric depth and dynamic-object masks. Per segment, C sits at the keyframe as usual;
+frame t is projected with the known camera (c2w and K, as posed views) after the predicted 3D flow `M_t` (as
+video) moves what moves, then read and refined with `r[:L]`. Posed views are the case M = 0, dt = 0; video is
+the case where the camera is predicted. The camera is side information and costs no numbers; a segment costs
+C + (K - 1) x (flow + innovation). Diagnostics: `rho_gt_corr` against the keyframe's depth, and `flow_dyn` /
+`flow_static`, the mean |M| on cells with and without moving objects: the flow should go to what moves.
+
 Held-out numbers of a stage (either model kind; the checkpoint's config says which): `scripts/eval_cdv.py`
 scores ImageNet validation (PSNR, SSIM, LPIPS, rFID), the held-out tail of each video manifest and the
 Objaverse hold-out views. For video and posed views it reports the key frames (C only) apart from the frames
@@ -151,7 +160,8 @@ PSNR-vs-numbers curve of one checkpoint comes out of one run; with `--objaverse-
 `rho_gt_corr`. Outputs are clamped to [-1, 1] before scoring, unlike the training-batch PSNR in the logs.
 
     python scripts/eval_cdv.py --ckpt <stage>/last.pt --imagenet <parquet root> --openvid <manifest>[,<manifest>] \
-        --objaverse <render root> --objaverse-depth --omniworld <pack root> --dino-repo <local copy> --out <stage>/eval
+        --objaverse <render root> --objaverse-depth --omniworld <pack root> [--omniworld-modality world] \
+        --dino-repo <local copy> --out <stage>/eval
 
 ## Depth
 
