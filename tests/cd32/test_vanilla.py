@@ -181,3 +181,27 @@ def test_dry_run_and_staged_init(tmp_path):
     assert ck2["step"] == 3 and ck2["cfg"]["geometry"] is False
     k = "backbone.pos_emb"
     assert not torch.equal(ck2["model"][k], ck["model"][k])          # trained on from the stage-1 weights
+
+
+class _CountingLPIPS(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.seen, self.w = [], torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, pred, target):
+        self.seen.append(pred.shape[0])
+        return (pred - target).abs().mean() + 0 * self.w.sum()
+
+
+def test_lpips_on_a_subset_of_frames_and_resume():
+    m = _model(lpips_max_frames=2)
+    m.lpips = _CountingLPIPS()
+    x, _ = _inputs("video", T=4)                                  # 2 clips x 4 frames = 8 decoded frames
+    out = m(x, "video")
+    assert "lpips" in out["parts"] and m.lpips.seen == [2]
+    m.cfg.lpips_max_frames = 0
+    m(x, "video")
+    assert m.lpips.seen == [2, 8]
+    sd = {k: v for k, v in m.state_dict().items() if not k.startswith("lpips.")}   # LPIPS is never saved
+    missing, unexpected = m.load_state_dict(sd, strict=False)
+    assert not [k for k in missing if "lpips" in k] and not unexpected

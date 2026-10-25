@@ -51,6 +51,7 @@ geometry: true                 # false: ablation, identity projection for every 
 # ---- losses: reconstruction branch
 w_rgb: 1.0
 w_lpips: 0.5
+lpips_max_frames: 64         # LPIPS on 64 random decoded frames per step per GPU (0: all, halves throughput)
 w_feat: 0.25
 w_geo: 0.5                     # frames after the keyframe decoded with L = 0 (geometry only)
 geo_rgb: true

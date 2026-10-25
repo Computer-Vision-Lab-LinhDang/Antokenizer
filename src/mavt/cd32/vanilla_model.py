@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from ..dino_v0.camera import patch_rays
+from ..dino_v0.losses import ignore_lpips_keys
 from . import geometry as geo
 from .encoder import FrameEncoder
 from .losses import charbonnier, feat_loss, gaussian_sample, kl_masked, psnr, rgb_l1
@@ -44,6 +45,7 @@ class MAVTCDV(DepthRegs, nn.Module):
         if cfg.w_lpips > 0:
             from ..dino_v0.losses import LPIPSLoss
             self.lpips = LPIPSLoss()
+        self.register_load_state_dict_post_hook(ignore_lpips_keys)   # frozen VGG is never saved: not "missing"
         self.init_probe(cfg, feat_dim)
 
     # ------------------------------------------------------------------------------ helpers
@@ -94,7 +96,12 @@ class MAVTCDV(DepthRegs, nn.Module):
         diag["psnr"] = psnr(rgb.detach(), im)
         loss = cfg.w_feat * f + cfg.w_rgb * l1
         if self.lpips is not None:
-            lp = self.lpips(rgb, im)
+            n = cfg.lpips_max_frames
+            if 0 < n < rgb.shape[0]:                              # random subset of the decoded frames
+                sel = torch.randperm(rgb.shape[0], device=rgb.device)[:n]
+                lp = self.lpips(rgb[sel], im[sel])
+            else:
+                lp = self.lpips(rgb, im)
             parts["lpips"] = lp.detach()
             loss = loss + cfg.w_lpips * lp
         return loss, rgb

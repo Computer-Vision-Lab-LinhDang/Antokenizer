@@ -85,6 +85,7 @@ class CD32Config:
     depth_gt_lam: float = 0.85            # SILog lambda of that loss (1 = scale-free; poses fix the scale)
     w_rho_distill: float = 0.0            # posed views: |rho_mono - sg[rho]| (single-view part learns the refined rho)
     w_lpips: float = 0.0
+    lpips_max_frames: int = 0             # LPIPS on a random subset of this many decoded frames per step (0: all)
     charbonnier_eps: float = 1e-3
     detach_rho_image: bool = True         # still images have no parallax: rho gets no gradient from L_rec
     extra: dict = field(default_factory=dict)

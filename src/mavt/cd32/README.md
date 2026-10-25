@@ -123,7 +123,7 @@ on. It exists to test the idea quickly before the two-stream design is trained a
 | innovation | Enc_R after a trial decode (residual) | the slot tokens of the same pass (mu, logvar), nested dropout |
 | decoder | geometric read, prediction blocks, previous-frame read, innovation branch | geometric read, `dec_blocks` x (self-attention, cross-attention to [null ; r[:L]], MLP), all frames of a segment in one pass |
 | pixels | conv upsampler | linear unpatchify + one 3 x 3 conv (`rgb_head: linear`), or the conv upsampler |
-| losses | as above | `rec_rgb` L1 + `lpips` (0.5) + `rec_feat` (0.25), `geo_*` (L = 0 decode), `flow_l1`, `smooth`, `kl_*`, depth terms |
+| losses | as above | `rec_rgb` L1 + `lpips` (0.5, on `lpips_max_frames` random frames per step) + `rec_feat` (0.25), `geo_*` (L = 0 decode), `flow_l1`, `smooth`, `kl_*`, depth terms |
 | not there | | link, L_pred, previous-frame read, cross-view rho refinement |
 
 `geometry: false` (`--set geometry=false`) is the ablation at the same budget: identity projection for every

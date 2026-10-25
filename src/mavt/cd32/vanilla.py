@@ -48,6 +48,7 @@ class CDVConfig(CD32Config):
     p_l0: float = 0.25                    # more L = 0 draws: they are the only geometry-only decode
     w_feat: float = 0.25                  # DINO feature loss is auxiliary; the pixels are the target
     w_lpips: float = 0.5
+    lpips_max_frames: int = 64            # the VGG of LPIPS on every frame halves the throughput
 
     def check(self) -> None:
         super().check()

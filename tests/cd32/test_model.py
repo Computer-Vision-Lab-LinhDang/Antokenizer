@@ -197,3 +197,11 @@ def test_bf16_autocast_keeps_geometry_float32():
         out = m(torch.rand(1, 3, 4, 64, 64) * 2 - 1, "threed", _orbit(1, 4, 64))
     assert p.dtype == z.dtype == R.dtype == torch.float32
     assert torch.isfinite(out["loss"])
+
+
+def test_lpips_keys_are_not_missing_on_load():
+    m = _model()
+    m.lpips = torch.nn.Linear(1, 1)
+    sd = {k: v for k, v in m.state_dict().items() if not k.startswith("lpips.")}
+    missing, unexpected = m.load_state_dict(sd, strict=False)
+    assert not [k for k in missing if "lpips" in k] and not unexpected
