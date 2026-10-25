@@ -427,7 +427,8 @@ def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, 
     import torch._dynamo
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)   # shapes per modality
-    targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in COMPILE_REGIONS]
+    regions = getattr(model, "COMPILE_REGIONS", COMPILE_REGIONS)      # another model may name its own blocks
+    targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in regions]
     conv = getattr(getattr(model, "decoder", None), "rgb_conv", None)
     if conv_head and isinstance(conv, torch.nn.Module):
         targets.append(("decoder.rgb_conv", conv))
@@ -444,13 +445,16 @@ def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, 
 
 
 # ---------------------------------------------------------------------------- main loop
-def main(argv=None) -> int:
+def main(argv=None, config_fn=None, model_fn=None) -> int:
+    """config_fn(model_cfg, dry) -> config and model_fn(cfg, args) -> nn.Module let another model with the
+    MAVTDinoV0 interface (forward(x, modality, cam) -> dict(loss, parts, diag)) reuse this trainer
+    (scripts/train_cd32.py). Defaults: DinoV0Config / MAVTDinoV0."""
     args, model_cfg = parse_args(argv)
     dry = args.dry_run
     if dry:
         args.steps, args.batch_image, args.batch_video, args.batch_3d, args.n_frames = 3, 2, 2, 2, 4
         args.warmup, args.log_every, args.ckpt_every, args.bf16 = 1, 1, 2, False
-    cfg = make_config(model_cfg, dry)
+    cfg = (config_fn or make_config)(model_cfg, dry)
     rank, world, local, dev = setup_dist(dry)
     os.makedirs(args.out, exist_ok=True)
     seed = args.seed + 1000 * rank
@@ -466,7 +470,10 @@ def main(argv=None) -> int:
     from mavt.dino_v0.model import MAVTDinoV0
     log = (lambda s: print(s, flush=True)) if rank == 0 else (lambda s: None)
     torch.manual_seed(args.seed)                               # identical init on every rank
-    model = MAVTDinoV0(cfg, use_checkpoint=args.use_checkpoint).to(dev)
+    if model_fn is None:
+        model = MAVTDinoV0(cfg, use_checkpoint=args.use_checkpoint).to(dev)
+    else:
+        model = model_fn(cfg, args).to(dev)
     opt, sched = build_optim(model, args, dev)
     fused = bool(opt.param_groups[0].get("fused"))
     step = 0

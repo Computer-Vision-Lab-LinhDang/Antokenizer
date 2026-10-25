@@ -1,0 +1,135 @@
+# C-D tokenizer, bản 3.2, with the two-stream backbone
+
+A tokenizer for images, video and posed views on a frozen DINOv3 ViT-L/16. It splits a clip into what
+stays (C, at keyframes) and what changes (D, at the other frames), and makes the change pass through a
+fixed geometric operator so that depth, pose and object motion keep their physical meaning.
+
+Status: implemented and unit-tested on CPU with the tiny config. Not trained at scale yet.
+
+## Latent
+
+| Part | Where | Numbers | Meaning |
+|---|---|---|---|
+| `c_k` | keyframe, per cell | 47 (image) / 23 (video, views) | static content (Gaussian, KL) |
+| `rho_k` | keyframe, per cell | 1 | log inverse depth; median depth 1 per keyframe on video |
+| `f_k` | keyframe | 1 (video only) | focal length as a bounded FOV (30 to 120 degrees, init 50) |
+| `xi_t` | other frames | 6 | pose of frame t against the keyframe (axis-angle + translation) |
+| `M_t` | other frames | 4 x 4 x 3 | coarse 3D object flow, convex-upsampled guided by `c_k` |
+| `D_innov` | other frames / views | L x 24, L <= L_max | residual tokens, prefix of random length (nested dropout) |
+| link | keyframe k >= 1 | 7 | pose of keyframe k against k - 1 and a log scale ratio |
+
+Budget with the default config: an image is 256 x 48 = 12 288 numbers. A segment of K = 4 frames is
+256 x 24 + 1 + 7 + 3 x (54 + 82 x 24) = 12 218, so L_max = 82. Posed views cost 0 numbers of D_geom: the
+poses are given and M = 0.
+
+## Forward projection and decoder
+
+Cell u of keyframe k lands in frame t at
+
+    P_k(u) = exp(-rho_k(u)) K^-1 [u, 1]
+    P'(u)  = R_t (P_k(u) + m_t(u)) + tau_t
+    p(u)   = pi(P'(u)),  z(u) = P'_z(u)
+
+Each query cell u' of frame t reads its k = 9 nearest projected cells. The attention logit bias is
+`-lam_d d^2 - lam_z Δlog z + w_cut(d) + cull`, with `w_cut = log max(eps, 1 - d^2 / R^2)` and R the
+distance to the 10th neighbour, so the read is smooth when a cell enters or leaves the neighbour set.
+`Δlog z` is the depth of each neighbour against the soft-selected front surface (soft z-buffer), and
+`cull` is a soft back-face term from the normals of the keyframe surface. Values are built from
+`[c_k ; Fourier(u' - p) ; Fourier(t - t_k)]`.
+
+Frames after the keyframe are coded in order. For each one:
+
+1. **Predict.** Run the geometric read, then self-attention, to get `h_geom`. Add a 3 x 3 window read of
+   the previous decoded frame to get `h_pred` (zero-init).
+2. **Residual.** Compute `e = X_t - sg[feat(h_pred)]` in DINO space. `Enc_R` (slots reading
+   `[e ; sg[X~] ; sg[c_k]]`) turns it into `D_innov`.
+3. **Innovation.** Cross-attend from a query built on `[Fourier(u') ; sg[h_pred] ; d_min]` to
+   `[null ; D_innov[:L]]`. The null token has value 0, and the branch is masked when L = 0.
+4. **Combine.** `h = h_pred` when L = 0, with no stop-gradient. Otherwise `h = sg[h_pred] + h_innov`.
+   DINO features come from a linear head and RGB from the v0 conv upsampler.
+
+## Backbone
+
+The backbone has two streams with separate weights (MM-DiT style). Each layer runs block C, then block D:
+
+| Block | Queries | Keys and values |
+|---|---|---|
+| C | 256 cells + 1 focal token of the keyframe | own tokens + DINOv3 memory of the keyframe |
+| D, frame t | 256 cells + 1 pose + 16 flow tokens | `[K_C ; K_D(t-1) ; K_D(t) ; memory(t)]` |
+| link | 1 token per keyframe | `[K_C(k) ; K_C(k-1) ; own]` |
+
+- **The mask is asymmetric.** C never reads D or other frames. D is sparse-causal (Tune-A-Video), with C
+  as the sink. For t = 1 the previous frame is the keyframe, so its D slot is empty.
+- **The memory is read-only.** It holds the DINOv3 patch features of layers 6, 12, 18 and 24, each with
+  its own projection and layer embedding. Every block re-reads it in every layer.
+- **Positions.** RoPE runs over (t, x, y) with 16 / 24 / 24 dims of each 64-dim head. t is the frame
+  index in the clip. Posed views add a zero-init Plücker ray embedding instead of a view axis.
+- **Heads.**
+  - Content `mu` and `logvar`.
+  - `rho`, which reads the stream and the 4 memory layers, like a DPT head.
+  - FOV, from the focal token.
+  - Pose, flow and link, all zero-init, so identity pose and no flow at the start.
+  - On posed views, `rho` also gets a `tanh(alpha)`-gated cross-view refinement, with alpha = 0 at init.
+- **Option B.** `shared_streams: true` gives the D blocks the C block weights.
+
+The default config has about 102M trainable parameters: 59M backbone, 16M Enc_R and 20M decoder.
+
+## Losses
+
+| Name | What |
+|---|---|
+| `rec_feat`, `rec_rgb` | DINO (1 - cos + MSE) and RGB L1 on every decoded frame |
+| `geo_feat`, `geo_rgb` | Charbonnier on the geometry-only decode `h_geom` of the frames after the keyframe |
+| `pred_feat` | Charbonnier on `sg[h_geom] + h_prev`: trains the previous-frame read without bending geometry |
+| `flow_l1` | mean of the 3D flow magnitude, so motion is explained by pose and depth first |
+| `smooth` | edge-aware smoothness of `rho` at keyframes |
+| `kl_c`, `kl_d` | KL of `c_k` and of the kept innovation tokens |
+| `link` | Charbonnier: keyframe k decoded from `C_{k-1}` through the link pose and scale |
+| `depth_prior` | optional, scale/shift-invariant pull of `rho` to a frozen depth probe trained on real depth labels |
+
+On still images `rho` is detached from `L_rec`, because without parallax it could only learn to carry
+content.
+
+## Decisions taken in this version
+
+- **Backbone option A** (two streams). Option B is one flag away.
+- **The innovation reference is the previous decoded frame** (DCVC-style conditional coding). It enters
+  the prediction through the window read, so the residual and `Enc_R` see it.
+- **`Δlog z` sits in the logit bias only**, never in the value path.
+- **The soft z-buffer reference is a softmax-weighted mean** of the neighbours' `log z`, windowed by
+  `w_cut`. The log-sum-exp form shifts by log(number of equal neighbours).
+- **Posed views keep the image order of bản 3.2.** View 0 is the keyframe and the others are sorted by
+  the angle of their optical axis to view 0. The previous view in that order is the reference.
+
+## Not implemented yet
+
+- 4D rigs: several cameras over time sharing one D_geom.
+- The world-model forecast of D (`L_fut`).
+- Training the depth probe.
+- Choosing L by a distortion threshold at inference. `forward(..., L=...)` takes explicit lengths.
+- LPIPS (`w_lpips > 0`) reuses the v0 module and has not been tested here.
+
+## Files
+
+| File | Content |
+|---|---|
+| `config.py` | `CD32Config`, budget accounting (`L_max`, `segment_numbers`), `tiny_config()` |
+| `geometry.py` | unproject / SE(3) / project, k-NN with cut radius, soft z-buffer, normals and cull, convex upsampling |
+| `encoder.py` | frozen DINOv3 read at several layers, pixel stem, memory tokens |
+| `layers.py` | 3-axis RoPE, stream block, window read |
+| `backbone.py` | two-stream backbone, C heads (content, rho, FOV, cross-view rho), D heads (pose, flow, link) |
+| `enc_r.py` | residual encoder |
+| `decoder.py` | geometric read, prediction blocks, innovation branch, feature and RGB heads |
+| `model.py` | `MAVTCD32.forward(x, modality, cam)`, the same interface as `MAVTDinoV0` |
+
+## Commands
+
+    python -m pytest tests/cd32 -q
+    python scripts/train_cd32.py --dry-run --out /tmp/cd32_dry
+    torchrun --nproc_per_node 2 scripts/train_cd32.py --dry-run --mix-modalities --out /tmp/cd32_ddp
+    torchrun --standalone --nproc_per_node <gpus> scripts/train_cd32.py --config configs/cd32/base.yaml \
+        --imagenet <parquet root> --openvid <manifest> --out <run dir>
+
+`scripts/train_cd32.py` is the v0 trainer, so it has the same flags, data loaders, DDP and checkpoints.
+Video clips must have a multiple of 4 frames. The link is trained only when a clip has at least 2
+segments, for example `--n-frames 8`.
