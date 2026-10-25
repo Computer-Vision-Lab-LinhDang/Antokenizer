@@ -186,6 +186,24 @@ def test_rendered_depth_loss_on_posed_views():
     assert m.c_heads.rho_mlp.fc2.bias.grad.abs().sum() > 0           # lambda < 1: the scale is supervised
 
 
+def test_rho_distill_teaches_the_single_view_part_only():
+    from .test_model import _orbit
+    torch.manual_seed(0)
+    off = dict(w_rgb=0.0, w_feat=0.0, w_geo=0.0, w_pred=0.0, w_flow=0.0, w_smooth=0.0, w_kl_c=0.0, w_kl_d=0.0)
+    m = MAVTCD32(tiny_config(w_rho_distill=1.0, **off))                # the distill term is the whole loss
+    x, cam = torch.rand(2, 3, 4, 64, 64) * 2 - 1, _orbit(2, 4, 64)
+    assert m(x, "threed", cam)["parts"]["rho_distill"] == 0          # gate closed: rho = rho_mono
+    with torch.no_grad():
+        m.c_heads.alpha.fill_(1.0)
+    out = m(x, "threed", cam)
+    assert out["parts"]["rho_distill"] > 0 and torch.isclose(out["loss"], out["parts"]["rho_distill"])
+    out["loss"].backward()
+    assert m.c_heads.rho_mlp.fc2.weight.grad.abs().sum() > 0
+    assert m.c_heads.refine_out.weight.grad.abs().sum() == 0           # the teacher is not pulled back
+    cam["depth"] = torch.zeros(2, 4, 64, 64)                           # all background: nothing to distill
+    assert m(x, "threed", cam)["parts"]["rho_distill"] == 0
+
+
 def test_model_checks_probe_layers(tmp_path):
     cfg = tiny_config()
     p = DepthProbe(cfg.stub_dino_dim, (1, 3))

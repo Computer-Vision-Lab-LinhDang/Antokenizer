@@ -198,13 +198,15 @@ class CHeads(nn.Module):
         logvar = logvar.clamp(-30, 20)
         mem = mem_key.permute(0, 2, 1, 3).flatten(2)                               # [B', N, L*dim]
         rho = self.rho_mlp(torch.relu(self.rho_in(torch.cat([cells, mem], -1)))).squeeze(-1).float()
+        out = {}
         if other_views is not None:                                                # [B', V-1, N, dim]
             kv = self.refine_norm_kv(other_views.flatten(1, 2))
             a, _ = self.refine(self.refine_norm_q(cells), kv, kv, need_weights=False)
+            out["rho_mono"] = rho                                                  # single-view part
             rho = rho + torch.tanh(self.alpha) * self.refine_out(a).squeeze(-1).float()
         s = torch.sigmoid(self.fov(ftok).squeeze(-1).float() + self.fov_bias)
         fov = cfg.fov_min + (cfg.fov_max - cfg.fov_min) * s
-        return dict(mu=mu, logvar=logvar, rho=rho, fov=fov)
+        return dict(mu=mu, logvar=logvar, rho=rho, fov=fov, **out)
 
 
 class DHeads(nn.Module):

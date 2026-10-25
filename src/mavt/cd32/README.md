@@ -87,6 +87,7 @@ The default config has about 102M trainable parameters: 59M backbone, 16M Enc_R 
 | `link` | Charbonnier: keyframe k decoded from `C_{k-1}` through the link pose and scale |
 | `depth_prior` | optional, shift-invariant pull of `rho` to `sg[probe]`, a frozen depth probe trained on real depth labels |
 | `depth_gt` | optional, SILog of `rho` (view 0 of posed views) against rendered depth, when the batch has it |
+| `rho_distill` | optional, posed views: L1 of the single-view part of `rho` to `sg[rho]` (with the cross-view refinement) |
 
 On still images `rho` is detached from `L_rec`, because without parallax it could only learn to carry
 content.
@@ -123,6 +124,11 @@ posed views in the units of the cameras (no normalisation). Two optional depth s
 - **Rendered depth on posed views.** `--objaverse-depth` loads the Objaverse `_depth.png` maps
   (`v / 65535 * max_depth`, background invalid) and `w_depth_gt` scores `rho` of view 0 against them
   (SILog, `depth_gt_lam`).
+- **Self-distillation on posed views.** `rho = rho_mono + tanh(alpha) CrossAttn_rho(...)`. With
+  `w_rho_distill > 0`, `|rho_mono - sg[rho]|` makes the single-view part learn what the cross-view
+  refinement adds, since images and video have no other views. Only cells with rendered depth count when
+  the batch has it (background cells are not constrained by any view). The term is 0 while the gate is
+  closed (`alpha = 0` at init).
 
 Depth labels come as jsonl manifests (format in `depth_data.py`). `scripts/make_depth_manifest.py` builds
 them from the packed OmniWorld-Game (dense metric depth), Argoverse 2 (LiDAR projected into the ring

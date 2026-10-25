@@ -83,6 +83,7 @@ class CD32Config:
     depth_prior_on: tuple = ("image", "video")   # modalities that get the prior (posed views: by parallax)
     w_depth_gt: float = 0.0               # rho of view 0 against rendered depth, when the batch has it
     depth_gt_lam: float = 0.85            # SILog lambda of that loss (1 = scale-free; poses fix the scale)
+    w_rho_distill: float = 0.0            # posed views: |rho_mono - sg[rho]| (single-view part learns the refined rho)
     w_lpips: float = 0.0
     charbonnier_eps: float = 1e-3
     detach_rho_image: bool = True         # still images have no parallax: rho gets no gradient from L_rec

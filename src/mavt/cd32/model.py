@@ -205,6 +205,7 @@ class MAVTCD32(nn.Module):
             diag["rho_probe_corr"] = _pearson(rho.detach(), target).mean()
             if cfg.w_depth_prior > 0 and modality in cfg.depth_prior_on:
                 loss = loss + cfg.w_depth_prior * dp
+        mask = None
         if depth_gt is not None:
             tgt, mask = cell_log_inv_depth(depth_gt, depth_gt > 0, cfg.grid)
             dg = silog(rho, tgt, mask, lam=cfg.depth_gt_lam)
@@ -212,6 +213,15 @@ class MAVTCD32(nn.Module):
             diag["rho_gt_corr"] = _pearson(rho.detach(), tgt, mask).mean()
             if cfg.w_depth_gt > 0:
                 loss = loss + cfg.w_depth_gt * dg
+        if "rho_mono" in ch:
+            # the single-view part of rho learns what the cross-view refinement adds; 0 while the gate is
+            # closed (tanh(alpha) = 0 at init); only on cells with rendered depth when the batch has it
+            # (background cells are not constrained by any view)
+            w = mask.float() if mask is not None else torch.ones_like(rho)
+            dd = ((ch["rho_mono"] - rho.detach()).abs() * w).sum() / w.sum().clamp_min(1.0)
+            parts["rho_distill"] = dd.detach()
+            if cfg.w_rho_distill > 0:
+                loss = loss + cfg.w_rho_distill * dd
         diag["rho_std"] = rho.detach().std(-1).mean()
         return loss
 

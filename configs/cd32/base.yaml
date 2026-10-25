@@ -67,6 +67,7 @@ depth_prior_kind: silog        # silog | ssi | ordinal
 depth_prior_on: [image, video] # posed views learn depth from parallax (and rendered depth below)
 w_depth_gt: 0.0                # > 0 with --objaverse-depth: rho of view 0 against the rendered depth
 depth_gt_lam: 0.85             # SILog lambda of that loss (poses fix the scale)
+w_rho_distill: 0.0             # posed views: |rho_mono - sg[rho]| on cells with rendered depth
 w_lpips: 0.0
 detach_rho_image: true
 
