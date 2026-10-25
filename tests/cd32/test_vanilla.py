@@ -205,3 +205,37 @@ def test_lpips_on_a_subset_of_frames_and_resume():
     sd = {k: v for k, v in m.state_dict().items() if not k.startswith("lpips.")}   # LPIPS is never saved
     missing, unexpected = m.load_state_dict(sd, strict=False)
     assert not [k for k in missing if "lpips" in k] and not unexpected
+
+
+def _evaluator():
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    spec = importlib.util.spec_from_file_location("eval_cdv", os.path.join(ROOT, "scripts", "eval_cdv.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_eval_dry_run_on_a_trained_checkpoint(tmp_path):
+    """scripts/eval_cdv.py: checkpoint kind detection, the PSNR-vs-L curve, key vs non-key frames, depth corr."""
+    tr, ev = _trainer(), _evaluator()
+    run = tmp_path / "s1"
+    assert tr.main(["--dry-run", "--out", str(run)]) == 0
+    assert ev.checkpoint_kind(str(run / "last.pt")) == "vanilla"
+    out = tmp_path / "ev"
+    assert ev.main(["--dry-run", "--ckpt", str(run / "last.pt"), "--L-list", "0,1,max,99", "--out", str(out)]) == 0
+    res = json.loads((out / "eval.json").read_text())
+    assert res["kind"] == "vanilla" and res["step"] == 3 and res["L_list"] == [0, 1, res["L_max"]]
+    im = res["images"]
+    assert im["n_images"] == 4 and np.isfinite(im["psnr"]) and 0 <= im["ssim"] <= 1 and im["numbers"] == 192
+    for v in (res["video"]["synthetic"], res["threed"]):
+        Ls = [r["L"] for r in v["curve"]]
+        assert Ls == res["L_list"] and all(np.isfinite(r["psnr"]) for r in v["curve"])
+        nums = [r["numbers"] for r in v["curve"]]
+        assert nums == sorted(nums) and nums[-1] <= res["budget"] and nums[0] < nums[-1]
+        assert np.isfinite(v["key"]["psnr"]) and v["n_clips"] == 4 and v["n_frames"] == 4
+        assert v["diag"]["L_mean"] == res["L_max"]
+    assert "xi_rot_deg" in res["video"]["synthetic"]["diag"] and "flow_l1" in res["video"]["synthetic"]["diag"]
+    assert "rho_gt_corr" in res["threed"]["diag"]
+    md = (out / "eval.md").read_text()
+    assert "| L | numbers | PSNR |" in md and "Key frames (C only)" in md
+    assert ev.parse_L("max,0,0,5", 3) == [0, 3]

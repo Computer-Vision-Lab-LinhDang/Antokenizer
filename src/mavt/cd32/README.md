@@ -136,6 +136,16 @@ one (optimizer and schedule fresh): images, then + video, then + posed views.
     ... --imagenet <root> --openvid <manifest> --n-frames 4 --init <stage 1>/last.pt --out <stage 2>
     ... --objaverse <render root> --objaverse-depth --init <stage 2>/last.pt --out <stage 3>
 
+Held-out numbers of a stage (either model kind; the checkpoint's config says which): `scripts/eval_cdv.py`
+scores ImageNet validation (PSNR, SSIM, LPIPS, rFID), the held-out tail of each video manifest and the
+Objaverse hold-out views. For video and posed views it reports the key frames (C only) apart from the frames
+after them, and decodes those frames once per L of `--L-list` (0 = geometry only, max = L_max), so the
+PSNR-vs-numbers curve of one checkpoint comes out of one run; with `--objaverse-depth` it also gives
+`rho_gt_corr`. Outputs are clamped to [-1, 1] before scoring, unlike the training-batch PSNR in the logs.
+
+    python scripts/eval_cdv.py --ckpt <stage>/last.pt --imagenet <parquet root> --openvid <manifest>[,<manifest>] \
+        --objaverse <render root> --objaverse-depth --dino-repo <local copy> --out <stage>/eval
+
 ## Depth
 
 `rho` is log inverse depth per cell. Still images and video only know it up to a shift (median depth 1),
