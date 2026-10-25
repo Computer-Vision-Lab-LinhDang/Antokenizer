@@ -8,8 +8,9 @@
 Images (ImageNet validation, --image-limit random images): PSNR, SSIM, LPIPS and rFID of the reconstruction
 (the `lpips` / `torchmetrics` packages are optional). Video (the held-out tail of each manifest, clips of
 --n-frames frames at --frame-stride): per-frame PSNR of the key frames (C only) and of the frames after them
-(C + D), and the PSNR-vs-L curve: every frame after a keyframe decoded with L innovation slots for each L of
---L-list (0 = geometry only: C + pose + flow; max = L_max), with the numbers a segment then costs.
+(C + D), the copy-the-keyframe baseline on the same frames (no model: is the geometry-only decode better than
+doing nothing?), and the PSNR-vs-L curve: every frame after a keyframe decoded with L innovation slots for
+each L of --L-list (0 = geometry only: C + pose + flow; max = L_max), with the numbers a segment then costs.
 Diagnostics from the same pass: xi_rot_deg, xi_trans, flow_l1, rho_std, fov_deg. Posed views (Objaverse
 hold-out, view 0 = keyframe, --n-views views): the same curve; with --objaverse-depth also rho_gt_corr, the
 Pearson correlation of rho with the rendered depth. Outputs are clamped to [-1, 1] before scoring.
@@ -177,18 +178,21 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
     K = model.cfg.keyframe_every
     curve = {L: {k: Mean() for k in ("psnr", "ssim", "lpips", "numbers")} for L in L_list}
     key = {k: Mean() for k in ("psnr", "ssim", "lpips")}
+    copy = {k: Mean() for k in ("psnr", "ssim", "lpips")}                # baseline: the keyframe as frame t
     dg, seen, T, t0 = DiagMean(), 0, 0, time.time()
     for b in loader:
         x = b["data"].to(dev, non_blocking=True)                       # [B, 3, T, H, W]
         B, T = x.shape[0], x.shape[2]
         cam = None
+        t = torch.arange(T, device=dev)
         if modality == "threed":
             cam = {k: b[k].to(dev) for k in ("c2w", "K", "depth") if k in b}
-            is_key = torch.arange(T, device=dev) == 0
+            key_of = torch.zeros_like(t)
             L_shape = (B, T - 1)
         else:
-            is_key = torch.arange(T, device=dev) % K == 0
+            key_of = t - t % K
             L_shape = (B * (T // K), K - 1)
+        is_key = key_of == t
         frames = x.permute(0, 2, 1, 3, 4)
         for L in L_list:
             Lt = torch.full(L_shape, L, dtype=torch.long, device=dev)
@@ -213,13 +217,19 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
                 key["ssim"].add_t(s[:, is_key])
                 if lp.available:
                     key["lpips"].add_t(lp(rgb[:, is_key].flatten(0, 1), tgt[:, is_key].flatten(0, 1)))
+                src, dst = tgt[:, key_of[nk]].flatten(0, 1), tgt[:, nk].flatten(0, 1)
+                copy["psnr"].add_t(E.psnr(src, dst))
+                copy["ssim"].add_t(E.ssim(src, dst))
+                if lp.available:
+                    copy["lpips"].add_t(lp(src, dst))
                 dg.add(out, B)
         seen += B
         if limit and seen >= limit:
             break
     rows = [dict(L=L, **{k: m.mean for k, m in c.items() if m.n}) for L, c in curve.items()]
-    return dict(n_clips=seen, n_frames=T, key={k: m.mean for k, m in key.items() if m.n}, curve=rows,
-                diag=dg.result(), seconds=time.time() - t0)
+    return dict(n_clips=seen, n_frames=T, key={k: m.mean for k, m in key.items() if m.n},
+                copy_key={k: m.mean for k, m in copy.items() if m.n}, curve=rows, diag=dg.result(),
+                seconds=time.time() - t0)
 
 
 # ---------------------------------------------------------------------------------------------- data
@@ -269,11 +279,14 @@ def _curve_md(v: dict) -> list:
     for r in v["curve"]:
         lines.append(f"| {r['L']} | {_f(r.get('numbers'), 0)} | {_f(r.get('psnr'))} | {_f(r.get('ssim'), 3)} | "
                      f"{_f(r.get('lpips'), 3)} |")
-    k = v["key"]
+    k, c = v["key"], v["copy_key"]
     lines.append("")
     lines.append(f"Key frames (C only): PSNR {_f(k.get('psnr'))}, SSIM {_f(k.get('ssim'), 3)}, "
                  f"LPIPS {_f(k.get('lpips'), 3)}. Frames after the keyframe at L = max minus L = 0: "
                  f"{_f(v['curve'][-1].get('psnr', 0) - v['curve'][0].get('psnr', 0))} dB.")
+    lines.append(f"Baseline, the keyframe copied as the frame (no model): PSNR {_f(c.get('psnr'))}, "
+                 f"SSIM {_f(c.get('ssim'), 3)}, LPIPS {_f(c.get('lpips'), 3)}; L = 0 above it by "
+                 f"{_f(v['curve'][0].get('psnr', 0) - c.get('psnr', 0))} dB.")
     if v["diag"]:
         lines.append("")
         lines.append(_diag_line(v["diag"]))

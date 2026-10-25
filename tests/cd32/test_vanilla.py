@@ -233,9 +233,10 @@ def test_eval_dry_run_on_a_trained_checkpoint(tmp_path):
         nums = [r["numbers"] for r in v["curve"]]
         assert nums == sorted(nums) and nums[-1] <= res["budget"] and nums[0] < nums[-1]
         assert np.isfinite(v["key"]["psnr"]) and v["n_clips"] == 4 and v["n_frames"] == 4
+        assert np.isfinite(v["copy_key"]["psnr"]) and 0 <= v["copy_key"]["ssim"] <= 1
         assert v["diag"]["L_mean"] == res["L_max"]
     assert "xi_rot_deg" in res["video"]["synthetic"]["diag"] and "flow_l1" in res["video"]["synthetic"]["diag"]
     assert "rho_gt_corr" in res["threed"]["diag"]
     md = (out / "eval.md").read_text()
-    assert "| L | numbers | PSNR |" in md and "Key frames (C only)" in md
+    assert "| L | numbers | PSNR |" in md and "Key frames (C only)" in md and "Baseline" in md
     assert ev.parse_L("max,0,0,5", 3) == [0, 3]
