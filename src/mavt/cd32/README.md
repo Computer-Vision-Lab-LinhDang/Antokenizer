@@ -151,6 +151,9 @@ video) moves what moves, then read and refined with `r[:L]`. Posed views are the
 the case where the camera is predicted. The camera is side information and costs no numbers; a segment costs
 C + (K - 1) x (flow + innovation). Diagnostics: `rho_gt_corr` against the keyframe's depth, and `flow_dyn` /
 `flow_static`, the mean |M| on cells with and without moving objects: the flow should go to what moves.
+By default rho is median-normalised as for video and the encoder does not see the cameras; `world_rays: true`
+feeds the Plücker rays of the known cameras to the encoder and the decoder queries (as posed views), and
+`world_median_rho: false` keeps rho in the clip's scale.
 
 Held-out numbers of a stage (either model kind; the checkpoint's config says which): `scripts/eval_cdv.py`
 scores ImageNet validation (PSNR, SSIM, LPIPS, rFID), the held-out tail of each video manifest and the

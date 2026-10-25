@@ -49,6 +49,9 @@ class CDVConfig(CD32Config):
     w_feat: float = 0.25                  # DINO feature loss is auxiliary; the pixels are the target
     w_lpips: float = 0.5
     lpips_max_frames: int = 64            # the VGG of LPIPS on every frame halves the throughput
+    # ---- world (4D) clips: known cameras + predicted flow
+    world_rays: bool = False              # Plücker rays of the known cameras into the encoder and decoder queries
+    world_median_rho: bool = True         # rho median-normalised as video (the clip is scaled to median depth 1)
 
     def check(self) -> None:
         super().check()

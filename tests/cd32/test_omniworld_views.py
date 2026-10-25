@@ -144,9 +144,10 @@ def _world_inputs(B=2, T=8, size=64):
     return torch.rand(B, 3, T, size, size) * 2 - 1, cam
 
 
-def test_world_step_finite_and_backward():
+@pytest.mark.parametrize("rays,median", [(False, True), (True, False)])
+def test_world_step_finite_and_backward(rays, median):
     torch.manual_seed(0)
-    m = MAVTCDV(tiny_cdv_config(w_depth_gt=0.5))
+    m = MAVTCDV(tiny_cdv_config(w_depth_gt=0.5, world_rays=rays, world_median_rho=median))
     x, cam = _world_inputs()
     out = m(x, "world", cam, return_outputs=True)
     assert torch.isfinite(out["loss"]) and all(torch.isfinite(v) for v in out["parts"].values())
@@ -159,6 +160,9 @@ def test_world_step_finite_and_backward():
     grads = {n for n, p in m.named_parameters() if p.grad is not None and p.grad.abs().sum() > 0}
     assert "heads.flow.weight" in grads and "heads.slot_out.weight" in grads and "heads.rho.fc2.weight" in grads
     assert "heads.pose.weight" not in grads                     # the camera is known: no predicted pose
+    assert d["xi_trans"].item() > 0                              # the orbit moves: the given camera motion
+    if median:
+        assert torch.allclose(o["rho"].median(-1).values, torch.zeros(4), atol=1e-6)
 
 
 def test_world_uses_the_known_camera_causally():

@@ -270,11 +270,13 @@ class MAVTCDV(DepthRegs, nn.Module):
             rel = torch.linalg.inv(c2w[:, :1]) @ c2w                                      # frames in camera k
             rays = patch_rays(rel, Kpix, cfg.image_size, G)                               # [Bp, K, N, 6]
             T_v = torch.linalg.inv(rel)                                                   # camera k -> camera t
-        enc = self.encoder(img.flatten(0, 1), rays.flatten(0, 1))
+        rays = rays if cfg.world_rays else None
+        enc = self.encoder(img.flatten(0, 1), None if rays is None else rays.flatten(0, 1))
         sv = lambda t: t.reshape(Bp, K, *t.shape[1:])
         x, tgt = sv(self._tokens(enc)), sv(enc["feat_target"])
         hd = self.heads(self.backbone(x[:, 0], x[:, 1:]), "threed")
-        c, rho = gaussian_sample(hd["mu"], hd["logvar"], self.training), hd["rho"]   # metric: cameras are known
+        c = gaussian_sample(hd["mu"], hd["logvar"], self.training)
+        rho = geo.median_normalise(hd["rho"]) if cfg.world_median_rho else hd["rho"]
         Kc = geo.intrinsics_to_cells(Kpix, cfg.patch)
         w_flow = self.flow_w(c)
         R0, t0 = self._identity(Bp, dev)
@@ -292,7 +294,8 @@ class MAVTCDV(DepthRegs, nn.Module):
         H = self._decode(c, "video", projs, dts, tokens, L_all, rays)
         loss, rgb = self._rec(H, tgt, img, parts, diag)
         if cfg.w_geo > 0:
-            loss = loss + self._geo(c, "video", projs[1:], dts[1:], tgt[:, 1:], img[:, 1:], parts, diag, rays[:, 1:])
+            loss = loss + self._geo(c, "video", projs[1:], dts[1:], tgt[:, 1:], img[:, 1:], parts, diag,
+                                    None if rays is None else rays[:, 1:])
         M = torch.stack(ms, 1)                                                            # [Bp, K-1, N, 3]
         fl = M.abs().mean()
         parts["flow_l1"] = fl.detach()
@@ -306,6 +309,8 @@ class MAVTCDV(DepthRegs, nn.Module):
         L = L_all[:, 1:].float()
         diag["L_mean"] = L.mean()
         diag["numbers"] = cfg.c_numbers("threed") + (K - 1) * 3 * cfg.n_flow + (L * cfg.d_r).sum(1).mean()
+        diag["xi_rot_deg"] = geo.rotation_angle_deg(T_v[:, 1:, :3, :3]).mean()          # the given camera motion
+        diag["xi_trans"] = T_v[:, 1:, :3, 3].norm(dim=-1).mean()
         if cam.get("dyn") is not None:                    # does the flow go to what moves? (keyframe's mask)
             share = F.adaptive_avg_pool2d(seg(cam["dyn"].float())[:, 0].unsqueeze(1), G).flatten(1)   # [Bp, N]
             mov = M.detach().norm(dim=-1).mean(1)                                         # [Bp, N]
