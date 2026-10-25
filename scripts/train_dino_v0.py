@@ -58,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-views", type=int, default=4)
     p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
     p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
+    p.add_argument("--objaverse-depth", action=argparse.BooleanOptionalAction, default=False,
+                   help="posed views also load their rendered depth (cam['depth']; used by the cd32 model)")
     p.add_argument("--n-frames", type=int, default=8)
     p.add_argument("--frame-stride", default="2",
                    help="int, or a list like 2,4,8: each training clip draws one stride uniformly "
@@ -255,7 +257,7 @@ def orbit_cams(B: int, T: int, size: int) -> dict:
     return dict(c2w=c2w, K=K)
 
 
-def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, seed: int):
+def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, seed: int, depth: bool = False):
     g = torch.Generator().manual_seed(seed)
     s = cfg.image_size
     shape = (batch, 3, s, s) if modality == "image" else (batch, 3, n_frames, s, s)
@@ -263,6 +265,8 @@ def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, 
         b = dict(data=torch.rand(shape, generator=g) * 2 - 1, modality=modality)
         if modality == "threed":
             b.update(orbit_cams(batch, n_frames, s))
+            if depth:                                                # a sphere-ish blob at about 2 units
+                b["depth"] = (2.0 - torch.rand(batch, n_frames, s, s, generator=g) * 0.2)
         yield b
 
 
@@ -273,7 +277,8 @@ def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dic
                         n_frames=args.n_frames, frame_stride=args.frame_stride, n_views=args.n_views,
                         video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
                         num_workers=args.num_workers, rank=rank, world=world, seed=seed,
-                        ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3))
+                        ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3),
+                        objaverse_depth=getattr(args, "objaverse_depth", False))
     return {m: infinite(ld, smp) for m, (ld, smp) in lds.items()}
 
 
@@ -372,6 +377,8 @@ def to_inputs(b: dict, modality: str, dev) -> tuple:
     cam = None
     if modality == "threed":
         cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
+        if "depth" in b:
+            cam["depth"] = b["depth"].to(dev, non_blocking=True)
     return x, cam
 
 
@@ -382,7 +389,7 @@ def probe_unused(step_mod: MixedStep, cfg: DinoV0Config, args, dev, use_amp: boo
     batches = {}
     for m in step_mod.weights:
         T = args.n_views if m == "threed" else args.n_frames
-        batches[m] = to_inputs(next(synthetic_iter(m, 1, cfg, T, args.seed)), m, dev)
+        batches[m] = to_inputs(next(synthetic_iter(m, 1, cfg, T, args.seed, getattr(args, "objaverse_depth", False))), m, dev)
     step_mod.train().zero_grad(set_to_none=True)
     with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
         out = step_mod(batches)
@@ -492,7 +499,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
 
     if dry:
         bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d)
-        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed) for m in MODALITIES}
+        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed, args.objaverse_depth) for m in MODALITIES}
     else:
         # sampler seed: the same on every rank, so the rank shards are disjoint (it was per rank in v0).
         # Augmentation stays per rank: worker seeds come from each rank's own torch stream (data._worker_init).

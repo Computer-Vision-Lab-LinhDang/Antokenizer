@@ -31,15 +31,6 @@ def edge_aware_smooth(rho: torch.Tensor, feat: torch.Tensor, grid: int) -> torch
     return ((r[:, :, 1:] - r[:, :, :-1]).abs() * wx).mean() + ((r[:, 1:] - r[:, :-1]).abs() * wy).mean()
 
 
-def scale_shift_invariant(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """MiDaS-style: both [B, N] aligned by their median and mean absolute deviation, then L1."""
-    def norm(x):
-        x = x.float()
-        med = x.median(-1, keepdim=True).values
-        return (x - med) / (x - med).abs().mean(-1, keepdim=True).clamp_min(1e-6)
-    return (norm(pred) - norm(target)).abs().mean()
-
-
 def psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Mean PSNR (dB) over images in [-1, 1]: pred / target [B, 3, H, W]."""
     mse = ((pred.float().clamp(-1, 1) - target.float()) / 2).pow(2).flatten(1).mean(-1)

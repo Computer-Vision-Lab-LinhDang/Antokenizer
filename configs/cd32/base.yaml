@@ -61,7 +61,12 @@ w_smooth: 0.01
 w_kl_c: 1.0e-6
 w_kl_d: 1.0e-6
 w_link: 0.25
-w_depth_prior: 0.0             # > 0 needs depth_probe (a probe trained on real depth labels)
+depth_probe: null              # probe from scripts/train_depth_probe.py, e.g. --set depth_probe=<probe.pt>
+w_depth_prior: 0.0             # > 0 needs depth_probe; 0 with a probe = logged only
+depth_prior_kind: silog        # silog | ssi | ordinal
+depth_prior_on: [image, video] # posed views learn depth from parallax (and rendered depth below)
+w_depth_gt: 0.0                # > 0 with --objaverse-depth: rho of view 0 against the rendered depth
+depth_gt_lam: 0.85             # SILog lambda of that loss (poses fix the scale)
 w_lpips: 0.0
 detach_rho_image: true
 

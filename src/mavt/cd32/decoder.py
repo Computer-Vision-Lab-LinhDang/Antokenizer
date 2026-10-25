@@ -87,7 +87,8 @@ class GeomRead(nn.Module):
                 bias = bias + torch.gather(cull.unsqueeze(1).expand(-1, N, -1), 2, idx).unsqueeze(2)
             a = torch.softmax(logits + bias, -1).to(v.dtype)
         out = torch.einsum("bnhk,bnkhd->bnhd", a, v).flatten(-2)
-        return q0 + self.out(out), d2[..., 0].clamp_min(0).sqrt()
+        # d_min = 0 at an identity projection: clamp above 0, so sqrt has a finite gradient on every torch
+        return q0 + self.out(out), d2[..., 0].clamp_min(1e-12).sqrt()
 
 
 class InnovBlock(nn.Module):

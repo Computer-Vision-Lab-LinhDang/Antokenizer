@@ -77,8 +77,12 @@ class CD32Config:
     w_kl_c: float = 1e-6
     w_kl_d: float = 1e-6
     w_link: float = 0.25                  # keyframe k decoded from C_{k-1} through the link pose
-    w_depth_prior: float = 0.0            # scale/shift-invariant pull of rho to a depth probe (needs depth_probe)
-    depth_probe: Optional[str] = None     # torch.save'd state_dict of Linear(dino_dim, 1) -> log inverse depth
+    depth_probe: Optional[str] = None     # probe file from scripts/train_depth_probe.py (frozen, never saved)
+    w_depth_prior: float = 0.0            # L_depth_prior: pull of rho to sg[probe]; 0 with a probe = log only
+    depth_prior_kind: str = "silog"       # silog (shift-invariant in log depth) | ssi | ordinal (see depth.py)
+    depth_prior_on: tuple = ("image", "video")   # modalities that get the prior (posed views: by parallax)
+    w_depth_gt: float = 0.0               # rho of view 0 against rendered depth, when the batch has it
+    depth_gt_lam: float = 0.85            # SILog lambda of that loss (1 = scale-free; poses fix the scale)
     w_lpips: float = 0.0
     charbonnier_eps: float = 1e-3
     detach_rho_image: bool = True         # still images have no parallax: rho gets no gradient from L_rec
@@ -144,6 +148,8 @@ class CD32Config:
         assert len(self.conv_channels) - 1 == (self.patch.bit_length() - 1), "one conv stage per x2 up to the patch"
         assert self.segment_numbers("image") <= self.budget, "image C exceeds the budget"
         assert self.segment_numbers("video") <= self.budget, "video segment exceeds the budget"
+        assert self.depth_prior_kind in ("silog", "ssi", "ordinal"), "depth_prior_kind: silog | ssi | ordinal"
+        assert set(self.depth_prior_on) <= {"image", "video", "threed"}, "depth_prior_on: image, video, threed"
 
 
 def tiny_config(**kw) -> CD32Config:

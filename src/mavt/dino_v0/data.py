@@ -472,6 +472,20 @@ def objaverse_camera(cam: dict, size: int, render_size: int = 512) -> tuple[torc
     return c2w, K
 
 
+def objaverse_depth(raw: np.ndarray, alpha: np.ndarray, max_depth: float, size: int) -> np.ndarray:
+    """Rendered depth PNG (uint16, value / 65535 * max_depth = camera z, 65535 = background) + the RGBA alpha
+    -> float32 [size, size] camera z, 0 where invalid (background, anti-aliased rim). Nearest-neighbour resize."""
+    z = raw.astype(np.float32) / 65535.0 * max_depth
+    valid = (raw < 65535) & (alpha > 0)
+    z = np.where(valid, z, 0.0).astype(np.float32)
+    h, w = z.shape
+    if (h, w) != (size, size):
+        ys = np.clip(((np.arange(size) + 0.5) * h / size).astype(np.int64), 0, h - 1)
+        xs = np.clip(((np.arange(size) + 0.5) * w / size).astype(np.int64), 0, w - 1)
+        z = z[ys][:, xs]
+    return np.ascontiguousarray(z)
+
+
 class ObjaverseViews(Dataset):
     """n_views random distinct posed renders of one Objaverse object (view 0 = keyframe).
 
@@ -479,14 +493,15 @@ class ObjaverseViews(Dataset):
     root/renders/<uid>/NNNNN.png (RGBA, transparent bg) + NNNNN.json camera. RGBA is composited
     over a background (train: one random gray level per object, eval: white) and resized to `size`
     (no crop). The last `holdout` non-blank uids are the eval split ('heldout'); 'train' excludes them.
-    Returns {'data': [3,T,H,W], 'modality': 'threed', 'c2w': [T,4,4], 'K': [T,3,3], 'label': category}."""
+    Returns {'data': [3,T,H,W], 'modality': 'threed', 'c2w': [T,4,4], 'K': [T,3,3], 'label': category},
+    plus 'depth' [T,H,W] (camera z in scene units, 0 = background) when depth=True (see objaverse_depth)."""
 
     MANIFEST = "manifest.lvis_full.jsonl"
 
     def __init__(self, root: str, n_views: int = 4, size: int = 256, train: bool = True, bg: str = "random",
                  holdout: int = 500, split: Optional[str] = None, manifest: Optional[str] = None,
-                 max_retries: int = 20):
-        self.root, self.n_views, self.size, self.train = root, n_views, size, train
+                 max_retries: int = 20, depth: bool = False):
+        self.root, self.n_views, self.size, self.train, self.depth = root, n_views, size, train, depth
         self.bg = bg if train else ("white" if bg == "random" else bg)
         split = split or ("train" if train else "heldout")
         rows = read_manifest(manifest or os.path.join(root, self.MANIFEST), path_key=None)
@@ -524,10 +539,15 @@ class ObjaverseViews(Dataset):
         else:                                                       # eval: fixed, spread-out views
             pick = [names[(k * len(names)) // self.n_views] for k in range(self.n_views)]
         level = rng.randint(0, 255) if self.bg == "random" else (0 if self.bg == "black" else 255)
-        frames, c2ws, Ks = [], [], []
+        frames, c2ws, Ks, depths = [], [], [], []
         for n in pick:
             im = Image.open(os.path.join(d, n + ".png")).convert("RGBA")
             rw = im.size[0]
+            if self.depth:
+                with open(os.path.join(d, n + ".json")) as f:
+                    mx = float(json.load(f).get("max_depth", 5.0))
+                with Image.open(os.path.join(d, n + "_depth.png")) as dm:
+                    depths.append(objaverse_depth(np.array(dm), np.asarray(im)[..., 3], mx, self.size))
             bgim = Image.new("RGBA", im.size, (level, level, level, 255))
             im = Image.alpha_composite(bgim, im).convert("RGB")
             if im.size != (self.size, self.size):
@@ -537,8 +557,11 @@ class ObjaverseViews(Dataset):
                 c2w, K = objaverse_camera(json.load(f), self.size, render_size=rw)
             c2ws.append(c2w)
             Ks.append(K)
-        return dict(data=_to_tensor(np.stack(frames)), modality="threed", c2w=torch.stack(c2ws),
-                    K=torch.stack(Ks), label=r.get("category", ""))
+        out = dict(data=_to_tensor(np.stack(frames)), modality="threed", c2w=torch.stack(c2ws),
+                   K=torch.stack(Ks), label=r.get("category", ""))
+        if self.depth:
+            out["depth"] = torch.from_numpy(np.stack(depths))
+        return out
 
     def __getitem__(self, i: int) -> dict:
         rng = self._rng if self.train else random.Random(i)
@@ -557,7 +580,7 @@ class ObjaverseViews(Dataset):
 # ---------------------------------------------------------------------------- loaders
 def collate(batch: list[dict]) -> dict:
     out = dict(data=torch.stack([b["data"] for b in batch]), modality=batch[0]["modality"])
-    for k in ("c2w", "K"):
+    for k in ("c2w", "K", "depth"):
         if k in batch[0]:
             out[k] = torch.stack([b[k] for b in batch])
     if "stride" in batch[0]:                                      # frame stride of each clip [B]
@@ -646,7 +669,7 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                   eval_frame_stride: Optional[int] = None, n_views: int = 4, video_tail: int = 1000,
                   objaverse_holdout: int = 500, num_workers: int = 8, rank: int = 0, world: int = 1,
                   seed: int = 0, split: str = "train", ssv2: Optional[str] = None,
-                  ssv2_weight: float = 0.3) -> dict:
+                  ssv2_weight: float = 0.3, objaverse_depth: bool = False) -> dict:
     """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
     Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
     DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
@@ -656,7 +679,7 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
     format, used whole as unlabeled video: labels are never read) mixed into the video stream: each
     video sample is SSv2 with probability ssv2_weight (MixtureSampler, rank-sharded). With OpenVid,
     ssv2_weight <= 0 leaves SSv2 out and >= 1 leaves OpenVid out; without OpenVid, SSv2 is the
-    whole video stream."""
+    whole video stream. objaverse_depth: posed views also carry their rendered depth ('depth')."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -687,7 +710,8 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
     if vids:
         out["video"] = (DataLoader(ds, batch_size=batch_video, sampler=smp, drop_last=True, **common), smp)
     if objaverse:
-        ds = ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout)
+        ds = ObjaverseViews(objaverse, n_views=n_views, size=size, train=train, holdout=objaverse_holdout,
+                            depth=objaverse_depth)
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
         out["threed"] = (DataLoader(ds, batch_size=batch_3d, sampler=smp, drop_last=True, **common), smp)
     return out

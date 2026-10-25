@@ -83,7 +83,8 @@ class MultiLayerDINO(nn.Module):
 
 class FrameEncoder(nn.Module):
     """frames [B', 3, H, W] in [-1, 1] -> dict(x0 [B', N, dim], mem [B', L, N, dim], feat_target [B', N, D],
-    cls [B', D], patch_last [B', N, D] (centred, for the depth probe))."""
+    cls [B', D], patch [B', N, D] (centred last layer), layers: list of [B', N, D] raw DINO features at
+    cfg.dino_layers (read by the frozen depth probe))."""
 
     def __init__(self, cfg: CD32Config):
         super().__init__()
@@ -109,4 +110,4 @@ class FrameEncoder(nn.Module):
             x0 = x0 + r
             mem = mem + r.unsqueeze(1)
         return dict(x0=x0, mem=mem, feat_target=F.layer_norm(centred, centred.shape[-1:]).detach(),
-                    cls=cls.float().detach(), patch=centred.detach())
+                    cls=cls.float().detach(), patch=centred.detach(), layers=[f.detach() for f in layers])

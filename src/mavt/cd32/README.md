@@ -85,7 +85,8 @@ The default config has about 102M trainable parameters: 59M backbone, 16M Enc_R 
 | `smooth` | edge-aware smoothness of `rho` at keyframes |
 | `kl_c`, `kl_d` | KL of `c_k` and of the kept innovation tokens |
 | `link` | Charbonnier: keyframe k decoded from `C_{k-1}` through the link pose and scale |
-| `depth_prior` | optional, scale/shift-invariant pull of `rho` to a frozen depth probe trained on real depth labels |
+| `depth_prior` | optional, shift-invariant pull of `rho` to `sg[probe]`, a frozen depth probe trained on real depth labels |
+| `depth_gt` | optional, SILog of `rho` (view 0 of posed views) against rendered depth, when the batch has it |
 
 On still images `rho` is detached from `L_rec`, because without parallax it could only learn to carry
 content.
@@ -105,9 +106,29 @@ content.
 
 - 4D rigs: several cameras over time sharing one D_geom.
 - The world-model forecast of D (`L_fut`).
-- Training the depth probe.
 - Choosing L by a distortion threshold at inference. `forward(..., L=...)` takes explicit lengths.
 - LPIPS (`w_lpips > 0`) reuses the v0 module and has not been tested here.
+
+## Depth
+
+`rho` is log inverse depth per cell. Still images and video only know it up to a shift (median depth 1),
+posed views in the units of the cameras (no normalisation). Two optional depth signals:
+
+- **Prior from a probe.** `scripts/train_depth_probe.py` fits a linear probe on the frozen DINOv3 layers
+  of `dino_layers` (each centred and layer-normed) to real depth labels, with SILog (lambda 0.85) plus a
+  small ordinal term. The tokenizer loads it with `depth_probe=<file>` as non-persistent buffers (never in
+  checkpoints) and pulls `rho` to `sg[probe]` with `w_depth_prior`, by default on images and video only.
+  `depth_prior_kind`: `silog` (lambda 1: shift-invariant in log depth), `ssi` (scale and shift) or
+  `ordinal`. With `w_depth_prior = 0` the loss and `rho_probe_corr` are only logged.
+- **Rendered depth on posed views.** `--objaverse-depth` loads the Objaverse `_depth.png` maps
+  (`v / 65535 * max_depth`, background invalid) and `w_depth_gt` scores `rho` of view 0 against them
+  (SILog, `depth_gt_lam`).
+
+Depth labels come as jsonl manifests (format in `depth_data.py`). `scripts/make_depth_manifest.py` builds
+them from the packed OmniWorld-Game (dense metric depth), Argoverse 2 (LiDAR projected into the ring
+cameras, sparse, real) and NYU Depth v2. `scripts/eval_cd32_depth.py` scores `rho`, the probe and a
+constant depth with median scaling per image (AbsRel, SqRel, RMSE, RMSE log, SILog, delta < 1.25^k), per
+cell and per pixel, and on held-out Objaverse objects also without scaling.
 
 ## Files
 
@@ -120,7 +141,9 @@ content.
 | `backbone.py` | two-stream backbone, C heads (content, rho, FOV, cross-view rho), D heads (pose, flow, link) |
 | `enc_r.py` | residual encoder |
 | `decoder.py` | geometric read, prediction blocks, innovation branch, feature and RGB heads |
-| `model.py` | `MAVTCD32.forward(x, modality, cam)`, the same interface as `MAVTDinoV0` |
+| `model.py` | `MAVTCD32.forward(x, modality, cam)`, the same interface as `MAVTDinoV0`; `load_model()` |
+| `depth.py` | cell depth targets, SILog / SSI / ordinal losses, depth metrics, the depth probe |
+| `depth_data.py` | depth manifests: reading depth files, crops that keep invalid pixels invalid |
 
 ## Commands
 
@@ -129,6 +152,14 @@ content.
     torchrun --nproc_per_node 2 scripts/train_cd32.py --dry-run --mix-modalities --out /tmp/cd32_ddp
     torchrun --standalone --nproc_per_node <gpus> scripts/train_cd32.py --config configs/cd32/base.yaml \
         --imagenet <parquet root> --openvid <manifest> --out <run dir>
+    python scripts/make_depth_manifest.py omniworld --root <pack root> --split train --out <train.jsonl>
+    python scripts/make_depth_manifest.py argoverse2 --root <av2 sensor root> --split val --out-dir <dir>
+    python scripts/train_depth_probe.py --train <manifests> --val <manifests> --out <probe dir>
+    python scripts/eval_cd32_depth.py --ckpt <run dir>/last.pt --probe <probe.pt> --depth <manifests> \
+        [--objaverse <render root>] --out <json>
+
+Overrides of single config fields: `--set KEY=VALUE` (repeatable), e.g.
+`--set depth_probe=<probe.pt> --set w_depth_prior=0.1`.
 
 `scripts/train_cd32.py` is the v0 trainer, so it has the same flags, data loaders, DDP and checkpoints.
 Video clips must have a multiple of 4 frames. The link is trained only when a clip has at least 2

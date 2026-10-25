@@ -27,10 +27,19 @@ from .config import CD32Config
 from .decoder import Decoder
 from .enc_r import ResidualEncoder
 from .encoder import FrameEncoder
-from .losses import (charbonnier, edge_aware_smooth, feat_loss, gaussian_sample, kl, kl_masked, psnr, rgb_l1,
-                     scale_shift_invariant)
+from .depth import apply_probe, cell_log_inv_depth, load_probe, prior_loss, silog
+from .losses import charbonnier, edge_aware_smooth, feat_loss, gaussian_sample, kl, kl_masked, psnr, rgb_l1
 
 MODALITIES = ("image", "video", "threed")
+
+
+def _pearson(a: torch.Tensor, b: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Per-row correlation of [B, N] tensors over the masked entries (how well rho follows a depth target)."""
+    w = torch.ones_like(a, dtype=torch.float32) if mask is None else mask.float()
+    n = w.sum(-1, keepdim=True).clamp_min(1.0)
+    a = (a.float() - (a.float() * w).sum(-1, keepdim=True) / n) * w
+    b = (b.float() - (b.float() * w).sum(-1, keepdim=True) / n) * w
+    return (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp_min(1e-6)
 
 
 class MAVTCD32(nn.Module):
@@ -55,14 +64,21 @@ class MAVTCD32(nn.Module):
         if cfg.w_lpips > 0:
             from ..dino_v0.losses import LPIPSLoss
             self.lpips = LPIPSLoss()
-        self.depth_probe = None
-        if cfg.w_depth_prior > 0:
-            if not cfg.depth_probe:
-                raise ValueError("w_depth_prior > 0 needs depth_probe: a Linear(dino_dim, 1) state_dict trained "
-                                 "on real depth labels (log inverse depth)")
-            self.depth_probe = nn.Linear(feat_dim, 1)
-            self.depth_probe.load_state_dict(torch.load(cfg.depth_probe, map_location="cpu"))
-            self.depth_probe.requires_grad_(False)
+        # Frozen depth probe (L_depth_prior). Kept as non-persistent buffers: it is not part of the
+        # tokenizer, so checkpoints neither carry it nor need it on resume.
+        self.probe_idx = None
+        if cfg.w_depth_prior > 0 and not cfg.depth_probe:
+            raise ValueError("w_depth_prior > 0 needs depth_probe: a probe file written by "
+                             "scripts/train_depth_probe.py (linear probe on real depth labels)")
+        if cfg.depth_probe:
+            ck = load_probe(cfg.depth_probe)
+            if int(ck["dim"]) != feat_dim:
+                raise ValueError(f"depth probe expects {ck['dim']}-dim DINO features, the encoder has {feat_dim}")
+            if any(int(l) not in cfg.dino_layers for l in ck["layers"]):
+                raise ValueError(f"depth probe layers {ck['layers']} must be among dino_layers {cfg.dino_layers}")
+            self.probe_idx = [list(cfg.dino_layers).index(int(l)) for l in ck["layers"]]
+            self.register_buffer("probe_weight", ck["weight"].float(), persistent=False)
+            self.register_buffer("probe_bias", ck["bias"].float(), persistent=False)
 
     # ------------------------------------------------------------------------------ helpers
     @staticmethod
@@ -163,11 +179,16 @@ class MAVTCD32(nn.Module):
         R, tau = self._identity(B, frames.device)
         h, _, _ = self.decoder.predict(ch["c"], "image", self.decoder.project(rho_dec, Kc, R, tau), 0.0)
         loss, rgb = self._rec(h.unsqueeze(1), enc["feat_target"].unsqueeze(1), frames, parts, diag)
-        loss = loss + self._c_regs(ch, rho, enc["feat_target"], parts, diag)
+        loss = loss + self._c_regs(ch, rho, enc["feat_target"], parts, diag, enc["layers"], "image")
         diag["numbers"] = torch.tensor(float(cfg.segment_numbers("image")), device=frames.device)
         return loss, dict(rgb=rgb.view_as(frames), c=ch["mu"], rho=rho)
 
-    def _c_regs(self, ch, rho, feat_key, parts, diag, patch_key=None):
+    def probe_rho(self, layers: list) -> torch.Tensor:
+        """Frozen probe on the keyframe's DINO layers (list over cfg.dino_layers of [B, N, D]) -> [B, N]."""
+        with geo.fp32(layers[0].device):
+            return apply_probe([layers[i] for i in self.probe_idx], self.probe_weight, self.probe_bias).detach()
+
+    def _c_regs(self, ch, rho, feat_key, parts, diag, layers_key=None, modality=None, depth_gt=None):
         cfg = self.cfg
         loss = 0.0
         k = kl(ch["mu"], ch["logvar"])
@@ -177,11 +198,20 @@ class MAVTCD32(nn.Module):
             s = edge_aware_smooth(rho, feat_key, cfg.grid)
             parts["smooth"] = s.detach()
             loss = loss + cfg.w_smooth * s
-        if self.depth_probe is not None and patch_key is not None:
-            target = self.depth_probe(patch_key.float()).squeeze(-1).detach()
-            dp = scale_shift_invariant(rho, target)
+        if self.probe_idx is not None and layers_key is not None:
+            target = self.probe_rho(layers_key)
+            dp = prior_loss(cfg.depth_prior_kind, rho, target)
             parts["depth_prior"] = dp.detach()
-            loss = loss + cfg.w_depth_prior * dp
+            diag["rho_probe_corr"] = _pearson(rho.detach(), target).mean()
+            if cfg.w_depth_prior > 0 and modality in cfg.depth_prior_on:
+                loss = loss + cfg.w_depth_prior * dp
+        if depth_gt is not None:
+            tgt, mask = cell_log_inv_depth(depth_gt, depth_gt > 0, cfg.grid)
+            dg = silog(rho, tgt, mask, lam=cfg.depth_gt_lam)
+            parts["depth_gt"] = dg.detach()
+            diag["rho_gt_corr"] = _pearson(rho.detach(), tgt, mask).mean()
+            if cfg.w_depth_gt > 0:
+                loss = loss + cfg.w_depth_gt * dg
         diag["rho_std"] = rho.detach().std(-1).mean()
         return loss
 
@@ -195,7 +225,7 @@ class MAVTCD32(nn.Module):
         Bp = B * S
         enc = self.encoder(frames.flatten(0, 1))
         seg = lambda t: t.reshape(Bp, K, *t.shape[1:])
-        x0, mem, tgt, patch = seg(enc["x0"]), seg(enc["mem"]), seg(enc["feat_target"]), seg(enc["patch"])
+        x0, mem, tgt = seg(enc["x0"]), seg(enc["mem"]), seg(enc["feat_target"])
         img = frames.reshape(Bp, K, *frames.shape[2:])
         tk = (torch.arange(S, device=dev) * K).float().repeat(B)                        # frame index of keyframes
         td = tk.view(-1, 1) + torch.arange(1, K, device=dev).float()
@@ -228,7 +258,7 @@ class MAVTCD32(nn.Module):
         kd = torch.stack(co["kl"]).mean()
         parts["kl_d"] = kd.detach()
         loss = loss + cfg.w_kl_d * kd
-        loss = loss + self._c_regs(ch, rho, tgt[:, 0], parts, diag, patch[:, 0])
+        loss = loss + self._c_regs(ch, rho, tgt[:, 0], parts, diag, [seg(f)[:, 0] for f in enc["layers"]], "video")
         # link: keyframe k decoded from C_{k-1} through the 7 link numbers (pose + log scale)
         sel = torch.nonzero(torch.arange(Bp, device=dev) % S > 0).squeeze(1)
         if sel.numel() > 0 and cfg.w_link > 0:
@@ -290,7 +320,9 @@ class MAVTCD32(nn.Module):
             Ls = torch.stack(co["L"], 1).float()
             diag["L_mean"] = Ls.mean()
             diag["numbers"] = cfg.c_numbers("threed") + (Ls * cfg.d_r).sum(1).mean()
-        loss = loss + self._c_regs(ch, rho, tgt[:, 0], parts, diag)
+        depth_gt = take(cam["depth"].float())[:, 0] if cam.get("depth") is not None else None
+        loss = loss + self._c_regs(ch, rho, tgt[:, 0], parts, diag, [sv(f)[:, 0] for f in enc["layers"]],
+                                   "threed", depth_gt)
         diag["rho_refine_gate"] = torch.tanh(self.c_heads.alpha).detach()
         return loss, dict(rgb=rgb.view(B, V, *rgb.shape[1:]), c=ch["mu"], rho=rho, order=order)
 
@@ -320,3 +352,26 @@ class MAVTCD32(nn.Module):
         if return_outputs:
             out["outputs"] = outputs
         return out
+
+
+def load_model(ckpt_path: str, device="cpu", strict: bool = True, **overrides):
+    """Checkpoint of scripts/train_cd32.py -> (model in eval mode, cfg, step). Training-only parts are off
+    (LPIPS); `overrides` replace config fields, e.g. depth_probe=<probe file> or depth_probe=None."""
+    import dataclasses
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    fields = {f.name for f in dataclasses.fields(CD32Config)}
+    cfg_d = {k: v for k, v in dict(ck.get("cfg", {})).items() if k in fields}
+    for k in ("dino_layers", "rope_dims", "conv_channels", "depth_prior_on"):
+        if isinstance(cfg_d.get(k), list):
+            cfg_d[k] = tuple(cfg_d[k])
+    cfg_d.update(w_lpips=0.0, depth_probe=None, w_depth_prior=0.0)
+    cfg_d.update(overrides)
+    cfg = CD32Config(**cfg_d)
+    model = MAVTCD32(cfg)
+    sd = ck["model"] if "model" in ck else ck
+    sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in sd.items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [k for k in missing if not k.startswith("encoder.dino.model.")]
+    if strict and (missing or unexpected):
+        raise RuntimeError(f"checkpoint mismatch: missing={missing[:10]} unexpected={unexpected[:10]}")
+    return model.to(device).eval(), cfg, int(ck.get("step", -1))
