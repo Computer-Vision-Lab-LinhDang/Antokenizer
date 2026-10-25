@@ -162,6 +162,11 @@ def main():
     ap.add_argument("--d-prefix-lens", default=None,
                     help="d_nested models: comma list of D prefix lengths to sweep, e.g. 0,1,2,4,8 "
                          "(default 0, M/8, M/4, M/2, 3M/4, M)")
+    ap.add_argument("--split-probe", action="store_true",
+                    help="d_nested models: per prefix n also psnr_warpdlen{n} (warp only) and psnr_split{n} "
+                         "(delta from D token 1, content read from tokens 2..n)")
+    ap.add_argument("--static-repeat", action="store_true",
+                    help="video evals on still clips: every clip replaced by its frame 0 repeated")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -211,14 +216,16 @@ def main():
                      knn_t=args.knn_t, num_classes=1000 if image_train is not None else None,
                      probe_epochs=args.probe_epochs, probe_lrs=[float(x) for x in args.probe_lrs.split(",")],
                      use_lpips=not args.no_lpips, use_fid=not args.no_fid, extra_video=extra,
-                     prefix_lens=None if args.d_prefix_lens is None else [int(x) for x in args.d_prefix_lens.split(",")])
+                     prefix_lens=None if args.d_prefix_lens is None else [int(x) for x in args.d_prefix_lens.split(",")],
+                     static_repeat=args.static_repeat, split_probe=args.split_probe)
     for name, ds in (("openvid", video), *extra.items()):
         msg = short_clip_note(name, ds, args.video_frames, args.frame_stride) if ds is not None else None
         if msg:
             res["notes"].append(msg)
             print(f"[data] {msg}", flush=True)
     res["meta"] = dict(ckpt=os.path.abspath(args.ckpt), step=step, amp=args.amp, device=args.device,
-                       video_frames=args.video_frames, frame_stride=args.frame_stride, cfg=cfg.__dict__)
+                       video_frames=args.video_frames, frame_stride=args.frame_stride,
+                       static_repeat=args.static_repeat, split_probe=args.split_probe, cfg=cfg.__dict__)
     jp, mp = E.write_results(res, args.out, args.stem)
     print(E.to_markdown({k: v for k, v in res.items() if k != "meta"}))
     print(f"[done] {jp} {mp}", flush=True)

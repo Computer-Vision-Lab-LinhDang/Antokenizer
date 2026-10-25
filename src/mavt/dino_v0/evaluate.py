@@ -11,6 +11,9 @@ Reconstruction
            at (u, v) + delta only; skipped when the model has no warp_only), gap_* = psnr_full - psnr_*,
            delta_cells_mean / delta_cells_p95 (L2 norm of delta in cells), gate, cos_full (decoded vs
            DINOv3 feature cosine).
+  D prefix (d_nested): psnr_dlen{n} (only the first n D tokens read); with split_probe also
+           psnr_warpdlen{n} (warp only, first n tokens) and psnr_split{n} (n >= 1: delta reads D token 1 alone,
+           the content read tokens 2..n + the null token). static_repeat: every clip is its frame 0 repeated.
   forecast (video_pass): for each horizon h of e['zd_fut'] (v1) or e['zd_next'] (v0, h = 1), frame
            t + h decoded from zc of frame t's segment and the forecast zd, against the ground truth:
            forecast_h{h}_psnr / _cos, and the copy baselines (frame t as the guess for t + h):
@@ -39,7 +42,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import DinoV0Config
-from .decoder import patches_to_image
+from .decoder import patches_to_image, query_coords
+from .rope import modality_mask
 
 PSNR_CAP = 100.0      # dB; PSNR of identical images is capped here instead of inf
 
@@ -344,19 +348,37 @@ def quantile(x: torch.Tensor, q: float) -> float:
     return float(x.kthvalue(k).values)
 
 
+def split_decode(model, zc: torch.Tensor, zd: torch.Tensor, t, ell: int) -> dict:
+    """Decode a video frame with D split in two: delta reads D token 1 alone, the blocks' content read reads
+    tokens 2..ell plus the null token (d_nested). Queries built as in model.decode_frame (all N, float t)."""
+    dec, cfg = model.decoder, model.cfg
+    B = zc.shape[0]
+    qc = query_coords(cfg.grid, float(t), B, None, device=zc.device)
+    qm = modality_mask("video", qc.shape[1], device=zc.device).unsqueeze(0).expand(B, -1, -1)
+    one = torch.ones(B, device=zc.device, dtype=torch.long)
+    d, v1 = dec.d_tokens(zd, one)
+    delta = dec.compute_delta(d, qc, None, v1)
+    _, rv = dec.d_tokens(zd, one * ell)
+    rv = rv & (torch.arange(rv.shape[1], device=rv.device) > 0)        # drop token 1 from the content read
+    return dec(zc, zd, qc, qm, "video", delta_override=delta, read_valid=rv)
+
+
 KINDS = ("", "_key", "_nonkey")       # all frames, keyframes (t % K == 0), the others
 
 
 @torch.no_grad()
 def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Optional[int] = None,
                log: Optional[Logger] = None, per_clip: bool = True,
-               prefix_lens: Optional[Sequence[int]] = None) -> dict:
+               prefix_lens: Optional[Sequence[int]] = None, static_repeat: bool = False,
+               split_probe: bool = False) -> dict:
     """Per-frame reconstruction, C/D split diagnostics and forecasts on video clips [B, 3, T, H, W].
 
     Every per-frame metric m is averaged over all frames (m), keyframes (m_key) and the other frames
     (m_nonkey); out['per_clip'] holds the same means for each clip (plus its 'stride' when the batch
     has one). Forecast metrics are bucketed by their target frame t + h. A metric whose model output
-    is missing (v0: no warp_only, no zd_fut) is skipped and listed in out['skipped']."""
+    is missing (v0: no warp_only, no zd_fut) is skipped and listed in out['skipped'].
+    static_repeat: each clip replaced by its frame 0 repeated T times (no motion: what D does on a still clip).
+    split_probe (d_nested): psnr_warpdlen{n} and psnr_split{n} next to psnr_dlen{n} (see split_decode)."""
     model.eval()
     cfg = model.cfg
     K = cfg.keyframe_every
@@ -387,6 +409,8 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
             if n >= limit:
                 break
             x = x[: limit - n]
+        if static_repeat:
+            x = x[:, :, :1].expand_as(x).contiguous()
         B, _, T = x.shape[:3]
         T_seen = T
         fr: Dict[str, torch.Tensor] = {}                                   # metric -> [B, T], NaN = not measured
@@ -439,6 +463,11 @@ def video_pass(model, loader: Iterable, device, *, amp: bool = False, limit: Opt
                 for ell in lens:                                           # the first ell D tokens only
                     ln = torch.full((B,), ell, device=zd.device, dtype=torch.long)
                     put(f"psnr_dlen{ell}", t, psnr(frame_image(dec(zc, zd, t, zd_len=ln), cfg), tgt))
+                    if split_probe and can_warp:                           # D through delta only
+                        ow = dec(zc, zd, t, warp_only=True, zd_len=ln)
+                        put(f"psnr_warpdlen{ell}", t, psnr(frame_image(ow, cfg), tgt))
+                    if split_probe and ell >= 1:                           # token 1 -> delta, 2..ell -> content
+                        put(f"psnr_split{ell}", t, psnr(frame_image(split_decode(model, zc, zd, t, ell), cfg), tgt))
                 if can_warp:                                               # C read at (u, v) + delta only
                     try:
                         ow = dec(zc, zd, t, warp_only=True)
@@ -642,7 +671,8 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
              num_classes: Optional[int] = None, probe_epochs: int = 10,
              probe_lrs: Sequence[float] = (1e-3, 3e-3, 1e-2, 3e-2), use_lpips: bool = True,
              use_fid: bool = True, extra_video: Optional[dict] = None, log: Optional[Logger] = None,
-             prefix_lens: Optional[Sequence[int]] = None) -> dict:
+             prefix_lens: Optional[Sequence[int]] = None, static_repeat: bool = False,
+             split_probe: bool = False) -> dict:
     """Run every eval whose dataset (or ready DataLoader) is given. extra_video: {name: dataset | None}."""
     log = log or Logger()
     cfg: DinoV0Config = model.cfg
@@ -677,7 +707,8 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
 
     if video is not None:
         res["video_recon"] = video_pass(model, as_loader(video, video_batch_size, num_workers), device,
-                                        amp=amp, limit=video_limit, log=log, prefix_lens=prefix_lens)
+                                        amp=amp, limit=video_limit, log=log, prefix_lens=prefix_lens,
+                                        static_repeat=static_repeat, split_probe=split_probe)
         note_skipped("video_recon")
         log(f"video recon: {json.dumps({k: v for k, v in res['video_recon'].items() if k != 'per_clip'})}",
             force=True)
@@ -688,7 +719,8 @@ def run_eval(model, device, *, image_val=None, image_train=None, video=None, bat
             log(msg, force=True)
             continue
         res[f"video_{name}"] = video_pass(model, as_loader(ds, video_batch_size, num_workers), device,
-                                          amp=amp, limit=video_limit, log=log, prefix_lens=prefix_lens)
+                                          amp=amp, limit=video_limit, log=log, prefix_lens=prefix_lens,
+                                          static_repeat=static_repeat, split_probe=split_probe)
         note_skipped(f"video_{name}")
     return res
 
@@ -713,14 +745,20 @@ def _cd_split_md(v: dict) -> List[str]:
     return lines + [""]
 
 
-def _dlen_md(v: dict) -> List[str]:
+DLEN_TITLE = "D prefix length (nested dropout): PSNR dB when only the first n D tokens are read."
+WARPDLEN_TITLE = "D prefix length, warp only: PSNR dB, gate locked to the C read, delta from the first n D tokens."
+SPLIT_TITLE = ("D split: PSNR dB, delta reads D token 1 alone, the content read reads tokens 2..n "
+               "(+ the null token).")
+
+
+def _dlen_md(v: dict, pre: str = "psnr_dlen", title: str = DLEN_TITLE) -> List[str]:
     """Distortion vs D prefix length (nested dropout): all / non-key frames, then the clips by motion tercile
-    (motion_l1 = mean |frame_t - frame_{t-1}| in [-1, 1] pixels): the rate ladder must separate by motion."""
-    pre = "psnr_dlen"
+    (motion_l1 = mean |frame_t - frame_{t-1}| in [-1, 1] pixels): the rate ladder must separate by motion.
+    pre: the metric family (psnr_dlen, psnr_warpdlen, psnr_split), title: the table's caption."""
     lens = sorted(int(k[len(pre):]) for k in v if k.startswith(pre) and k[len(pre):].isdigit())
     if not lens:
         return []
-    lines = ["D prefix length (nested dropout): PSNR dB when only the first n D tokens are read.", "",
+    lines = [title, "",
              "| frames / clips | " + " | ".join(f"n = {n}" for n in lens) + " |", "|---|" + "---|" * len(lens)]
     for label, s in (("all frames", ""), ("non-key frames", "_nonkey")):
         lines.append(f"| {label} | " + " | ".join(_f(v.get(f"{pre}{n}{s}"), "{:.2f}") for n in lens) + " |")
@@ -776,7 +814,8 @@ def to_markdown(res: dict) -> str:
                   f"({_f(v.get('gap_zeroD_key'), '{:.2f}')} / {_f(v.get('gap_zeroD_nonkey'), '{:.2f}')}) | "
                   f"{_f(v.get('gap_noD'), '{:.2f}')} | {_f(v.get('gate'), '{:.3f}')} | "
                   f"{_f(v.get('delta_abs_cells'), '{:.3f}')} |", ""]
-        lines += _cd_split_md(v) + _dlen_md(v) + _forecast_md(v)
+        lines += (_cd_split_md(v) + _dlen_md(v) + _dlen_md(v, "psnr_warpdlen", WARPDLEN_TITLE)
+                  + _dlen_md(v, "psnr_split", SPLIT_TITLE) + _forecast_md(v))
     u = res.get("understanding")
     if u:
         lines += [f"## Understanding (ImageNet, train {u['n_train']} / val {u['n_val']})", "",

@@ -371,11 +371,13 @@ class QueryDecoder(nn.Module):
     def forward(self, zc: torch.Tensor, zd: Optional[torch.Tensor], q_coords: torch.Tensor,
                 q_mask: torch.Tensor, modality: str, delta_override: Optional[torch.Tensor] = None,
                 q_rays: Optional[torch.Tensor] = None, warp_only: bool = False,
-                zd_len: Optional[torch.Tensor] = None) -> dict:
+                zd_len: Optional[torch.Tensor] = None, read_valid: Optional[torch.Tensor] = None) -> dict:
         """zc [B, N, zr_c], zd [B, M, zr_d] | None, q_coords / q_mask [B, Q, 4] (each row its own t).
         q_rays [B, Q, 6]: Plücker rays of the target view's queries (posed 3D views), else None.
         warp_only: with zd, blocks add readC only (gate 1, readD skipped); Δ still comes from zd.
         zd_len [B] long | None: each row reads only the first zd_len D tokens (nested dropout; see d_tokens).
+        read_valid [B, M (+1)] bool | None: the D keys of the blocks' content read, in place of the zd_len
+        mask (Δ keeps the zd_len mask or delta_override); an eval probe that splits D between Δ and content.
 
         Returns rgb [B, Q, p*p*3], image [B, 3, H, W] (conv head) | None (linear head),
         feat [B, Q, feat_dim], delta [B, Q, 2], gate [B, Q, 1] (last block)."""
@@ -414,8 +416,9 @@ class QueryDecoder(nn.Module):
             h = h + self.ray_q(q_rays.to(c.dtype))
         d_blk = None if warp_only else d                                       # warp-only: D acts via Δ alone
         gate = None
+        rv = d_valid if read_valid is None else read_valid
         for blk in self.blocks:
-            h, gate = blk(h, c, d_blk, win, q_coords, q_mask, d_valid)
+            h, gate = blk(h, c, d_blk, win, q_coords, q_mask, rv)
         h = self.norm(h)
         if self.cfg.rgb_head == "linear":
             rgb, image = self.rgb_head(h), None

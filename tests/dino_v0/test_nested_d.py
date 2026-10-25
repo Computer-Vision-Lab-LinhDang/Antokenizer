@@ -227,6 +227,69 @@ def test_video_pass_sweeps_given_prefix_lengths():
         E.video_pass(m, E.make_loader(_Clips(2), 2), "cpu", prefix_lens=[cfg.d_tokens + 1])
 
 
+# ---------------------------------------------------------------------------- eval: D split probes, still clips
+def test_split_probe_full_warp_prefix_is_psnr_warp():
+    cfg = _v1(d_nested=True)
+    m = _model(cfg).eval()
+    _nonzero_delta(m.decoder)                                 # Δ ≠ 0: the warp-only decode differs from the full one
+    v = E.video_pass(m, E.make_loader(_Clips(3), 2), "cpu", split_probe=True)
+    M = cfg.d_tokens
+    lens = E.prefix_lengths(M)
+    assert all(f"psnr_warpdlen{n}" in v for n in lens)
+    assert "psnr_split0" not in v and all(f"psnr_split{n}" in v for n in lens if n >= 1)
+    assert math.isclose(v[f"psnr_warpdlen{M}"], v["psnr_warp"], abs_tol=1e-3)
+    md = E.to_markdown({"video_openvid": v})
+    assert E.WARPDLEN_TITLE in md and E.SPLIT_TITLE in md
+    plain = E.video_pass(m, E.make_loader(_Clips(2), 2), "cpu")
+    assert not any(k.startswith(("psnr_warpdlen", "psnr_split")) for k in plain)
+
+
+def test_read_valid_with_the_usual_mask_and_delta_is_the_usual_decode():
+    cfg = _v1(d_nested=True)
+    m = _model(cfg).double()
+    _nonzero_delta(m.decoder)
+    with torch.no_grad():
+        m.decoder.d_null.normal_()
+    dec = m.decoder
+    B, T = 2, 3
+    zc, zd, qc, qm = _flat_inputs(cfg, B, T, dtype=torch.float64)
+    for ell in (0, 1, cfg.d_tokens):
+        ln = torch.full((B * T,), ell)
+        a = dec(zc, zd, qc, qm, "video", zd_len=ln)
+        d, valid = dec.d_tokens(zd, ln)
+        b = dec(zc, zd, qc, qm, "video", read_valid=valid, delta_override=dec.compute_delta(d, qc, None, valid))
+        for k in ("image", "delta", "gate", "feat"):
+            torch.testing.assert_close(a[k], b[k])
+
+
+def test_split_decode_is_delta_from_token_1_and_content_from_tokens_2_to_ell():
+    cfg = _v1(d_nested=True)
+    m = _model(cfg).double()
+    _nonzero_delta(m.decoder)
+    with torch.no_grad():
+        m.decoder.d_null.normal_()
+    dec, B, t = m.decoder, 2, 3.0
+    g = torch.Generator().manual_seed(4)
+    zc = torch.randn(B, cfg.n_patches, cfg.zr_c_video, generator=g, dtype=torch.float64)
+    zd = torch.randn(B, cfg.d_tokens, cfg.zr_d, generator=g, dtype=torch.float64)
+    qc = query_coords(cfg.grid, t, B)                                    # as split_decode builds them
+    qm = modality_mask("video", cfg.n_patches).unsqueeze(0).expand(B, -1, -1)
+    delta = dec.compute_delta(dec.d_tokens(zd[:, :1])[0], qc)
+    for ell in (1, 2, cfg.d_tokens):
+        a = E.split_decode(m, zc, zd, t, ell)
+        b = dec(zc, zd[:, 1:ell], qc, qm, "video", delta_override=delta)      # sliced tokens (+ null)
+        for k in ("image", "delta", "gate", "feat"):
+            torch.testing.assert_close(a[k], b[k], atol=1e-9, rtol=1e-7)
+
+
+def test_static_repeat_has_no_motion_and_keyframes_decode_like_the_rest():
+    cfg = _v1(d_nested=True)
+    m = _model(cfg).eval()
+    v = E.video_pass(m, E.make_loader(_Clips(3), 2), "cpu", static_repeat=True)   # T = 4 = K: one segment
+    assert all(c["motion_l1"] == 0 for c in v["per_clip"])
+    assert math.isclose(v["psnr_dlen0_key"], v["psnr_dlen0_nonkey"], abs_tol=1e-3)
+
+
 # ---------------------------------------------------------------------------- the run config
 def test_v1c_alpha_yaml():
     yaml = pytest.importorskip("yaml")
