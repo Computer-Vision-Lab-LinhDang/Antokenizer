@@ -135,6 +135,14 @@ one (optimizer and schedule fresh): images, then + video, then + posed views.
         --imagenet <parquet root> --out <stage 1>
     ... --imagenet <root> --openvid <manifest> --n-frames 4 --init <stage 1>/last.pt --out <stage 2>
     ... --objaverse <render root> --objaverse-depth --init <stage 2>/last.pt --out <stage 3>
+    ... --omniworld <OmniWorld-Game pack root> --batch-world <n> --init <stage 3>/last.pt --out <stage 4>
+
+**World clips** (`--omniworld`, modality `world`): posed dynamic video from the OmniWorld-Game pack
+(`scripts/pack_omniworld_dino.py` on branch `feat/dino-omniworld-geo`, loader `dino_v0/omniworld.py`), one
+segment of `keyframe_every` frames per clip. The poses and intrinsics come from the cameras (translations over
+the keyframe's median depth, so they match the median-normalised `rho`); the object flow `M` and the innovation
+tokens are predicted as for video. The metric depth of the keyframe is scored against `rho` (`rho_gt_corr`, and
+the loss with `w_depth_gt > 0`).
 
 ## Depth
 

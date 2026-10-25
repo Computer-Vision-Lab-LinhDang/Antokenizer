@@ -7,6 +7,7 @@
       --imagenet <parquet root> --out <stage 1 dir>                                      # images
   ... --imagenet <root> --openvid <manifest> --init <stage 1 dir>/last.pt --out <stage 2 dir>   # + video
   ... --objaverse <render root> --init <stage 2 dir>/last.pt --out <stage 3 dir>         # + posed views
+  ... --omniworld <pack root> --init <stage 3 dir>/last.pt --out <stage 4 dir>           # + posed dynamic video
 
 The yaml holds CDVConfig fields at top level and trainer defaults under `train:` (CLI wins). --init loads
 the model weights of another run (optimizer and schedule start fresh); --resume continues a run in place.

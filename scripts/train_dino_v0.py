@@ -47,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--imagenet", default=None, help="ImageNet-1k HF parquet root")
     p.add_argument("--openvid", default=None, help="OpenVid jsonl manifest")
     p.add_argument("--objaverse", default=None, help="Objaverse render root (manifest.lvis_full.jsonl + renders/)")
+    p.add_argument("--omniworld", default=None,
+                   help="OmniWorld-Game pack root (scripts/pack_omniworld_dino.py): modality 'world', posed dynamic "
+                        "clips of one segment with metric depth (models whose MODALITIES include 'world')")
     p.add_argument("--steps", type=int, default=200_000)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.05, help="cosine floor as a fraction of --lr")
@@ -55,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-image", type=int, default=32, help="per GPU")
     p.add_argument("--batch-video", type=int, default=4, help="per GPU")
     p.add_argument("--batch-3d", type=int, default=4, help="per GPU, objects of --n-views views")
+    p.add_argument("--batch-world", type=int, default=4, help="per GPU, OmniWorld clips")
     p.add_argument("--n-views", type=int, default=4)
     p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
     p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
@@ -277,11 +281,16 @@ def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, 
     shape = (batch, 3, s, s) if modality == "image" else (batch, 3, n_frames, s, s)
     while True:
         b = dict(data=torch.rand(shape, generator=g) * 2 - 1, modality=modality)
-        if modality == "threed":
+        if modality in ("threed", "world"):
             b.update(orbit_cams(batch, n_frames, s))
-            if depth:                                                # a sphere-ish blob at about 2 units
+            if depth or modality == "world":                         # a sphere-ish blob at about 2 units
                 b["depth"] = (2.0 - torch.rand(batch, n_frames, s, s, generator=g) * 0.2)
         yield b
+
+
+def synthetic_frames(modality: str, args, cfg) -> int:
+    """Frames of a synthetic clip: views for posed views, one segment for world clips, else --n-frames."""
+    return dict(threed=args.n_views, world=cfg.keyframe_every).get(modality, args.n_frames)
 
 
 def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dict:
@@ -292,7 +301,9 @@ def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dic
                         video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
                         num_workers=args.num_workers, rank=rank, world=world, seed=seed,
                         ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3),
-                        objaverse_depth=getattr(args, "objaverse_depth", False))
+                        objaverse_depth=getattr(args, "objaverse_depth", False),
+                        omniworld=getattr(args, "omniworld", None), batch_world=getattr(args, "batch_world", 4),
+                        cell=cfg.patch, keyframe_every=cfg.keyframe_every)
     return {m: infinite(ld, smp) for m, (ld, smp) in lds.items()}
 
 
@@ -315,7 +326,7 @@ def parse_weights(spec: str) -> dict:
         if part.strip():
             k, v = part.split(":")
             w[k.strip()] = float(v)
-    bad = set(w) - {"image", "video", "threed"}
+    bad = set(w) - set(ALL_MODALITIES)
     if bad:
         raise SystemExit(f"unknown modalities in --modality-weights: {sorted(bad)}")
     return w
@@ -343,6 +354,7 @@ def bench_data(args, cfg, rank, world) -> None:
 
 # ---------------------------------------------------------------------------- mixed step / compile
 MODALITIES = ("image", "video", "threed")
+ALL_MODALITIES = MODALITIES + ("world",)        # + OmniWorld clips (--omniworld), for models that support them
 COMPILE_REGIONS = ("TrunkLayer", "CBlock", "DBlock", "DecoderBlock")   # repeated blocks, by class name
 
 
@@ -361,7 +373,7 @@ class MixedStep(torch.nn.Module):
 
     def forward(self, batches: dict) -> dict:
         loss, parts, diag = 0.0, {}, {}
-        for m in MODALITIES:
+        for m in ALL_MODALITIES:
             if m not in batches:
                 continue
             x, cam = batches[m]
@@ -377,8 +389,8 @@ def mixed_weights(spec: Optional[str], available) -> dict:
     """Loss weights of a mixed step over the available modalities, normalised to sum 1 so the step loss
     stays on the scale of a one-modality step (--grad-clip keeps its meaning). spec None: equal; a
     modality missing from spec or at 0 is not run."""
-    w = parse_weights(spec) if spec else {m: 1.0 for m in MODALITIES}
-    w = {m: w.get(m, 0.0) for m in MODALITIES if m in available and w.get(m, 0.0) > 0}
+    w = parse_weights(spec) if spec else {m: 1.0 for m in ALL_MODALITIES}
+    w = {m: w.get(m, 0.0) for m in ALL_MODALITIES if m in available and w.get(m, 0.0) > 0}
     if not w:
         raise SystemExit("--modality-loss-weights selects no available modality")
     tot = sum(w.values())
@@ -386,10 +398,10 @@ def mixed_weights(spec: Optional[str], available) -> dict:
 
 
 def to_inputs(b: dict, modality: str, dev) -> tuple:
-    """Loader batch -> (x, cam) on dev; cam = dict(c2w, K) for posed views, else None."""
+    """Loader batch -> (x, cam) on dev; cam = dict(c2w, K [, depth]) for posed views and world clips, else None."""
     x = b["data"].to(dev, non_blocking=True)
     cam = None
-    if modality == "threed":
+    if modality in ("threed", "world"):
         cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
         if "depth" in b:
             cam["depth"] = b["depth"].to(dev, non_blocking=True)
@@ -402,7 +414,7 @@ def probe_unused(step_mod: MixedStep, cfg: DinoV0Config, args, dev, use_amp: boo
     ranks. DDP ignores them: without find_unused_parameters it would wait for their gradients forever."""
     batches = {}
     for m in step_mod.weights:
-        T = args.n_views if m == "threed" else args.n_frames
+        T = synthetic_frames(m, args, cfg)
         batches[m] = to_inputs(next(synthetic_iter(m, 1, cfg, T, args.seed, getattr(args, "objaverse_depth", False))), m, dev)
     step_mod.train().zero_grad(set_to_none=True)
     with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
@@ -515,8 +527,10 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
     mixed = args.mix_modalities
 
     if dry:
-        bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d)
-        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed, args.objaverse_depth) for m in MODALITIES}
+        bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d, world=args.batch_world)
+        mods = [m for m in ALL_MODALITIES if m in MODALITIES or m in getattr(model, "MODALITIES", ())]
+        its = {m: synthetic_iter(m, bsz[m], cfg, synthetic_frames(m, args, cfg), seed, args.objaverse_depth)
+               for m in mods}
     else:
         # sampler seed: the same on every rank, so the rank shards are disjoint (it was per rank in v0).
         # Augmentation stays per rank: worker seeds come from each rank's own torch stream (data._worker_init).

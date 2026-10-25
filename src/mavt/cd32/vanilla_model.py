@@ -4,6 +4,8 @@ the interface of MAVTDinoV0 and MAVTCD32, so scripts/train_cdv.py is the v0 trai
   image   [B, 3, H, W]      C only; identity projection; L = 0
   video   [B, 3, T, H, W]   T = S * K; per segment C at the keyframe (+ focal), (xi, M, r[:L]) at the others
   threed  [B, 3, V, H, W]   posed views, cam = dict(c2w, K [, depth]); view 0 = keyframe, xi from the cameras
+  world   [B, 3, K, H, W]   posed dynamic video (one segment), cam = dict(c2w, K [, depth]): xi and K from the
+                            cameras, object flow M and innovation predicted as for video
 
 All frames of a segment are decoded in one batched pass of the decoder.
 """
@@ -21,11 +23,12 @@ from .losses import charbonnier, feat_loss, gaussian_sample, kl_masked, psnr, rg
 from .regs import DepthRegs
 from .vanilla import CDVConfig, VanillaBackbone, VanillaDecoder, VanillaHeads
 
-MODALITIES = ("image", "video", "threed")
+MODALITIES = ("image", "video", "threed", "world")
 
 
 class MAVTCDV(DepthRegs, nn.Module):
     COMPILE_REGIONS = ("StreamBlock", "DecBlock")
+    MODALITIES = MODALITIES
 
     def __init__(self, cfg: CDVConfig, use_checkpoint: bool = False):
         super().__init__()
@@ -146,12 +149,15 @@ class MAVTCDV(DepthRegs, nn.Module):
         diag["numbers"] = torch.tensor(float(cfg.segment_numbers("image")), device=dev)
         return loss, dict(rgb=rgb.view_as(frames), c=hd["mu"], rho=rho)
 
-    def _video(self, frames, parts, diag, L_given=None):
+    def _video(self, frames, parts, diag, L_given=None, cam=None):
+        """Video; with cam (world clips) the poses and intrinsics come from the cameras, one segment."""
         cfg = self.cfg
         B, T = frames.shape[:2]
         K, G, N, dev = cfg.keyframe_every, cfg.grid, cfg.n_cells, frames.device
         if T % K:
             raise ValueError(f"video length {T} must be a multiple of keyframe_every={K}")
+        if cam is not None and T != K:
+            raise ValueError(f"world clips hold one segment: {T} frames, keyframe_every={K}")
         S = T // K
         Bp = B * S
         enc = self.encoder(frames.flatten(0, 1))
@@ -160,21 +166,33 @@ class MAVTCDV(DepthRegs, nn.Module):
         img = frames.reshape(Bp, K, *frames.shape[2:])
         hd = self.heads(self.backbone(x[:, 0], x[:, 1:]), "video")
         c = gaussian_sample(hd["mu"], hd["logvar"], self.training)
-        rho = geo.median_normalise(hd["rho"])
-        Kc = geo.intrinsics_from_focal(geo.fov_to_focal(hd["fov"], G), G)
+        rho = geo.median_normalise(hd["rho"])      # world: translations are over the keyframe's median depth too
+        if cam is None:
+            Kc = geo.intrinsics_from_focal(geo.fov_to_focal(hd["fov"], G), G)
+            Kd = [None] * (K - 1)
+        else:
+            Kall = geo.intrinsics_to_cells(cam["K"].float(), cfg.patch)
+            Kc, Kd = Kall[:, 0], [Kall[:, j + 1] for j in range(K - 1)]
+            with geo.fp32(dev):
+                c2w = cam["c2w"].float()
+                T_t = torch.linalg.inv(c2w[:, 1:]) @ c2w[:, :1]                     # keyframe camera -> frame t
         w_flow = self.flow_w(c)
         R0, t0 = self._identity(Bp, dev)
-        projs, ms, Rs = [self.decoder.project(rho, Kc, R0, t0)], [], []
+        projs, ms, Rs, taus = [self.decoder.project(rho, Kc, R0, t0)], [], [], []
         for j in range(K - 1):
             if cfg.geometry:
-                R, tau = geo.pose_matrix(hd["xi"][:, j])
+                if cam is None:
+                    R, tau = geo.pose_matrix(hd["xi"][:, j])
+                else:
+                    R, tau = T_t[:, j, :3, :3], T_t[:, j, :3, 3]
                 m = geo.convex_upsample(hd["M"][:, j], w_flow, G)
-                projs.append(self.decoder.project(rho, Kc, R, tau, m))
+                projs.append(self.decoder.project(rho, Kc, R, tau, m, Kd[j]))
             else:
                 R, m = R0, torch.zeros(Bp, N, 3, device=dev)
                 projs.append(projs[0])
             ms.append(m)
             Rs.append(R)
+            taus.append(tau if cfg.geometry else t0)
         tokens, L_all, keep = self._innovation(hd, Bp, K - 1, L_given)
         dts = [j / K for j in range(K)]
         H = self._decode(c, "video", projs, dts, tokens, L_all)
@@ -187,13 +205,21 @@ class MAVTCDV(DepthRegs, nn.Module):
         kd = kl_masked(hd["r_mu"].flatten(0, 1), hd["r_logvar"].flatten(0, 1), keep.flatten(0, 1))
         parts["kl_d"] = kd.detach()
         loss = loss + cfg.w_kl_d * kd
-        loss = loss + self._c_regs(hd, rho, tgt[:, 0], parts, diag, [seg(f)[:, 0] for f in enc["layers"]], "video")
+        depth_gt = None if cam is None or cam.get("depth") is None else cam["depth"].float()[:, 0]
+        loss = loss + self._c_regs(hd, rho, tgt[:, 0], parts, diag, [seg(f)[:, 0] for f in enc["layers"]],
+                                   "video" if cam is None else "world", depth_gt)
         L = L_all[:, 1:].float()
         diag["L_mean"] = L.mean()
         diag["xi_rot_deg"] = geo.rotation_angle_deg(torch.stack(Rs, 1).detach()).mean()
-        diag["xi_trans"] = hd["xi"][..., 3:].detach().norm(dim=-1).mean()
-        diag["fov_deg"] = hd["fov"].detach().mean()
-        diag["numbers"] = cfg.c_numbers("video") + (K - 1) * cfg.geom_numbers + (L * cfg.d_r).sum(1).mean()
+        if cam is None:
+            diag["xi_trans"] = hd["xi"][..., 3:].detach().norm(dim=-1).mean()
+            diag["fov_deg"] = hd["fov"].detach().mean()
+            geom = cfg.geom_numbers
+        else:                                                    # given cameras cost nothing; the flow is coded
+            diag["xi_trans"] = torch.stack(taus, 1).detach().norm(dim=-1).mean()
+            diag["fov_deg"] = torch.rad2deg(2 * torch.atan(cfg.image_size / 2 / cam["K"][:, 0, 0, 0].float())).mean()
+            geom = 3 * cfg.n_flow
+        diag["numbers"] = cfg.c_numbers("video") + (K - 1) * geom + (L * cfg.d_r).sum(1).mean()
         outputs = dict(rgb=rgb.view(B, T, *rgb.shape[1:]), c=hd["mu"], rho=rho, fov=hd["fov"], xi=hd["xi"],
                        M=hd["M"], tokens=tokens[:, 1:], L=L.long())
         return loss, outputs
@@ -254,6 +280,10 @@ class MAVTCDV(DepthRegs, nn.Module):
             loss, outputs = self._image(frames, parts, diag)
         elif modality == "video":
             loss, outputs = self._video(frames, parts, diag, L)
+        elif modality == "world":
+            if cam is None:
+                raise ValueError("world needs cam = dict(c2w, K)")
+            loss, outputs = self._video(frames, parts, diag, L, cam)
         else:
             if cam is None:
                 raise ValueError("threed needs cam = dict(c2w, K)")

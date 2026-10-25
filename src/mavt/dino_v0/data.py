@@ -669,8 +669,9 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                   eval_frame_stride: Optional[int] = None, n_views: int = 4, video_tail: int = 1000,
                   objaverse_holdout: int = 500, num_workers: int = 8, rank: int = 0, world: int = 1,
                   seed: int = 0, split: str = "train", ssv2: Optional[str] = None,
-                  ssv2_weight: float = 0.3, objaverse_depth: bool = False) -> dict:
-    """{'image' | 'video' | 'threed': (loader, sampler)} for whichever sources are given.
+                  ssv2_weight: float = 0.3, objaverse_depth: bool = False, omniworld: Optional[str] = None,
+                  batch_world: int = 4, cell: int = 16, keyframe_every: int = 4) -> dict:
+    """{'image' | 'video' | 'threed' | 'world': (loader, sampler)} for whichever sources are given.
     Image batches use ParquetGroupBatchSampler (row-group aware, rank-sharded); video and threed use
     DistributedSampler. With split='train' the OpenVid manifest tail and the Objaverse hold-out uids
     are excluded.
@@ -679,7 +680,9 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
     format, used whole as unlabeled video: labels are never read) mixed into the video stream: each
     video sample is SSv2 with probability ssv2_weight (MixtureSampler, rank-sharded). With OpenVid,
     ssv2_weight <= 0 leaves SSv2 out and >= 1 leaves OpenVid out; without OpenVid, SSv2 is the
-    whole video stream. objaverse_depth: posed views also carry their rendered depth ('depth')."""
+    whole video stream. objaverse_depth: posed views also carry their rendered depth ('depth').
+    omniworld: an OmniWorld-Game pack root (scripts/pack_omniworld_dino.py): 'world' clips of one segment
+    (keyframe_every frames) with clip-relative cameras and metric depth ('depth'), no geometry targets."""
     train = split == "train"
     out = {}
     common = dict(num_workers=num_workers, collate_fn=collate, pin_memory=torch.cuda.is_available(),
@@ -714,6 +717,13 @@ def mixed_loaders(imagenet: Optional[str] = None, openvid: Optional[str] = None,
                             depth=objaverse_depth)
         smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
         out["threed"] = (DataLoader(ds, batch_size=batch_3d, sampler=smp, drop_last=True, **common), smp)
+    if omniworld:
+        from .omniworld import OmniWorldClips
+        ds = OmniWorldClips(omniworld, "train" if train else "val", n_frames=keyframe_every, frame_stride=frame_stride,
+                            size=size, cell=cell, keyframe_every=keyframe_every, train=train,
+                            eval_stride=eval_frame_stride, geo_targets=False)
+        smp = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=train, seed=seed, drop_last=True)
+        out["world"] = (DataLoader(ds, batch_size=batch_world, sampler=smp, drop_last=True, **common), smp)
     return out
 
 
