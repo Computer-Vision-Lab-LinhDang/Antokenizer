@@ -1,0 +1,101 @@
+# C-D 4.1 (src/mavt/cd41): geometric transport + Δ-Tucker + ordered innovation slots on a frozen DINOv3.
+# Reference configuration of the design of 26/10; weights and temperatures are starting values, not tuned.
+#
+# Top-level keys are CD41Config fields; `train:` holds defaults for the scripts/train_cd41.py flags (the command
+# line wins). Data paths go on the command line:
+#   torchrun --standalone --nproc_per_node N scripts/train_cd41.py --config configs/cd41/base.yaml \
+#     --imagenet <parquet root> --openvid <manifest> --objaverse <render root> --objaverse-depth \
+#     --omniworld <pack> --omniworld-modality world --omniworld-scenes 30 --out <run>
+# Arm without Δ-Tucker at about the same payload (12 170 against 12 194 scalars per segment):
+#   ... --set tucker=false --set n_slots=81
+# Arm without the transport (identity W, same payload): --set geometry=false
+
+# ---- input and frozen DINOv3 ViT-L/16 (HF id or a local copy) + pixel stem
+image_size: 256
+patch: 16
+dino_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
+dino_dim: 1024
+dino_registers: 4
+dino_layers: [6, 12, 18, 24]   # Mem_i: read-only keys of every trunk layer (4 x 256 tokens)
+pix_dim: 256
+# ---- two-stream trunk: stream C reads observation 0, stream D observation i and the context decoded from S_{i-1}
+dim: 512
+heads: 8
+layers: 6                      # per stream
+time_freqs: 4
+mlp_ratio: 4.0
+keyframe_every: 4              # anchor + at most three targets per segment
+# ---- state: anchor 256 x 23 + 256 + 4; target 6 + 16 x 3 + 4 + 32 + 80 x 24; header 16
+d_c: 23
+n_motion: 16
+d_r: 24
+n_slots: 80
+tucker: true
+rank_xy: 32
+rank_a: 32
+rank_c: 32
+budget: 12288
+nested: false
+# ---- estimated cameras (video): bounded FOV, principal point near the centre
+fov_min: 30.0
+fov_max: 120.0
+fov_init: 50.0
+pp_range: 0.05
+# ---- transport
+geometry: true
+knn: 9
+r_cut: 1.5                     # patch units
+sigma_u: 0.35                  # patch units; zero motion keeps ~0.94 of a cell on itself
+tau_z: 0.1                     # depth temperature in the gauge (video: anchor median depth 1)
+z_eps: 0.01
+use_smooth_cutoff: false       # true adds log max(eps, 1 - d^2 / r_cut^2) to the logits (not section 7)
+# ---- decoder side
+dec_dim: 512
+dec_heads: 8
+synth: conv                    # F_C, F_U of the module spec; transformer: the first prototype's generator
+fc_hidden: 256
+fu_hidden: 128
+syn_blocks: 2                  # synth = transformer only
+rgb_blocks: 4
+dec_r_blocks: 2
+pix_out: 8
+# ---- encoder side
+refine: true                   # level 2 of the GTA refinement (static views: a only)
+refine_layers: 2
+enc_r_layers: 4
+slot_causal: true              # lower-triangular self-attention among the 80 slots
+world_camera: estimated        # world clips coded as video; the given cameras only enter the loss
+# ---- losses
+w_rgb: 1.0
+w_lpips: 0.5
+lpips_max_frames: 64
+w_feat: 1.0
+w_base: 0.5
+w_refine1: 0.25                # base loss of the level-1 estimate
+w_cam_gt: 1.0
+w_depth_gt: 0.0
+depth_gt_lam: 0.85
+w_flow: 0.01
+w_smooth: 0.0
+
+train:
+  steps: 2000
+  lr: 3.0e-4
+  wd: 0.05
+  warmup: 200
+  batch_image: 64
+  batch_video: 32
+  batch_3d: 16
+  batch_world: 32
+  n_views: 4
+  n_frames: 4
+  frame_stride: "4,8,16"
+  omniworld_stride: "2,4,8"
+  mix_modalities: true
+  compile: false
+  grad_accum: 1
+  bf16: true
+  grad_clip: 1.0
+  ckpt_every: 500
+  log_every: 20
+  num_workers: 8

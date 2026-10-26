@@ -1,0 +1,88 @@
+# Vanilla C-D model (src/mavt/cd32/vanilla.py): the 3.2 latent and geometric decoder on one plain transformer,
+# reconstruction branch on (L1 + LPIPS on pixels, DINO features auxiliary).
+#
+# Top-level keys are CDVConfig fields; `train:` holds defaults for the scripts/train_cdv.py flags (the
+# command line wins). Data paths and stage checkpoints are given on the command line:
+#   stage 1  torchrun --standalone --nproc_per_node 4 scripts/train_cdv.py --config configs/cd32/vanilla.yaml \
+#              --imagenet <parquet root> --steps 3000 --out <run 1>
+#   stage 2  ... --imagenet <root> --openvid <manifest> --n-frames 4 --init <run 1>/last.pt --out <run 2>
+#   stage 3  ... --imagenet <root> --openvid <manifest> --objaverse <render root> --objaverse-depth \
+#              --init <run 2>/last.pt --out <run 3>
+# Ablation without the geometric operator: --set geometry=false (same budget, identity projection).
+
+# ---- input
+image_size: 256
+patch: 16
+# ---- frozen DINOv3 ViT-L/16 (HF id or a local copy) + pixel stem
+dino_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
+dino_dim: 1024
+dino_registers: 4
+dino_layers: [6, 12, 18, 24]   # summed into the input tokens (and read by the depth probe)
+pix_dim: 256
+# ---- backbone: one transformer over [C tokens ; D tokens], asymmetric mask
+dim: 512
+heads: 8
+layers: 8
+mlp_ratio: 4.0
+keyframe_every: 4
+causal_d: true                 # D_t reads C, D_t, D_{t-1}
+# ---- C: 256 x (content + rho) [+ focal]
+d_c_image: 47                  # 256 x 48 = 12 288
+d_c_video: 23                  # 256 x 24 + 1 = 6 145 per segment
+fov_min: 30.0
+fov_max: 120.0
+fov_init: 50.0
+# ---- D: pose (6) + 3D flow 4 x 4 x 3 (48), then <= L_max x 24 innovation numbers from the slot tokens
+flow_grid: 4
+d_r: 24
+l_max: 0                       # 0: largest that fits the budget (82)
+budget: 12288
+p_l0: 0.25
+# ---- decoder: geometric read, then vanilla decoder blocks, linear pixel head
+dec_dim: 512
+dec_heads: 8
+dec_blocks: 4
+knn: 9
+softmin_beta: 1.0
+backface_kappa: 10.0
+rgb_head: linear               # linear (unpatchify + 3 x 3 conv) | conv (v0 upsampler)
+pix_out: 8
+geometry: true                 # false: ablation, identity projection for every frame
+# ---- losses: reconstruction branch
+w_rgb: 1.0
+w_lpips: 0.5
+lpips_max_frames: 64         # LPIPS on 64 random decoded frames per step per GPU (0: all, halves throughput)
+w_feat: 0.25
+w_geo: 0.5                     # frames after the keyframe decoded with L = 0 (geometry only)
+geo_rgb: true
+w_flow: 0.01
+w_smooth: 0.01
+w_kl_c: 1.0e-6
+w_kl_d: 1.0e-6
+depth_probe: null              # --set depth_probe=<probe.pt from scripts/train_depth_probe.py>
+w_depth_prior: 0.0
+depth_prior_kind: silog
+depth_prior_on: [image, video]
+w_depth_gt: 0.0                # > 0 with --objaverse-depth
+depth_gt_lam: 0.85
+detach_rho_image: true
+
+train:
+  steps: 3000
+  lr: 3.0e-4
+  wd: 0.05
+  warmup: 300
+  batch_image: 64
+  batch_video: 16              # clips of n_frames frames (a multiple of keyframe_every)
+  batch_3d: 16
+  n_views: 4
+  n_frames: 4                  # one segment per clip (no link in the vanilla model)
+  frame_stride: "2,4"
+  mix_modalities: true
+  compile: false
+  grad_accum: 1
+  bf16: true
+  grad_clip: 1.0
+  ckpt_every: 500
+  log_every: 20
+  num_workers: 8

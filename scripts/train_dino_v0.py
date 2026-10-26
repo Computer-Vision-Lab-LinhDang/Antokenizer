@@ -58,6 +58,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-views", type=int, default=4)
     p.add_argument("--video-tail", type=int, default=1000, help="last N OpenVid manifest lines held out for eval")
     p.add_argument("--objaverse-holdout", type=int, default=500, help="last N non-blank uids held out for eval")
+    p.add_argument("--omniworld", default=None,
+                   help="OmniWorld-Game pack root (scripts/pack_omniworld_dino.py): posed frames of real scenes as a "
+                        "second source of posed views (split train; the model sees them as 'threed')")
+    p.add_argument("--omniworld-stride", default="8,16,32",
+                   help="raw frame strides of OmniWorld posed clips (multiples of the pack's base stride)")
+    p.add_argument("--omniworld-weight", type=float, default=0.5,
+                   help="with --objaverse: share of posed-view samples that come from OmniWorld")
+    p.add_argument("--omniworld-modality", choices=("threed", "world"), default="threed",
+                   help="threed: OmniWorld frames as posed views of a rigid scene; world: 4D clips of --n-frames "
+                        "frames in time order (known cameras, predicted flow), a modality of their own")
+    p.add_argument("--omniworld-scenes", type=int, default=0, help="use only the first N OmniWorld scenes (0: all)")
+    p.add_argument("--batch-world", type=int, default=4, help="per GPU, 4D clips (--omniworld-modality world)")
+    p.add_argument("--objaverse-depth", action=argparse.BooleanOptionalAction, default=False,
+                   help="posed views also load their rendered depth (cam['depth']; used by the cd32 model)")
     p.add_argument("--n-frames", type=int, default=8)
     p.add_argument("--frame-stride", default="2",
                    help="int, or a list like 2,4,8: each training clip draws one stride uniformly "
@@ -78,6 +92,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--resume", default="auto", help="auto (out/last.pt if present) | none | <path>")
+    p.add_argument("--init", default=None, metavar="CKPT",
+                   help="start from the model weights of this checkpoint (optimizer and schedule fresh); "
+                        "for staged training; ignored when the run resumes")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
     # ---- speed: mixed-modality steps, DDP, compile
@@ -221,6 +238,17 @@ def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args) 
     os.replace(tmp, path)
 
 
+def init_weights(path: str, model) -> int:
+    """Model weights of another run (strict except the frozen DINO prefix), nothing else -> its step."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+    if missing or unexpected:
+        raise RuntimeError(f"--init mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
+    return int(ck.get("step", -1))
+
+
 def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None) -> int:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     missing, unexpected = model.load_state_dict(ck["model"], strict=False)
@@ -255,14 +283,19 @@ def orbit_cams(B: int, T: int, size: int) -> dict:
     return dict(c2w=c2w, K=K)
 
 
-def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, seed: int):
+def synthetic_iter(modality: str, batch: int, cfg: DinoV0Config, n_frames: int, seed: int, depth: bool = False):
     g = torch.Generator().manual_seed(seed)
     s = cfg.image_size
     shape = (batch, 3, s, s) if modality == "image" else (batch, 3, n_frames, s, s)
     while True:
         b = dict(data=torch.rand(shape, generator=g) * 2 - 1, modality=modality)
-        if modality == "threed":
+        if modality in ("threed", "world"):
             b.update(orbit_cams(batch, n_frames, s))
+            if depth or modality == "world":                         # a sphere-ish blob at about 2 units
+                b["depth"] = (2.0 - torch.rand(batch, n_frames, s, s, generator=g) * 0.2)
+            if modality == "world":                                  # a moving square in the top-left quarter
+                b["dyn"] = torch.zeros(batch, n_frames, s, s)
+                b["dyn"][:, :, : s // 2, : s // 2] = 1.0
         yield b
 
 
@@ -273,7 +306,14 @@ def build_data(args, cfg: DinoV0Config, rank: int, world: int, seed: int) -> dic
                         n_frames=args.n_frames, frame_stride=args.frame_stride, n_views=args.n_views,
                         video_tail=args.video_tail, objaverse_holdout=args.objaverse_holdout,
                         num_workers=args.num_workers, rank=rank, world=world, seed=seed,
-                        ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3))
+                        ssv2=getattr(args, "ssv2_train", None), ssv2_weight=getattr(args, "ssv2_weight", 0.3),
+                        objaverse_depth=getattr(args, "objaverse_depth", False),
+                        omniworld=getattr(args, "omniworld", None),
+                        omniworld_stride=getattr(args, "omniworld_stride", "8,16,32"),
+                        omniworld_weight=getattr(args, "omniworld_weight", 0.5),
+                        omniworld_modality=getattr(args, "omniworld_modality", "threed"),
+                        omniworld_scenes=getattr(args, "omniworld_scenes", 0),
+                        batch_world=getattr(args, "batch_world", 4))
     return {m: infinite(ld, smp) for m, (ld, smp) in lds.items()}
 
 
@@ -296,7 +336,7 @@ def parse_weights(spec: str) -> dict:
         if part.strip():
             k, v = part.split(":")
             w[k.strip()] = float(v)
-    bad = set(w) - {"image", "video", "threed"}
+    bad = set(w) - set(ALL_MODALITIES)
     if bad:
         raise SystemExit(f"unknown modalities in --modality-weights: {sorted(bad)}")
     return w
@@ -324,6 +364,7 @@ def bench_data(args, cfg, rank, world) -> None:
 
 # ---------------------------------------------------------------------------- mixed step / compile
 MODALITIES = ("image", "video", "threed")
+ALL_MODALITIES = MODALITIES + ("world",)                   # world (4D): only models that list it (MAVTCDV)
 COMPILE_REGIONS = ("TrunkLayer", "CBlock", "DBlock", "DecoderBlock")   # repeated blocks, by class name
 
 
@@ -332,7 +373,7 @@ class MixedStep(torch.nn.Module):
     and one all-reduce per step and every parameter is used each step (no find_unused_parameters).
 
     forward(batches {modality: (x, cam)}) runs model(x, modality, cam) for each modality present (fixed
-    order image, video, threed) and returns loss = sum_m weights[m] * loss_m, parts {'<m>/loss': loss_m,
+    order image, video, threed, world) and returns loss = sum_m weights[m] * loss_m, parts {'<m>/loss': loss_m,
     '<m>/loss_<k>': ...} and diag {'<m>/diag_<k>': ...}. No parameters of its own: checkpoints hold the
     inner model, keys unchanged."""
 
@@ -342,7 +383,7 @@ class MixedStep(torch.nn.Module):
 
     def forward(self, batches: dict) -> dict:
         loss, parts, diag = 0.0, {}, {}
-        for m in MODALITIES:
+        for m in ALL_MODALITIES:
             if m not in batches:
                 continue
             x, cam = batches[m]
@@ -358,8 +399,8 @@ def mixed_weights(spec: Optional[str], available) -> dict:
     """Loss weights of a mixed step over the available modalities, normalised to sum 1 so the step loss
     stays on the scale of a one-modality step (--grad-clip keeps its meaning). spec None: equal; a
     modality missing from spec or at 0 is not run."""
-    w = parse_weights(spec) if spec else {m: 1.0 for m in MODALITIES}
-    w = {m: w.get(m, 0.0) for m in MODALITIES if m in available and w.get(m, 0.0) > 0}
+    w = parse_weights(spec) if spec else {m: 1.0 for m in ALL_MODALITIES}
+    w = {m: w.get(m, 0.0) for m in ALL_MODALITIES if m in available and w.get(m, 0.0) > 0}
     if not w:
         raise SystemExit("--modality-loss-weights selects no available modality")
     tot = sum(w.values())
@@ -370,8 +411,11 @@ def to_inputs(b: dict, modality: str, dev) -> tuple:
     """Loader batch -> (x, cam) on dev; cam = dict(c2w, K) for posed views, else None."""
     x = b["data"].to(dev, non_blocking=True)
     cam = None
-    if modality == "threed":
+    if modality in ("threed", "world"):
         cam = dict(c2w=b["c2w"].to(dev, non_blocking=True), K=b["K"].to(dev, non_blocking=True))
+        for k in ("depth", "dyn"):
+            if k in b:
+                cam[k] = b[k].to(dev, non_blocking=True)
     return x, cam
 
 
@@ -382,7 +426,7 @@ def probe_unused(step_mod: MixedStep, cfg: DinoV0Config, args, dev, use_amp: boo
     batches = {}
     for m in step_mod.weights:
         T = args.n_views if m == "threed" else args.n_frames
-        batches[m] = to_inputs(next(synthetic_iter(m, 1, cfg, T, args.seed)), m, dev)
+        batches[m] = to_inputs(next(synthetic_iter(m, 1, cfg, T, args.seed, getattr(args, "objaverse_depth", False))), m, dev)
     step_mod.train().zero_grad(set_to_none=True)
     with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
         out = step_mod(batches)
@@ -427,7 +471,8 @@ def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, 
     import torch._dynamo
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)   # shapes per modality
-    targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in COMPILE_REGIONS]
+    regions = getattr(model, "COMPILE_REGIONS", COMPILE_REGIONS)      # another model may name its own blocks
+    targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in regions]
     conv = getattr(getattr(model, "decoder", None), "rgb_conv", None)
     if conv_head and isinstance(conv, torch.nn.Module):
         targets.append(("decoder.rgb_conv", conv))
@@ -444,13 +489,17 @@ def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, 
 
 
 # ---------------------------------------------------------------------------- main loop
-def main(argv=None) -> int:
+def main(argv=None, config_fn=None, model_fn=None) -> int:
+    """config_fn(model_cfg, dry) -> config and model_fn(cfg, args) -> nn.Module let another model with the
+    MAVTDinoV0 interface (forward(x, modality, cam) -> dict(loss, parts, diag)) reuse this trainer
+    (scripts/train_cd32.py). Defaults: DinoV0Config / MAVTDinoV0."""
     args, model_cfg = parse_args(argv)
     dry = args.dry_run
     if dry:
         args.steps, args.batch_image, args.batch_video, args.batch_3d, args.n_frames = 3, 2, 2, 2, 4
+        args.batch_world = 2
         args.warmup, args.log_every, args.ckpt_every, args.bf16 = 1, 1, 2, False
-    cfg = make_config(model_cfg, dry)
+    cfg = (config_fn or make_config)(model_cfg, dry)
     rank, world, local, dev = setup_dist(dry)
     os.makedirs(args.out, exist_ok=True)
     seed = args.seed + 1000 * rank
@@ -466,7 +515,10 @@ def main(argv=None) -> int:
     from mavt.dino_v0.model import MAVTDinoV0
     log = (lambda s: print(s, flush=True)) if rank == 0 else (lambda s: None)
     torch.manual_seed(args.seed)                               # identical init on every rank
-    model = MAVTDinoV0(cfg, use_checkpoint=args.use_checkpoint).to(dev)
+    if model_fn is None:
+        model = MAVTDinoV0(cfg, use_checkpoint=args.use_checkpoint).to(dev)
+    else:
+        model = model_fn(cfg, args).to(dev)
     opt, sched = build_optim(model, args, dev)
     fused = bool(opt.param_groups[0].get("fused"))
     step = 0
@@ -480,12 +532,16 @@ def main(argv=None) -> int:
         step = load_ckpt(resume, model, opt, sched, lr=args.lr)
         set_fused(opt, fused)
         log(f"resumed from {resume} at step {step}")
+    elif args.init:
+        step0 = init_weights(args.init, model)
+        log(f"initialised from {args.init} (step {step0}); optimizer and schedule start fresh")
     use_amp = args.bf16 and dev.type == "cuda"
     mixed = args.mix_modalities
 
     if dry:
-        bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d)
-        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed) for m in MODALITIES}
+        bsz = dict(image=args.batch_image, video=args.batch_video, threed=args.batch_3d, world=args.batch_world)
+        mods = getattr(model, "MODALITIES", MODALITIES)                       # v0 and two-stream: no world
+        its = {m: synthetic_iter(m, bsz[m], cfg, args.n_frames, seed, args.objaverse_depth) for m in mods}
     else:
         # sampler seed: the same on every rank, so the rank shards are disjoint (it was per rank in v0).
         # Augmentation stays per rank: worker seeds come from each rank's own torch stream (data._worker_init).

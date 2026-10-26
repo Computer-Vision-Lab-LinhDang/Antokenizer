@@ -1,0 +1,92 @@
+# C-D tokenizer bản 3.2 with the two-stream backbone (src/mavt/cd32).
+#
+# Top-level keys are CD32Config fields (src/mavt/cd32/config.py); `train:` holds defaults for the
+# scripts/train_cd32.py flags (the same flags as scripts/train_dino_v0.py; the command line wins).
+# Data paths are given on the command line:
+#   torchrun --standalone --nproc_per_node <gpus> scripts/train_cd32.py --config configs/cd32/base.yaml \
+#     --imagenet <parquet root> --openvid <manifest> [--objaverse <render root>] --out <run dir>
+# Stage 1 (design option A): pass only --imagenet (block C + decoder on still images).
+# Stage 2: add --openvid (block D, Enc_R, link) and resume from the stage 1 run dir.
+# Batch sizes below are first guesses: not profiled yet.
+
+# ---- input
+image_size: 256
+patch: 16
+# ---- frozen DINOv3 ViT-L/16 (HF id or a local copy) + pixel stem
+dino_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
+dino_dim: 1024
+dino_registers: 4
+dino_layers: [6, 12, 18, 24]   # re-read as read-only keys / values in every layer
+pix_dim: 256
+# ---- two-stream backbone (~59M of ~102M trainable)
+dim: 512
+heads: 8
+layers: 8
+mlp_ratio: 4.0
+rope_dims: [16, 24, 24]        # head dims rotated by t (frame), x, y (cells)
+shared_streams: false          # true = option B (one set of weights for C and D)
+keyframe_every: 4
+# ---- C: 256 x (content + rho) [+ focal]
+d_c_image: 47                  # 256 x 48 = 12 288
+d_c_video: 23                  # 256 x 24 + 1 = 6 145 per segment
+fov_min: 30.0
+fov_max: 120.0
+fov_init: 50.0
+# ---- D: pose (6) + 3D flow 4 x 4 x 3 (48), then <= L_max x 24 innovation numbers
+flow_grid: 4
+d_r: 24
+l_max: 0                       # 0: largest that fits (82)
+budget: 12288
+p_l0: 0.15
+enc_r_layers: 4
+# ---- decoder
+dec_dim: 512
+dec_heads: 8
+knn: 9
+softmin_beta: 1.0
+backface_kappa: 10.0
+dec_pred_blocks: 2
+dec_innov_blocks: 2
+prev_read: true                # the prediction also reads the previous decoded frame
+conv_channels: [256, 128, 64, 64, 64]
+conv_res_blocks: 1
+# ---- losses
+w_rgb: 1.0
+w_feat: 1.0
+w_geo: 0.5
+w_pred: 0.5
+geo_rgb: true
+w_flow: 0.01
+w_smooth: 0.01
+w_kl_c: 1.0e-6
+w_kl_d: 1.0e-6
+w_link: 0.25
+depth_probe: null              # probe from scripts/train_depth_probe.py, e.g. --set depth_probe=<probe.pt>
+w_depth_prior: 0.0             # > 0 needs depth_probe; 0 with a probe = logged only
+depth_prior_kind: silog        # silog | ssi | ordinal
+depth_prior_on: [image, video] # posed views learn depth from parallax (and rendered depth below)
+w_depth_gt: 0.0                # > 0 with --objaverse-depth: rho of view 0 against the rendered depth
+depth_gt_lam: 0.85             # SILog lambda of that loss (poses fix the scale)
+w_rho_distill: 0.0             # posed views: |rho_mono - sg[rho]| on cells with rendered depth
+w_lpips: 0.0
+detach_rho_image: true
+
+train:
+  steps: 16000
+  lr: 2.0e-4
+  wd: 0.05
+  warmup: 2000
+  batch_image: 64
+  batch_video: 8               # clips of n_frames frames (a multiple of keyframe_every)
+  batch_3d: 8
+  n_views: 4
+  n_frames: 8                  # 2 segments: the link is trained only with >= 2 segments
+  frame_stride: "2,4"
+  mix_modalities: true
+  compile: false
+  grad_accum: 1
+  bf16: true
+  grad_clip: 1.0
+  ckpt_every: 1000
+  log_every: 20
+  num_workers: 8

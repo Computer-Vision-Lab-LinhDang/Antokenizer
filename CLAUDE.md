@@ -5,6 +5,8 @@ with the design, file map, v0 vs v1 flags and commands. The repo-root `README.md
 describe older, paused pipelines. This repo is public: keep run paths, results and internal notes out of it.
 
 - Tests for the current code: `python -m pytest tests/dino_v0 -q`.
+- The C-D 3.2 tokenizer (two-stream backbone, forward projection) is in `src/mavt/cd32/` (see its README);
+  tests `python -m pytest tests/cd32 -q`, trainer `scripts/train_cd32.py` (the v0 trainer with the cd32 model).
 - Keep v0 behaviour unchanged when the v1 flags in `src/mavt/dino_v0/config.py` are at their defaults.
 - On the shared training server use only this project's GPUs; ask the owner before installing packages or
   deleting anything; never write credentials into files or logs.
