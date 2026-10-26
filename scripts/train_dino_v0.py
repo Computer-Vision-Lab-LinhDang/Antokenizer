@@ -52,6 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-lr-ratio", type=float, default=0.05, help="cosine floor as a fraction of --lr")
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--warmup", type=int, default=2000)
+    p.add_argument("--schedule", choices=("cosine", "plateau"), default="cosine",
+                   help="cosine over --steps | plateau: constant lr until the train loss stops improving, then a "
+                        "cosine decay of --decay-steps and stop (--steps is the cap)")
+    p.add_argument("--plateau-window", type=int, default=500, help="steps per loss window (plateau)")
+    p.add_argument("--plateau-tol", type=float, default=0.01,
+                   help="plateau when a window's mean loss improves on the previous one by less than this fraction")
+    p.add_argument("--decay-steps", type=int, default=1000, help="length of the final decay (plateau)")
     p.add_argument("--batch-image", type=int, default=32, help="per GPU")
     p.add_argument("--batch-video", type=int, default=4, help="per GPU")
     p.add_argument("--batch-3d", type=int, default=4, help="per GPU, objects of --n-views views")
@@ -185,7 +192,12 @@ def all_mean(t: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------- optim
-def build_optim(model: torch.nn.Module, args, device=None):
+def plateau_reached(prev: Optional[float], cur: float, tol: float) -> bool:
+    """The loss of the latest window improved on the previous window by less than a fraction tol."""
+    return prev is not None and (prev - cur) < tol * abs(prev)
+
+
+def build_optim(model: torch.nn.Module, args, device=None, plat: Optional[dict] = None):
     """AdamW (decay on >= 2-D weights only) + warmup / cosine LambdaLR. Fused AdamW (one kernel set for all
     params) when device is a GPU, the default implementation otherwise or if fused is unavailable."""
     decay, no_decay = [], []
@@ -207,6 +219,12 @@ def build_optim(model: torch.nn.Module, args, device=None):
     def lr_lambda(step: int) -> float:
         if step < args.warmup:
             return (step + 1) / max(1, args.warmup)
+        if getattr(args, "schedule", "cosine") == "plateau":           # plat["decay_start"] < 0: not decaying yet
+            d0 = plat["decay_start"]
+            if d0 < 0 or step <= d0:
+                return 1.0
+            prog = min(1.0, (step - d0) / max(1, args.decay_steps))
+            return args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
         prog = min(1.0, (step - args.warmup) / max(1, args.steps - args.warmup))
         return args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
 
@@ -231,10 +249,10 @@ def trainable_state(model: torch.nn.Module) -> dict:
     return {k: v for k, v in model.state_dict().items() if not k.startswith(FROZEN_PREFIX)}
 
 
-def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args) -> None:
+def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args, plat: Optional[dict] = None) -> None:
     tmp = path + ".tmp"
     torch.save(dict(model=trainable_state(model), optim=opt.state_dict(), sched=sched.state_dict(),
-                    step=step, cfg=dataclasses.asdict(cfg), args=vars(args)), tmp)
+                    step=step, cfg=dataclasses.asdict(cfg), args=vars(args), plateau=plat), tmp)
     os.replace(tmp, path)
 
 
@@ -249,8 +267,10 @@ def init_weights(path: str, model) -> int:
     return int(ck.get("step", -1))
 
 
-def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None) -> int:
+def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None, plat: Optional[dict] = None) -> int:
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    if plat is not None and ck.get("plateau"):
+        plat.update(ck["plateau"])
     missing, unexpected = model.load_state_dict(ck["model"], strict=False)
     missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
     if missing or unexpected:
@@ -519,7 +539,8 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
         model = MAVTDinoV0(cfg, use_checkpoint=args.use_checkpoint).to(dev)
     else:
         model = model_fn(cfg, args).to(dev)
-    opt, sched = build_optim(model, args, dev)
+    plat = dict(decay_start=-1, prev=None, acc=0.0, n=0)               # plateau schedule state (saved in ckpts)
+    opt, sched = build_optim(model, args, dev, plat=plat)
     fused = bool(opt.param_groups[0].get("fused"))
     step = 0
     resume = None
@@ -529,7 +550,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
     elif args.resume and args.resume != "none":
         resume = args.resume
     if resume:
-        step = load_ckpt(resume, model, opt, sched, lr=args.lr)
+        step = load_ckpt(resume, model, opt, sched, lr=args.lr, plat=plat)
         set_fused(opt, fused)
         log(f"resumed from {resume} at step {step}")
     elif args.init:
@@ -631,7 +652,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
             return next(its[m])
         except Exception:
             if stop["flag"] and rank == 0:                      # loader torn down by the signal
-                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args)
+                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
                 print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
             raise
 
@@ -684,18 +705,32 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
             t_last, steps_since, clips_since = time.time(), 0, 0
         if not finite and rank == 0:
             print(f"step {step}: non-finite grad norm, update skipped", flush=True)
+        if args.schedule == "plateau":
+            if finite:
+                plat["acc"], plat["n"] = plat["acc"] + float(out["loss"].detach()), plat["n"] + 1
+            if plat["decay_start"] < 0 and step % args.plateau_window == 0 and plat["n"]:
+                cur = all_mean(torch.tensor([plat["acc"] / plat["n"]], device=dev)).item()   # same on all ranks
+                if step >= args.warmup + args.plateau_window and plateau_reached(plat["prev"], cur, args.plateau_tol):
+                    plat["decay_start"] = step
+                    log(f"step {step}: loss plateau ({plat['prev']:.4f} -> {cur:.4f}), decaying over {args.decay_steps}")
+                plat["prev"], plat["acc"], plat["n"] = cur, 0.0, 0
+            if plat["decay_start"] >= 0 and step >= plat["decay_start"] + args.decay_steps:
+                if rank == 0:
+                    save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
+                log(f"step {step}: decay done, converged")
+                break
 
         if rank == 0 and (step % args.ckpt_every == 0 or step == args.steps):
-            save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args)
+            save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
             if step % (args.ckpt_every * 5) == 0:
-                save_ckpt(os.path.join(args.out, f"step_{step:07d}.pt"), model, opt, sched, step, cfg, args)
+                save_ckpt(os.path.join(args.out, f"step_{step:07d}.pt"), model, opt, sched, step, cfg, args, plat)
 
         flag = torch.tensor([float(stop["flag"])], device=dev)
         if is_dist():
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item() > 0:
             if rank == 0:
-                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args)
+                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
                 print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
             break
 
