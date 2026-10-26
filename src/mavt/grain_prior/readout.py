@@ -149,7 +149,7 @@ class Readout(nn.Module):
             support = valid.any(-1, keepdim=True).expand(-1, lnu.shape[1])
             far = z_cam.float().masked_fill(~valid, 0).amax(-1, keepdim=True).clamp_min(1.0)
             d_grain = torch.where(support, (nu * z_cam.float().unsqueeze(1)).sum(-1), far.expand_as(support).float())
-            d_dense = torch.exp(self.depth(a).squeeze(-1).float().clamp(-20, 20)) * scale.float().view(B, 1)
+            d_dense = torch.exp(self.depth(a.float()).squeeze(-1).float().clamp(-20, 20)) * scale.float().view(B, 1)
         return dict(a0=a0, a=a, pe=pe, F_base=self.w_out(a).float(), F_init=self.w_out(a0).float(),
                     depth_grain=d_grain, depth_dense=d_dense, support=support)
 
