@@ -16,12 +16,13 @@ patch: 16
 dino_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
 dino_dim: 1024
 dino_registers: 4
-dino_layers: [6, 12, 18, 24]   # summed into the encoder tokens
+dino_layers: [6, 12, 18, 24]   # Mem_i: read-only keys of every trunk layer (4 x 256 tokens)
 pix_dim: 256
-# ---- encoder trunk (anchor encoder and Enc_D share it)
+# ---- two-stream trunk: stream C reads observation 0, stream D observation i and the context decoded from S_{i-1}
 dim: 512
 heads: 8
-layers: 8
+layers: 6                      # per stream
+time_freqs: 4
 mlp_ratio: 4.0
 keyframe_every: 4              # anchor + at most three targets per segment
 # ---- state: anchor 256 x 23 + 256 + 4; target 6 + 16 x 3 + 4 + 32 + 80 x 24; header 16
@@ -47,15 +48,22 @@ r_cut: 1.5                     # patch units
 sigma_u: 0.35                  # patch units; zero motion keeps ~0.94 of a cell on itself
 tau_z: 0.1                     # depth temperature in the gauge (video: anchor median depth 1)
 z_eps: 0.01
+use_smooth_cutoff: false       # true adds log max(eps, 1 - d^2 / r_cut^2) to the logits (not section 7)
 # ---- decoder side
 dec_dim: 512
 dec_heads: 8
-syn_blocks: 2
+synth: conv                    # F_C, F_U of the module spec; transformer: the first prototype's generator
+fc_hidden: 256
+fu_hidden: 128
+syn_blocks: 2                  # synth = transformer only
 rgb_blocks: 4
 dec_r_blocks: 2
 pix_out: 8
 # ---- encoder side
-enc_r_layers: 2
+refine: true                   # level 2 of the GTA refinement (static views: a only)
+refine_layers: 2
+enc_r_layers: 4
+slot_causal: true              # lower-triangular self-attention among the 80 slots
 world_camera: estimated        # world clips coded as video; the given cameras only enter the loss
 # ---- losses
 w_rgb: 1.0
@@ -63,6 +71,7 @@ w_lpips: 0.5
 lpips_max_frames: 64
 w_feat: 1.0
 w_base: 0.5
+w_refine1: 0.25                # base loss of the level-1 estimate
 w_cam_gt: 1.0
 w_depth_gt: 0.0
 depth_gt_lam: 0.85

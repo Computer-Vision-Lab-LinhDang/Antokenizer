@@ -72,7 +72,6 @@ def teacher(dino, frames: torch.Tensor) -> torch.Tensor:
 
 def oracle_warp(b: dict, grid: int, size: int, r_cut: float, sigma_u: float, tau_z: float, dev) -> tuple:
     """Loader batch (world clip with depth, dyn) -> (W [B, T, N, N], omega [B, T, N] bool)."""
-    from mavt.cd32 import geometry as geo
     from mavt.cd32.depth import cell_log_inv_depth
     from mavt.cd41 import transport as tr
     depth, dyn = b["depth"].to(dev).float(), b["dyn"].to(dev).float()
@@ -84,12 +83,13 @@ def oracle_warp(b: dict, grid: int, size: int, r_cut: float, sigma_u: float, tau
     static = share < 0.5
     rho = torch.where(valid & static[:, 0], rho, torch.full_like(rho, float("nan")))   # unreadable sources
     kappa = tr.kappa_from_K(K, size, size)
-    R, t = geo.pose_matrix(tr.se3_log(tr.relative_pose(c2w))[:, 1:].flatten(0, 1))
+    Trel = tr.relative_pose(c2w)[:, 1:].flatten(0, 1)
+    R, t = Trel[:, :3, :3], Trel[:, :3, 3]
     rep = lambda v: v.unsqueeze(1).expand(B, T, *v.shape[1:]).flatten(0, 1)
-    out = tr.transport(rep(rho), rep(kappa[:, 0]), R, t, None, kappa[:, 1:].flatten(0, 1), grid, 9, r_cut,
-                       sigma_u, tau_z)
+    op = tr.transport(rep(rho), rep(kappa[:, 0]), R, t, None, kappa[:, 1:].flatten(0, 1), grid, 9, r_cut,
+                      sigma_u, tau_z)
     N = rho.shape[1]
-    W, sup = out["W"].view(B, T, N, N), out["support"].view(B, T, N)
+    W, sup = op.dense().view(B, T, N, N), op.support.view(B, T, N)
     return W, sup & static[:, 1:]
 
 

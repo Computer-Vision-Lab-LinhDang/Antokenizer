@@ -51,13 +51,22 @@ class CD41Config(CD32Config):
     r_cut: float = 1.5                    # patch units
     sigma_u: float = 0.35                 # patch units
     tau_z: float = 0.1                    # depth temperature, in the gauge (video: anchor median depth 1)
+    use_smooth_cutoff: bool = False       # True adds log max(eps, 1 - d^2 / r_cut^2) to the logits (not section 7)
     # ---- decoder side (reads only Z and the shared weights)
-    syn_blocks: int = 2                   # F_C / F_U generator from c
+    synth: str = "conv"                   # conv: F_C, F_U of the module spec | transformer: blocks over the cells
+    fc_hidden: int = 256                  # F_C: Linear(d_c -> 256) -> depthwise-separable 3 x 3 -> GELU -> Linear
+    fu_hidden: int = 128                  # F_U: Linear(d_c + 2 -> 128) -> 3 x 3 conv -> GELU -> Linear(-> R_xy)
+    syn_blocks: int = 2                   # synth = transformer only
     rgb_blocks: int = 4                   # Dec_RGB over the cells
     dec_r_blocks: int = 2                 # Dec_R: cells cross-attend to the innovation slots
     pix_out: int = 8
     # ---- encoder side
-    enc_r_layers: int = 2                 # Enc_R over [residual cells ; slot queries]
+    layers: int = 6                       # each stream of the two-stream trunk
+    time_freqs: int = 4                   # sin / cos features of the header time offsets (frame steps)
+    refine: bool = True                   # level 2 of the GTA refinement (alignment feedback F_i - sg H^base(1))
+    refine_layers: int = 2
+    enc_r_layers: int = 4                 # Enc_R: ordered slot queries over the fused residual cells
+    slot_causal: bool = True              # lower-triangular self-attention among the slots: r[:L] never reads r[L:]
     world_camera: str = "estimated"       # world clips: estimated (video mode, GT only in the loss) | given
     # ---- losses
     w_rgb: float = 1.0
@@ -65,6 +74,7 @@ class CD41Config(CD32Config):
     lpips_max_frames: int = 64
     w_feat: float = 1.0                   # cosine + MSE on the teacher features (LN of the last DINO layer)
     w_base: float = 0.5                   # same on H_base, cells with support only
+    w_refine1: float = 0.25               # same on the level-1 H_base (deep supervision of the refinement)
     w_cam_gt: float = 1.0                 # pose and intrinsics against the given cameras (world clips)
     w_depth_gt: float = 0.0               # SILog of rho against measured depth, when the batch has it
     w_flow: float = 0.01                  # |M|: explain motion by the camera first
@@ -97,6 +107,7 @@ class CD41Config(CD32Config):
         assert 2 <= self.keyframe_every <= 4, "a segment holds the anchor and at most three targets"
         assert self.header_slots == 16, "the header has exactly 16 slots"
         assert self.world_camera in ("estimated", "given")
+        assert self.synth in ("conv", "transformer")
         assert all(0 <= L <= self.n_slots for L in self.nested_L)
         assert self.segment_numbers("video") <= self.budget, \
             f"segment {self.segment_numbers('video')} exceeds the budget {self.budget}"
@@ -107,7 +118,8 @@ def tiny_cd41_config(**kw) -> CD41Config:
     base = dict(dino_repo=None, image_size=64, stub_dino_dim=32, stub_dino_blocks=2, dino_layers=(1, 2),
                 pix_dim=16, dim=48, heads=4, layers=2, dec_dim=48, dec_heads=4, d_c=5, rank_xy=4, rank_a=4,
                 rank_c=4, n_motion=4, d_r=4, n_slots=6, nested_L=(0, 2, 6), budget=400, syn_blocks=1,
-                rgb_blocks=1, dec_r_blocks=1, enc_r_layers=1, w_lpips=0.0, lpips_max_frames=0)
+                fc_hidden=16, fu_hidden=8, rgb_blocks=1, dec_r_blocks=1, enc_r_layers=1, refine_layers=1,
+                w_lpips=0.0, lpips_max_frames=0)
     base.update(kw)
     return CD41Config(**base)
 

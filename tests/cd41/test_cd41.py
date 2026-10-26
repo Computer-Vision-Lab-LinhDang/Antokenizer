@@ -56,13 +56,25 @@ def _inputs(modality, B=2, T=4, seed=0):
 
 
 def _random_out(m):
-    """ZeroLinear heads start at 0; give the innovation decoder and the Tucker coefficients a non-zero map."""
+    """ZeroLinear heads start at 0; give the innovation decoder, the Tucker coefficients and the level-2
+    increments a non-zero map."""
     torch.manual_seed(1)
     with torch.no_grad():
         m.dec_r.out.weight.normal_(0, 0.1)
         if m.a_head is not None:
             m.a_head.weight.normal_(0, 0.1)
+        if m.refiner is not None:
+            for head in (m.refiner.d_pose, m.refiner.d_kappa, m.refiner.d_motion, m.refiner.d_a):
+                if head is not None:
+                    head.weight.normal_(0, 0.01)
     return m
+
+
+def _random_op(B, N, k=9, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.stack([torch.randperm(N, generator=g)[:k] for _ in range(B * N)]).view(B, N, k)
+    w = torch.softmax(torch.randn(B, N, k, generator=g), -1)
+    return tr.SparseTransportOp(idx=idx, w=w, support=torch.ones(B, N, dtype=torch.bool))
 
 
 # ---------------------------------------------------------------------------------------------- budget
@@ -104,12 +116,13 @@ def test_step_shapes_and_serialized_payload(modality):
 def test_tucker_term_shape_and_identity():
     m = _random_out(_model())
     B, T, N, d = 2, 3, m.cfg.n_cells, m.feat_dim
-    U, a = torch.randn(B, N, m.cfg.rank_xy), torch.randn(B, T, m.cfg.rank_a)
-    W = torch.softmax(torch.randn(B, T, N, N), -1)
-    out = m.tucker_term(U, W, a)
-    assert out.shape == (B, T, N, d)
-    Bm = torch.einsum("pkq,btk->btpq", m.core, a)
-    ref = torch.einsum("btij,btjd->btid", W, torch.einsum("bjp,btpq->btjq", U, Bm) @ m.Q)    # W (U B Q)
+    U, a = torch.randn(B, N, m.cfg.rank_xy), torch.randn(B * T, m.cfg.rank_a)
+    op = _random_op(B * T, N, k=5)
+    out = m.tucker_term(op.apply(U), a)                          # (W U) B(a) Q, U shared by the T targets
+    assert out.shape == (B * T, N, d)
+    Bm = torch.einsum("pkq,bk->bpq", m.core, a)
+    UBQ = m.Q(torch.einsum("bjp,bpq->bjq", U.repeat_interleave(T, 0), Bm))
+    ref = torch.bmm(op.dense(), UBQ)                             # W (U B Q)
     assert torch.allclose(out, ref, atol=1e-5)
 
 
@@ -118,8 +131,9 @@ def _flat(B=1, G=4):
     return torch.zeros(B, G * G), torch.tensor([[0.5, 0.5, 0.5, 0.5]]).expand(B, 4)
 
 
-def _tr(rho, k0, R, t, disp, ki, r_cut=1.5, sigma=0.35, tau=0.1, G=4):
-    return tr.transport(rho, k0, R, t, disp, ki, G, 9, r_cut, sigma, tau)
+def _tr(rho, k0, R, t, disp, ki, r_cut=1.5, sigma=0.35, tau=0.1, G=4, smooth=False):
+    op = tr.transport(rho, k0, R, t, disp, ki, G, 9, r_cut, sigma, tau, smooth_cutoff=smooth)
+    return dict(W=op.dense(), support=op.support, ok=op.ok, op=op)
 
 
 def test_zero_motion_identity_only_when_the_kernel_selects_one_cell():
@@ -127,6 +141,7 @@ def test_zero_motion_identity_only_when_the_kernel_selects_one_cell():
     R, t = torch.eye(3).expand(1, 3, 3), torch.zeros(1, 3)
     out = _tr(rho, k, R, t, None, k, r_cut=0.5)
     assert torch.equal(out["W"][0], torch.eye(16)) and out["support"].all()
+    assert out["op"].idx.shape == (1, 16, 9) and out["op"].w.shape == (1, 16, 9)            # sparse: 9 per row
     blur = _tr(rho, k, R, t, None, k)["W"][0]                    # 9 neighbours within 1.5 cells: some blur
     assert not torch.equal(blur, torch.eye(16))
     assert torch.allclose(blur.sum(-1), torch.ones(16)) and (blur.diagonal() > 0.9).all()
@@ -147,8 +162,8 @@ def test_one_cell_translation_and_exact_empty_rows():
     assert out["ok"][0].view(4, 4)[:, 3].logical_not().all()     # the last column leaves the crop
 
 
-def _reference_W(rho, k0, R, t, ki, G, knn, r_cut, sigma, tau, z_eps=1e-2):
-    """Explicit loop over target cells: the formula of the design, written out."""
+def _reference_W(rho, k0, R, t, ki, G, knn, r_cut, sigma, tau, z_eps=1e-2, smooth=False):
+    """Explicit loop over target cells: the formula of section 7, written out."""
     N = G * G
     W = torch.zeros(N, N, dtype=torch.float64)
     K0, Ki = tr.K_cells(k0, G)[0].double(), tr.K_cells(ki, G)[0].double()
@@ -171,26 +186,53 @@ def _reference_W(rho, k0, R, t, ki, G, knn, r_cut, sigma, tau, z_eps=1e-2):
         cand = [c for c in cand if c[0] < r_cut ** 2]
         if not cand:
             continue
-        lg = torch.tensor([-d2 / (2 * sigma ** 2) - z / tau for d2, _, z in cand], dtype=torch.float64)
+        lg = torch.tensor([-d2 / (2 * sigma ** 2) - z / tau + (math.log(max(1e-6, 1 - d2 / r_cut ** 2)) if smooth else 0)
+                           for d2, _, z in cand], dtype=torch.float64)
         w = torch.softmax(lg, 0)
         for (d2, j, z), wj in zip(cand, w):
             W[q, j] = wj
     return W
 
 
-def test_transport_matches_the_explicit_reference():
+@pytest.mark.parametrize("depth", [1.0, 2000.0])
+def test_transport_matches_the_explicit_reference(depth):
     torch.manual_seed(3)
     G = 4
-    rho = torch.randn(1, G * G) * 0.3
+    rho = torch.randn(1, G * G) * 0.3 - math.log(depth)          # far scenes: logits ~ -z / tau_z = -1e4
     k0 = torch.tensor([[0.55, 0.6, 0.48, 0.52]])
     ki = torch.tensor([[0.5, 0.52, 0.5, 0.47]])
-    R, t = geo.so3_exp(torch.tensor([[0.05, -0.08, 0.03]])), torch.tensor([[0.12, -0.05, 0.1]])
+    R, t = geo.so3_exp(torch.tensor([[0.05, -0.08, 0.03]])), torch.tensor([[0.12, -0.05, 0.1]]) * depth
     out = _tr(rho, k0, R, t, None, ki, r_cut=1.2, sigma=0.4, tau=0.2)
     ref = _reference_W(rho, k0, R, t, ki, G, 9, 1.2, 0.4, 0.2)
     assert torch.allclose(out["W"][0].double(), ref, atol=1e-5)
     rows = out["support"][0]
+    assert rows.sum() >= 8
     assert torch.allclose(out["W"][0][rows].sum(-1), torch.ones(int(rows.sum())))
     assert torch.equal(out["W"][0][~rows], torch.zeros(int((~rows).sum()), 16))
+    smooth = _tr(rho, k0, R, t, None, ki, r_cut=1.2, sigma=0.4, tau=0.2, smooth=True)["W"][0]  # flag, off by default
+    assert torch.allclose(smooth.double(), _reference_W(rho, k0, R, t, ki, G, 9, 1.2, 0.4, 0.2, smooth=True), atol=1e-5)
+    if depth == 1.0:                                             # far scenes: the depth term picks one cell
+        assert not torch.allclose(smooth, out["W"][0], atol=1e-4)
+
+
+def test_sparse_apply_matches_the_dense_product_with_gradients():
+    torch.manual_seed(4)
+    G, B, T, D = 4, 2, 3, 7
+    rho = (torch.randn(B * T, G * G) * 0.3).requires_grad_(True)
+    k = torch.tensor([[0.5, 0.5, 0.5, 0.5]]).expand(B * T, 4)
+    R, t = geo.so3_exp(torch.randn(B * T, 3) * 0.05), torch.randn(B * T, 3) * 0.05
+    op = tr.transport(rho, k, R, t, None, k, G, 9, 1.5, 0.35, 0.1)
+    V = torch.randn(B, G * G, D, requires_grad=True)             # one source per sample, shared by its T targets
+    out = op.apply(V)
+    ref = torch.bmm(op.dense(), V.repeat_interleave(T, 0))
+    assert out.shape == (B * T, G * G, D) and torch.allclose(out, ref, atol=1e-6)
+    g = torch.randn_like(out)
+    gV, grho = torch.autograd.grad((out * g).sum(), (V, rho), retain_graph=True)
+    gV2, grho2 = torch.autograd.grad((ref * g).sum(), (V, rho))
+    assert torch.allclose(gV, gV2, atol=1e-5) and torch.allclose(grho, grho2, atol=1e-5) and grho.abs().sum() > 0
+    Vd, idx = torch.randn(3, 5, 2, dtype=torch.float64, requires_grad=True), torch.randint(0, 5, (3, 6, 4))
+    wd = torch.rand(3, 6, 4, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda a, b: tr._GatherWeighted.apply(a, idx, b), (Vd, wd))
 
 
 def test_points_behind_the_camera_or_nan_are_never_read():
@@ -223,17 +265,27 @@ def test_z_depth_is_not_ray_distance_and_kappa_conventions():
     assert torch.allclose(tr.kappa_from_K(Kc, 64, 120)[2], torch.tensor(0.5))
 
 
-def test_so3_log_round_trip_including_half_turns():
+def test_so3_and_se3_round_trips_including_half_turns():
     torch.manual_seed(0)
     w = torch.randn(200, 3)
     w = w / w.norm(dim=-1, keepdim=True) * torch.rand(200, 1) * math.pi
-    w[:4] = torch.tensor([[math.pi, 0, 0], [0, math.pi - 1e-6, 0], [0, 0, 1e-9], [0, 0, 0]])
+    w[:5] = torch.tensor([[math.pi, 0, 0], [0, math.pi - 1e-6, 0], [0, 0, 1e-9], [0, 0, 0], [0.05, 0, 0]])
     R = geo.so3_exp(w)
     assert torch.allclose(geo.so3_exp(tr.so3_log(R)), R, atol=1e-5)
-    T = torch.eye(4).repeat(3, 1, 1)
-    T[:, :3, :3], T[:, :3, 3] = R[:3], torch.randn(3, 3)
-    Rp, tp = geo.pose_matrix(tr.se3_log(T))
-    assert torch.allclose(Rp, R[:3], atol=1e-5) and torch.allclose(tp, T[:, :3, 3])
+    T = torch.eye(4).repeat(200, 1, 1)
+    T[:, :3, :3], T[:, :3, 3] = R, torch.randn(200, 3)
+    xi = tr.se3_log(T)
+    Rp, tp = tr.se3_exp(xi)
+    assert torch.allclose(Rp, R, atol=1e-5) and torch.allclose(tp, T[:, :3, 3], atol=1e-4)
+    inner = xi[:, :3].norm(dim=-1) < math.pi - 1e-2                             # away from the cut at pi
+    assert torch.allclose(tr.se3_log(torch.cat([torch.cat([Rp, tp.unsqueeze(-1)], -1), T[:, 3:]], 1))[inner],
+                          xi[inner], atol=1e-4)
+    assert not torch.allclose(xi[5:, 3:], T[5:, :3, 3], atol=1e-2)             # se(3): v = V^-1 t, not t
+    R0, t0 = tr.se3_exp(torch.zeros(2, 6))
+    assert torch.equal(R0, torch.eye(3).expand(2, 3, 3)) and torch.equal(t0, torch.zeros(2, 3))
+    x = torch.zeros(1, 6, requires_grad=True)
+    sum(v.sum() for v in tr.se3_exp(x)).backward()
+    assert torch.isfinite(x.grad).all()
 
 
 # ---------------------------------------------------------------------------------------------- innovation
@@ -242,14 +294,32 @@ def test_empty_innovation_is_exactly_zero_and_slots_reach_covered_cells():
     B, N, d = 2, m.cfg.n_cells, m.feat_dim
     Hb = torch.randn(B, N, d)
     sup = torch.ones(B, N, dtype=torch.bool)
+    meta = torch.randn(B, m.dec_r.meta.net[0].in_features)
     r = torch.randn(B, m.cfg.n_slots, m.cfg.d_r, requires_grad=True)
-    out0 = m.dec_r(Hb, sup, r, torch.zeros(B, dtype=torch.long))
+    out0 = m.dec_r(Hb, sup, r, torch.zeros(B, dtype=torch.long), meta)
     assert torch.equal(out0, torch.zeros_like(out0))
-    out = m.dec_r(Hb, sup, r, torch.full((B,), m.cfg.n_slots, dtype=torch.long))
+    mixed = m.dec_r(Hb, sup, r, torch.tensor([0, m.cfg.n_slots]), meta)         # one L = 0 in the batch
+    assert torch.equal(mixed[0], torch.zeros_like(mixed[0])) and mixed[1].abs().sum() > 0
+    out = m.dec_r(Hb, sup, r, torch.full((B,), m.cfg.n_slots, dtype=torch.long), meta)
     out[:, :, :].sum().backward()                                # every cell has support here
     assert r.grad.abs().sum() > 0 and out.abs().sum() > 0
-    out_new = m.dec_r(Hb, sup, r.detach() + 1, torch.full((B,), m.cfg.n_slots, dtype=torch.long))
+    out_new = m.dec_r(Hb, sup, r.detach() + 1, torch.full((B,), m.cfg.n_slots, dtype=torch.long), meta)
     assert not torch.allclose(out_new, out.detach())             # new content in covered cells is codable
+    out_meta = m.dec_r(Hb, sup, r.detach(), torch.full((B,), m.cfg.n_slots, dtype=torch.long), meta + 1)
+    assert not torch.allclose(out_meta, out.detach())            # Dec_R reads xi, M, kappa, a and the header
+
+
+@pytest.mark.parametrize("causal", [True, False])
+def test_slot_causal_mask_keeps_every_prefix_closed(causal):
+    m = _model(slot_causal=causal)
+    B, N, d, j = 2, m.cfg.n_cells, m.feat_dim, 3
+    args = (torch.randn(B, N, d), torch.rand(B, 3, S, S) * 2 - 1, torch.randn(B, N, d),
+            torch.ones(B, N, dtype=torch.bool), torch.randn(B, m.enc_r.meta.net[0].in_features))
+    with torch.no_grad():
+        r = m.enc_r(*args)
+        m.enc_r.queries[:, j:] += 1.0                            # change the queries after slot j
+        r2 = m.enc_r(*args)
+    assert torch.equal(r[:, :j], r2[:, :j]) == causal and not torch.allclose(r[:, j:], r2[:, j:])
 
 
 # ---------------------------------------------------------------------------------------------- bottleneck
@@ -345,6 +415,40 @@ def test_world_given_camera_copies_the_pose_and_predicts_motion():
 
 
 # ---------------------------------------------------------------------------------------------- prefix
+def test_level_two_refinement_starts_at_level_one_and_keeps_static_geometry():
+    m = _model()
+    x, cam = _inputs("video")
+    with torch.no_grad():
+        o = m(x, "video", return_outputs=True)["outputs"]           # zero increments at init: level 2 = level 1
+    assert torch.equal(o["Z"]["xi"], torch.zeros_like(o["Z"]["xi"]))
+    m = _random_out(m)
+    with torch.no_grad():
+        o = m(x, "video", return_outputs=True)["outputs"]
+        x3, cam3 = _inputs("threed")
+        s = m(x3, "threed", cam3, return_outputs=True)["outputs"]
+    assert o["Z"]["xi"].abs().sum() > 0 and o["Z"]["M"].abs().sum() > 0     # video: geometry refined
+    xi = tr.se3_log(tr.relative_pose(cam3["c2w"]))[:, 1:]
+    assert torch.equal(s["Z"]["xi"], xi) and torch.equal(s["Z"]["M"], torch.zeros_like(s["Z"]["M"]))
+    with torch.no_grad():
+        m.refiner.d_a.weight.zero_()
+        s0 = m(x3, "threed", cam3, return_outputs=True)["outputs"]
+    assert not torch.allclose(s0["Z"]["a"], s["Z"]["a"])                    # static views: only a moves
+
+
+def test_video_targets_read_the_earlier_state_and_static_views_do_not():
+    m = _random_out(_model())
+    for modality in ("video", "threed"):
+        x, cam = _inputs(modality)
+        y = x.clone()
+        y[:, :, 1] = torch.rand_like(y[:, :, 1]) * 2 - 1                    # new first target
+        with torch.no_grad():
+            a = m(x, modality, cam, return_outputs=True)["outputs"]["Z"]
+            b = m(y, modality, cam, return_outputs=True)["outputs"]["Z"]
+        assert not torch.allclose(a["r"][:, 0], b["r"][:, 0])
+        later = torch.allclose(a["r"][:, 1:], b["r"][:, 1:]) and torch.allclose(a["a"][:, 1:], b["a"][:, 1:])
+        assert later == (modality == "threed")                              # video: S_{i-1} holds F^_1
+
+
 def test_replacing_a_later_observation_leaves_the_prefix_unchanged():
     m = _random_out(_model())
     x, _ = _inputs("video")
