@@ -362,3 +362,36 @@ def test_eval_dry_run(tmp_path):
     v = res["clips"]["video"]
     assert [c["numbers"] for c in v["curve"]] == [tiny_config().state_numbers([L] * 3) for L in (0, 2, 6)]
     assert "cam_rot_err_deg" in res["clips"]["world (estimated cameras)"]["diag"]
+
+
+# ---------------------------------------------------------------------------------------------- rgb_from
+@pytest.mark.parametrize("modality,T", [("image", 1), ("video", 4), ("threed", 4)])
+def test_rgb_from_hidden_decodes_the_closed_state_like_the_encoder(modality, T):
+    """rgb_from = hidden: the RGB head reads the decoder state (width dim), not the predicted DINO feature, and
+    decode(S) still reproduces the in-graph images."""
+    m = _wake(_model(rgb_from="hidden"))
+    assert m.rgb.proj.in_features == m.cfg.dim
+    x, cam = _inputs(modality, T=T)
+    with torch.no_grad():
+        o = m(x, modality, cam, return_outputs=True)["outputs"]
+        dec = m.decode(sc.deserialize(m.cfg, sc.serialize(m.cfg, o["S"])))
+    q = len(o["S"]["recs"])
+    n = 1 if modality == "image" else T
+    rgb = torch.cat([o["rgb"][:, :1], o["rgb"][:, n - q:]], 1) if q else o["rgb"][:, :1]
+    assert torch.allclose(dec["rgb"], rgb, atol=1e-4)
+
+
+def test_rgb_from_hidden_bypasses_the_feature_projection():
+    """The image does not pass through the DINO-space projection w_out: changing it leaves the image as it is."""
+    m = _wake(_model(rgb_from="hidden"))
+    x, _ = _inputs("image")
+    with torch.no_grad():
+        a = m(x, "image", None, return_outputs=True)["outputs"]["rgb"]
+        m.readout.w_out.weight.add_(1.0)
+        b = m(x, "image", None, return_outputs=True)["outputs"]["rgb"]
+    assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_rgb_from_rejects_unknown_values():
+    with pytest.raises(AssertionError):
+        tiny_config(rgb_from="pixels").check()

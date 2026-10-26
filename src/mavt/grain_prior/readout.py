@@ -153,8 +153,10 @@ class Readout(nn.Module):
         return dict(a0=a0, a=a, pe=pe, F_base=self.w_out(a).float(), F_init=self.w_out(a0).float(),
                     depth_grain=d_grain, depth_dense=d_dense, support=support)
 
-    def innovation(self, a: torch.Tensor, pe: torch.Tensor, r: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
-        """dF [B, Q, D_t] from the own-view innovation slots r [B, n_slots, d_r] (prefix L [B]); exactly 0 at L = 0."""
+    def innovation(self, a: torch.Tensor, pe: torch.Tensor, r: torch.Tensor, L: torch.Tensor,
+                   return_hidden: bool = False):
+        """dF [B, Q, D_t] from the own-view innovation slots r [B, n_slots, d_r] (prefix L [B]); exactly 0 at L = 0.
+        return_hidden: also the state increment dH [B, Q, dim] (the input of f_out), 0 at L = 0."""
         cfg = self.cfg
         B = a.shape[0]
         rf = r.float()
@@ -165,5 +167,7 @@ class Readout(nn.Module):
             d2 = ((cfg.grid * (self.uq.view(1, -1, 1, 2) - rf[..., :2].unsqueeze(1))) ** 2).sum(-1)
             br = (-d2 / (2 * sig.unsqueeze(1) ** 2)).unsqueeze(1)
         q = self.f_q(torch.cat([a, pe], -1))
-        dF = self.f_out(self.r_ca(q, tok, br, ok)).float()
-        return dF * (L > 0).float().view(B, 1, 1)
+        on = (L > 0).float().view(B, 1, 1)
+        dH = self.r_ca(q, tok, br, ok)
+        dF = self.f_out(dH).float() * on
+        return (dF, dH * on.to(dH.dtype)) if return_hidden else dF

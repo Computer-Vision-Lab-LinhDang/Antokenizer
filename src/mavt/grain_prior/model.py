@@ -78,7 +78,7 @@ class MAVTGrainPrior(nn.Module):
         self.recur = Recurrence(cfg)
         self.appear = Appearance(cfg)
         self.readout = Readout(cfg, Dt)
-        self.rgb = RGBHead(cfg, Dt)
+        self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
         self.lpips = None
@@ -160,11 +160,15 @@ class MAVTGrainPrior(nn.Module):
         out = self.readout.base(f_t, tr["P_can"], S["u"], tr["u"], tr["z"], S["sigma"], tr["valid"], der["scale"],
                                 S["c0"], z, pg)
         out["tr"] = tr
-        out["F_hat"] = out["F_base"]
+        out["F_hat"], out["H_hat"] = out["F_base"], out["a"]
         if r is not None:
-            out["dF"] = self.readout.innovation(out["a"], out["pe"], r, L)
-            out["F_hat"] = out["F_base"] + out["dF"]
+            out["dF"], dH = self.readout.innovation(out["a"], out["pe"], r, L, return_hidden=True)
+            out["F_hat"], out["H_hat"] = out["F_base"] + out["dF"], out["a"] + dH
         return out
+
+    def rgb_of(self, F: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+        """RGB in [0, 1] of one observation: from the DINO-space feature F or the decoder state H (cfg.rgb_from)."""
+        return self.rgb(H if self.cfg.rgb_from == "hidden" else F)
 
     def decode_anchor(self, S: dict, der: dict) -> dict:
         B = S["c0"].shape[0]
@@ -181,7 +185,9 @@ class MAVTGrainPrior(nn.Module):
         for rec, z in zip(S["recs"], self.replay(S)):
             outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"]))
         Fh = torch.stack([o["F_hat"] for o in outs], 1)
-        rgb = self.rgb(Fh.flatten(0, 1)).view(Fh.shape[0], Fh.shape[1], 3, self.cfg.image_size, self.cfg.image_size)
+        Hh = torch.stack([o["H_hat"] for o in outs], 1)
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1)).view(Fh.shape[0], Fh.shape[1], 3, self.cfg.image_size,
+                                                                   self.cfg.image_size)
         return dict(F=Fh, rgb=rgb * 2 - 1, depth=torch.stack([o["depth_dense"] for o in outs], 1))
 
     # ============================================================================== encoder
@@ -280,16 +286,17 @@ class MAVTGrainPrior(nn.Module):
         kappa = kappa_of(zeta)
         z_i = mem(b)
         base = self.decode_obs(S, der, z_i, xi, kappa, M)
-        X_base = self.rgb(base["F_base"])
+        X_base = self.rgb_of(base["F_base"], base["a"])
         eF = st["F"] - base["F_base"].detach()
         eX = Xi - X_base.detach()
         r = self.innov(eF, eX, z_i, xi, kappa, M)
         keep = (torch.arange(cfg.n_slots, device=dev).view(1, -1) < L.view(-1, 1)).float().unsqueeze(-1)
         r = r * keep
-        dF = self.readout.innovation(base["a"], base["pe"], r, L)
-        F_hat = base["F_base"] + dF
+        dF, dH = self.readout.innovation(base["a"], base["pe"], r, L, return_hidden=True)
+        F_hat, H_hat = base["F_base"] + dF, base["a"] + dH
         rec = dict(xi=xi, M=M, kappa=kappa, b=b, r=r, L=L)
-        return dict(rec=rec, z=z_i, base=base, X_base=X_base, F_hat=F_hat, passes=passes, est0=(xi0, est["M"]))
+        return dict(rec=rec, z=z_i, base=base, X_base=X_base, F_hat=F_hat, H_hat=H_hat, passes=passes,
+                    est0=(xi0, est["M"]))
 
     def sample_L(self, B: int, device) -> torch.Tensor:
         cfg = self.cfg
@@ -342,6 +349,7 @@ class MAVTGrainPrior(nn.Module):
         # ---- anchor decode (z = c_0, T = I, M = 0, no innovation)
         out0 = self.decode_anchor(S, der)
         Fh, Fb, Fi, Xb_list, outs = [out0["F_hat"]], [], [out0["F_init"]], [], [out0]
+        Hh = [out0["H_hat"]]
         z_cur = S["c0"].float()
         tg = []
         for i in range(1, n):
@@ -353,13 +361,14 @@ class MAVTGrainPrior(nn.Module):
             self.append_and_fold(S, o["rec"], t_i)
             z_cur = torch.where(static.view(B, 1, 1), z_cur, o["z"])
             Fh.append(o["F_hat"])
+            Hh.append(o["H_hat"])
             Fb.append(o["base"]["F_base"])
             Fi.append(o["base"]["F_init"])
             Xb_list.append(o["X_base"])
             outs.append(o["base"])
             tg.append(o)
-        Fh = torch.stack(Fh, 1)
-        rgb = self.rgb(Fh.flatten(0, 1)).view(B, n, 3, S_img, S_img)
+        Fh, Hh = torch.stack(Fh, 1), torch.stack(Hh, 1)
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1)).view(B, n, 3, S_img, S_img)
         Ft = torch.stack([s["F"] for s in st], 1)
         # ---- L_rec on every observation (full), base and initializer on the targets, init also on the anchor
         loss = self._rec(rgb, X01, Fh, Ft, parts, diag, "rec")

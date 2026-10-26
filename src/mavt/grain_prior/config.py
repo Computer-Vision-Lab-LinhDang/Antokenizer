@@ -81,6 +81,7 @@ class GrainPriorConfig(CD32Config):
     tau_d: float = 0.1                    # depth temperature of the read bias
     tau_d_mode: str = "median"            # median: depth in units of the anchor median | absolute
     rgb_channels: tuple = (256, 128, 64, 32)
+    rgb_from: str = "feature"             # feature: RGB from the predicted DINO feature | hidden: from the decoder state
     # ---- causal prior (stage 8)
     prior_layers: int = 6
     horizons: tuple = (1, 4)
@@ -141,6 +142,7 @@ class GrainPriorConfig(CD32Config):
 
     def check(self) -> None:
         assert self.grid % self.stratum == 0, "stratum must divide the grid"
+        assert self.rgb_from in ("feature", "hidden"), "rgb_from: feature | hidden"
         assert self.grid % self.coarse_grid == 0, "coarse_grid must divide the grid"
         assert self.dim % self.heads == 0
         assert len(self.stem_channels) == 4 and self.image_size // 16 == self.grid, "four stride-2 convs: patch 16"
