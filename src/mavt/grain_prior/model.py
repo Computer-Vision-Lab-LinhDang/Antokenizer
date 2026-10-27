@@ -428,14 +428,19 @@ class MAVTGrainPrior(nn.Module):
         gk = sample_cells(lid[:, 0], S["u"], cfg.grid)
         mk = sample_cells(lmask[:, 0].float(), S["u"], cfg.grid) > 0.99
         terms = [huber_log_depth(der["d"], torch.exp(-gk) / s_scene.view(B, 1), mk, cfg.depth_delta)]
+        grain_v1, grain_v2 = [], []
         for j, o in enumerate(outs):
-            terms.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j] & o["support"], cfg.depth_delta))
+            grain_v1.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j] & o.get("support_v1", o["support"]), cfg.depth_delta))
+            grain_v2.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j], cfg.depth_delta))
+            terms.append((grain_v1 if cfg.measurement_version == 1 else grain_v2)[-1])
             terms.append(huber_log_depth(o["depth_dense"], gt[:, j], lmask[:, j], cfg.depth_delta))
         lg = torch.stack(terms).mean()
         parts["geom"] = lg.detach()
         with torch.no_grad():
             diag["rho_gt_corr"] = _pearson(S["rho"].float(), gk, mk).mean()
             diag["depth_grain_err"] = torch.stack(terms[1::2]).mean()
+            diag["depth_grain_err_v1"] = torch.stack(grain_v1).mean()
+            diag["depth_grain_err_v2"] = torch.stack(grain_v2).mean()
             diag["depth_dense_err"] = torch.stack(terms[2::2]).mean()
         return cfg.w_geom * lg
 

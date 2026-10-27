@@ -24,6 +24,16 @@ from .layers import CrossAttn, attend, mlp2
 N_POOLGEOM = 18
 
 
+def local_support(uq, uhat, sigma, valid, grid):
+    """Diagnostic v2: on-screen, finite front-facing grain within 3 kernel radii.
+
+    Evidence locality is not opacity or calibrated confidence, and never an eval mask.
+    """
+    on_screen = valid & torch.isfinite(uhat).all(-1) & ((uhat >= 0) & (uhat <= 1)).all(-1)
+    d2 = ((grid * (uq.float().unsqueeze(2) - uhat.float().unsqueeze(1))) ** 2).sum(-1)
+    return (on_screen.unsqueeze(1) & (d2 <= 9 * sigma.float().unsqueeze(1).square())).any(-1)
+
+
 def pool_geom(xi, kappa, kappa0, rho, M, valid) -> torch.Tensor:
     """PoolGeom(C, D_i): pooled geometric metadata of the state at observation i [B, 18] (no target data)."""
     return torch.cat([xi, kappa, kappa0, rho.mean(-1, keepdim=True), rho.std(-1, keepdim=True),
@@ -156,8 +166,11 @@ class Readout(nn.Module):
             far = z_cam.float().masked_fill(~valid, 0).amax(-1, keepdim=True).clamp_min(1.0)
             d_grain = torch.where(support, (nu * z_cam.float().unsqueeze(1)).sum(-1), far.expand_as(support).float())
             d_dense = torch.exp(self.depth(a.float()).squeeze(-1).float().clamp(-20, 20)) * scale.float().view(B, 1)
+        support_v2 = local_support(u_q, u_hat, sigma, valid, cfg.grid)
         return dict(a0=a0, a=a, pe=pe, F_base=self.w_out(a).float(), F_init=self.w_out(a0).float(),
-                    depth_grain=d_grain, depth_dense=d_dense, support=support)
+                    depth_grain=d_grain, depth_dense=d_dense,
+                    support=support if cfg.measurement_version == 1 else support_v2,
+                    support_v1=support, support_v2=support_v2)
 
     def innovation(self, a: torch.Tensor, pe: torch.Tensor, r: torch.Tensor, L: torch.Tensor,
                    return_hidden: bool = False):

@@ -32,7 +32,7 @@ def zero_last(m: nn.Module) -> nn.Module:
 
 
 def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, bias: Optional[torch.Tensor] = None,
-           valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+           valid: Optional[torch.Tensor] = None, *, strict: bool = False) -> torch.Tensor:
     """q [B, nq, d], k / v [B, ne, d]; bias [B, H or 1, nq, ne] (finite); valid [B, ne] or [B, nq, ne] bool.
     -> [B, nq, d]; rows without a valid key are 0."""
     B, nq, d = q.shape
@@ -46,7 +46,9 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, bias: 
         ok = ok | ~has
         m = torch.zeros(ok.shape, device=q.device, dtype=q.dtype).masked_fill(~ok, float("-inf"))
     if bias is not None:
-        b = bias.float().clamp_min(BIAS_FLOOR).to(q.dtype)
+        b = (bias.float() if strict else bias.float().clamp_min(BIAS_FLOOR)).to(q.dtype)
+        if strict and has is not None:
+            b = torch.where(has, b, torch.zeros_like(b))
         m = b if m is None else m + b
     out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=m)
     if has is not None:
@@ -61,10 +63,16 @@ class CrossAttn(nn.Module):
         self.norm_q, self.norm_kv = nn.LayerNorm(dim), nn.LayerNorm(d_kv or dim)
         self.q, self.kv, self.out = nn.Linear(dim, dim), nn.Linear(d_kv or dim, 2 * dim), nn.Linear(dim, dim)
 
-    def forward(self, h: torch.Tensor, e: torch.Tensor, bias=None, valid=None) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, e: torch.Tensor, bias=None, valid=None, *, strict=False) -> torch.Tensor:
         """Evidence read of LN(h) (not added to h): [B, nq, dim]."""
         k, v = self.kv(self.norm_kv(e)).chunk(2, -1)
-        return self.out(attend(self.q(self.norm_q(h)), k, v, self.heads, bias, valid))
+        out = self.out(attend(self.q(self.norm_q(h)), k, v, self.heads, bias, valid, strict=strict))
+        if strict and valid is not None:
+            has = valid.any(-1)
+            if has.ndim == 1:
+                has = has[:, None]
+            out = out * has.unsqueeze(-1).to(out.dtype)
+        return out
 
 
 class SelfAttn(nn.Module):
