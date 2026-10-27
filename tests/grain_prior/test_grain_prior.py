@@ -395,3 +395,52 @@ def test_rgb_from_hidden_bypasses_the_feature_projection():
 def test_rgb_from_rejects_unknown_values():
     with pytest.raises(AssertionError):
         tiny_config(rgb_from="pixels").check()
+
+
+# ---------------------------------------------------------------------------------------------- stability (gp3)
+def _read_layer_out(layer, d_pe, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    B, Q, G, d = 2, 8, 6, layer.norm.normalized_shape[0]
+    a, pe = torch.randn(B, Q, d, generator=gen), torch.randn(B, Q, d_pe, generator=gen)
+    k, v = torch.randn(B, G, d, generator=gen), torch.randn(B, G, d, generator=gen)
+    return layer(a, pe, k, v, None, torch.ones(B, G, dtype=torch.bool))
+
+
+def test_read_qk_norm_makes_the_logits_scale_free():
+    """gp3 diverged when |W_q|, |W_k| of the grain read grew (18 -> 175) and saturated the softmax: with
+    read_qk_norm the read is invariant to the scale of the q / k projections."""
+    from mavt.grain_prior.readout import ReadLayer
+    cfg = tiny_config(read_qk_norm=True)
+    d_pe = cfg.dim                                  # as in Readout: ReadLayer(cfg, d)
+    layer = ReadLayer(cfg, d_pe)
+    with torch.no_grad():
+        a = _read_layer_out(layer, d_pe)
+        for lin in (layer.wq, layer.wpe, layer.wk):
+            lin.weight.mul_(50.0)
+            if lin.bias is not None:
+                lin.bias.mul_(50.0)
+        b = _read_layer_out(layer, d_pe)
+    assert torch.allclose(a, b, atol=1e-4)
+    assert not any("qn" in n or "kn" in n for n, _ in ReadLayer(tiny_config(), cfg.dim).named_parameters())  # old ckpts load
+
+
+def test_image_fov_fixed_pins_the_anchor_camera_of_images_only():
+    """Images carry no focal signal (unproject and project with the same kappa_0): image_fov_fixed pins it to
+    fov_init with a centred principal point, whatever the camera head says; video keeps its estimate."""
+    m = _wake(_model(image_fov_fixed=True))
+    with torch.no_grad():
+        m.anchor.kappa0[-1].bias.add_(3.0)
+        img = m(_inputs("image")[0], "image", None, return_outputs=True)["outputs"]["S"]["kappa0"]
+        vid = m(_inputs("video")[0], "video", None, return_outputs=True)["outputs"]["S"]["kappa0"]
+    cfg = m.cfg
+    f0 = 0.5 / math.tan(math.radians(cfg.fov_init) / 2)
+    assert torch.allclose(img, torch.tensor([f0, f0, 0.5, 0.5]).expand_as(img), atol=1e-5)
+    assert not torch.allclose(vid, img, atol=1e-3)
+
+
+def test_sigma_min_sets_the_grain_radius_floor():
+    m = _model(sigma_min=0.15)
+    with torch.no_grad():
+        m.anchor.w_sigma[-1].bias.fill_(-30.0)
+        s = m(_inputs("image")[0], "image", None, return_outputs=True)["outputs"]["S"]["sigma"]
+    assert torch.allclose(s, torch.full_like(s, 0.15), atol=1e-5)

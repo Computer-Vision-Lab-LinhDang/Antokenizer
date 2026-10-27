@@ -53,10 +53,16 @@ class ReadLayer(nn.Module):
         self.nk, self.nv = nn.LayerNorm(d), nn.LayerNorm(d)
         self.wk, self.wv, self.wo = nn.Linear(d, d), nn.Linear(d, d), nn.Linear(d, d)
         self.ref = mlp2(3 * d, d, cfg.mlp_hidden)
+        if cfg.read_qk_norm:
+            self.qn, self.kn = nn.LayerNorm(d // cfg.heads), nn.LayerNorm(d // cfg.heads)
+
+    def _head_norm(self, x, ln):
+        return ln(x.unflatten(-1, (self.heads, -1))).flatten(-2) if hasattr(self, "qn") else x
 
     def forward(self, a, pe, ktok, vtok, bias, valid):
-        Q = self.wq(self.norm(a)) + self.wpe(pe)
-        e = self.wo(attend(Q, self.wk(self.nk(ktok)), self.wv(self.nv(vtok)), self.heads, bias, valid))
+        Q = self._head_norm(self.wq(self.norm(a)) + self.wpe(pe), getattr(self, "qn", None))
+        K = self._head_norm(self.wk(self.nk(ktok)), getattr(self, "kn", None))
+        e = self.wo(attend(Q, K, self.wv(self.nv(vtok)), self.heads, bias, valid))
         return a + self.ref(torch.cat([a, e, pe], -1))
 
 

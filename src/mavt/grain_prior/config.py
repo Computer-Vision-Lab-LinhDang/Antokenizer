@@ -65,6 +65,7 @@ class GrainPriorConfig(CD32Config):
     fov_min: float = 30.0                 # focal bounds as a field of view (degrees), locked in the run config
     fov_max: float = 120.0
     fov_init: float = 50.0
+    image_fov_fixed: bool = False         # images: kappa_0 = fov_init, centred (no focal signal in a single view)
     pp_range: float = 0.05                # principal point offset bound around the centre (normalised)
     z_eps: float = 1e-2
     # ---- refinement (stage 4B)
@@ -82,6 +83,7 @@ class GrainPriorConfig(CD32Config):
     tau_d_mode: str = "median"            # median: depth in units of the anchor median | absolute
     rgb_channels: tuple = (256, 128, 64, 32)
     rgb_from: str = "feature"             # feature: RGB from the predicted DINO feature | hidden: from the decoder state
+    read_qk_norm: bool = False            # per-head LayerNorm on q, k of the grain read (gp3: |W_q|, |W_k| grew, softmax saturated)
     # ---- causal prior (stage 8)
     prior_layers: int = 6
     horizons: tuple = (1, 4)

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -198,6 +200,10 @@ class MAVTGrainPrior(nn.Module):
         A = self.anchor(Hc, st["F"], st["P"])
         B = Hc.shape[0]
         kappa0 = g.kappa_from_logits(A["kappa_logits"], cfg)
+        if cfg.image_fov_fixed:
+            f0 = 0.5 / math.tan(math.radians(cfg.fov_init) / 2)
+            k_fix = torch.tensor([f0, f0, 0.5, 0.5], device=kappa0.device, dtype=kappa0.dtype).expand_as(kappa0)
+            kappa0 = torch.where((mode == M_IMAGE).view(B, 1), k_fix, kappa0)
         if kappa_cam is not None:
             kappa0 = torch.where(known.view(B, 1), kappa_cam.float(), kappa0)
         rho = torch.where(metric.view(B, 1), A["rho_raw"], A["rho_raw"] - A["rho_raw"].median(-1, keepdim=True).values)
