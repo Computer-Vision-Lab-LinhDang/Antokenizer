@@ -34,7 +34,7 @@ from .layers import mlp2
 from .losses import feat_loss, huber_log_depth, pose_loss, sample_cells
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
-from .readout import Readout, RGBHead, pool_geom
+from .readout import Readout, RGBHead, pool_geom, projected_radius
 from .refinement import CorrRead, UpdateHead
 from .trunk import Bank, PInit, StreamD
 
@@ -207,7 +207,10 @@ class MAVTGrainPrior(nn.Module):
         f_t = self.appear(S["f"].float(), S["u"], z, S["c0"]) if cfg.memory else S["f"].float()
         tr = g.transport_grains(der["P"], der["beta"], M, R, t, kappa, cfg.z_eps)
         pg = pool_geom(xi, kappa, S["kappa0"], S["rho"], M, tr["valid"])
-        out = self.readout.base(f_t, tr["P_can"], S["u"], tr["u"], tr["z"], S["sigma"], tr["valid"], der["scale"],
+        sigma = S["sigma"]
+        if cfg.read_radius_scale:                 # radius on this observation's image (1 at the anchor)
+            sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa)
+        out = self.readout.base(f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"],
                                 S["c0"], z, pg)
         out["tr"] = tr
         out["F_hat"], out["H_hat"] = out["F_base"], out["a"]

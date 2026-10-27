@@ -82,7 +82,7 @@ class ReadLayer(nn.Module):
         self.nk, self.nv = nn.LayerNorm(d), nn.LayerNorm(d)
         self.wk, self.wv, self.wo = nn.Linear(d, d), nn.Linear(d, d), nn.Linear(d, d)
         self.ref = mlp2(3 * d, d, cfg.mlp_hidden)
-        self.strict = cfg.readout_version != "legacy"
+        self.strict = cfg.readout_version != "legacy" or cfg.read_strict
         if self.strict:
             self.temperature = nn.Parameter(torch.zeros(()))
             if cfg.read_sink:                     # zero key and value, logit learned: starts at a few % of the read

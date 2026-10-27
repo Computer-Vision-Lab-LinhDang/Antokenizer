@@ -99,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--resume", default="auto", help="auto (out/last.pt if present) | none | <path>")
+    p.add_argument("--skip-gn", type=float, default=0.0,
+                   help="skip the update when the grad norm before clipping exceeds this (0: off), as in LVSM")
     p.add_argument("--init", default=None, metavar="CKPT",
                    help="start from the model weights of this checkpoint (optimizer and schedule fresh); "
                         "for staged training; ignored when the run resumes")
@@ -676,7 +678,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
             clips_since += n_clips
         gnorm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
                                                args.grad_clip if args.grad_clip > 0 else float("inf"))
-        finite = bool(torch.isfinite(gnorm))
+        finite = bool(torch.isfinite(gnorm)) and not (getattr(args, "skip_gn", 0) > 0 and float(gnorm) > args.skip_gn)
         if finite:                                              # grads are all-reduced: same on all ranks
             opt.step()
         sched.step()
@@ -705,7 +707,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
                             for k, v in rec.items() if isinstance(v, (int, float))}, step=step)
             t_last, steps_since, clips_since = time.time(), 0, 0
         if not finite and rank == 0:
-            print(f"step {step}: non-finite grad norm, update skipped", flush=True)
+            print(f"step {step}: grad norm {float(gnorm):.3g} non-finite or above --skip-gn, update skipped", flush=True)
         if args.schedule == "plateau":
             if finite:
                 plat["acc"], plat["n"] = plat["acc"] + float(out["loss"].detach()), plat["n"] + 1

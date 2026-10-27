@@ -125,3 +125,63 @@ def test_pilot_step_runs_under_bf16_autocast(version):
         r = pilot_step(m, x, cam.kappa, x, cam, torch.ones(1, 64, 64), rays=16, seed=0)
     r["loss"].backward()
     assert torch.isfinite(r["loss"]) and all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+
+
+LEGACY_CRSR = dict(readout_version="legacy", read_strict=True, read_coarse_init=True, read_sink=True,
+                   read_radius_scale=True, sigma_param="log", rgb_from="hidden")
+
+
+def test_read_strict_only_on_the_legacy_readout():
+    with pytest.raises(ValueError):
+        tiny_config(readout_version="shared_ray_v1", innovation_semantics="disabled", read_strict=True).check()
+    tiny_config(**LEGACY_CRSR).check()
+
+
+@pytest.mark.parametrize("modality", ["image", "video", "threed", "world"])
+def test_crsr_flags_on_the_full_legacy_pipeline(modality):
+    """The multi-modal trainer path (forward, innovation, conv RGB head) with the CRSR reader."""
+    from .test_grain_prior import _inputs
+    m = MAVTGrainPrior(tiny_config(**LEGACY_CRSR)).train()
+    assert all(l.strict and hasattr(l, "sink") for l in m.readout.layers)
+    x, cam = _inputs(modality, T=4)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = m(x, modality, cam, return_outputs=True)
+    out["loss"].backward()
+    assert torch.isfinite(out["loss"]) and all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+    assert m.readout.layers[0].sink.grad is not None and m.readout.coarse_in.weight.grad is not None
+
+
+@pytest.mark.parametrize("modality,T", [("image", 1), ("threed", 4)])
+def test_crsr_legacy_decode_of_the_closed_state_matches(modality, T):
+    from mavt.grain_prior import schema as sc
+    from .test_grain_prior import _inputs, _wake
+    m = _wake(MAVTGrainPrior(tiny_config(**LEGACY_CRSR)).eval())
+    x, cam = _inputs(modality, T=T)
+    with torch.no_grad():
+        o = m(x, modality, cam, return_outputs=True)["outputs"]
+        dec = m.decode(sc.deserialize(m.cfg, sc.serialize(m.cfg, o["S"])))
+    q = len(o["S"]["recs"])
+    n = 1 if modality == "image" else T
+    rgb = torch.cat([o["rgb"][:, :1], o["rgb"][:, n - q:]], 1) if q else o["rgb"][:, :1]
+    assert torch.allclose(dec["rgb"], rgb, atol=1e-4)
+
+
+def test_shared_ray_checkpoint_moves_to_the_legacy_pipeline(tmp_path):
+    """Encoder and the ray reader carry over (query_decoder.ray.* -> readout.*); the conv RGB head starts fresh;
+    the result loads with the full trainer's strict --init."""
+    import dataclasses
+    from mavt.grain_prior.pilot import shared_ray_to_legacy
+    src = MAVTGrainPrior(tiny_config(**CRSR, sigma_param="log", rgb_from="hidden"))
+    p, q = tmp_path / "shared.pt", tmp_path / "legacy.pt"
+    torch.save(dict(model=src.state_dict(), cfg=dataclasses.asdict(src.cfg), step=7), p)
+    receipt = shared_ray_to_legacy(p, q)
+    ck = torch.load(q, weights_only=False)
+    dst = MAVTGrainPrior(tiny_config(**{k: v for k, v in ck["cfg"].items() if k in LEGACY_CRSR}))
+    assert dst.cfg.readout_version == "legacy" and dst.cfg.read_strict and dst.cfg.read_sink
+    missing, unexpected = dst.load_state_dict(ck["model"], strict=False)
+    assert not unexpected and not [k for k in missing if not k.startswith("stems.dino.")]
+    for k, v in src.query_decoder.ray.state_dict().items():
+        assert torch.equal(dst.readout.state_dict()[k], v)
+    for k, v in src.anchor.state_dict().items():
+        assert torch.equal(dst.anchor.state_dict()[k], v)
+    assert receipt["step"] == 7 and receipt["fresh"] and all(k.startswith("rgb.") for k in receipt["fresh"])

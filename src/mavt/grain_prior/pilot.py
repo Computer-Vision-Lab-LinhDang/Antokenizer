@@ -3,6 +3,8 @@
 The encoder sees only the source image (and its intrinsics); the target image, mask and camera enter
 the loss and the ray query, never the state. Legacy, shared_ray_v1 and shared_field_v1 share this step.
 """
+import dataclasses
+
 import torch
 
 from . import geometry as g
@@ -98,3 +100,29 @@ def warm_start_query_encoder(ckpt_path, readout_version, **overrides):
     return model, dict(source=str(ckpt_path), source_step=ck.get("step"), readout_version=readout_version,
                        innovation_semantics=cfg.innovation_semantics, copied=len(copied),
                        new_reader_initialized=True, fresh_prefixes=FRESH)
+
+
+def shared_ray_to_legacy(src_path, out_path, **overrides):
+    """Checkpoint of a shared_ray_v1 pilot run -> checkpoint of the legacy pipeline with the same reader (read_strict,
+    CRSR flags kept): encoder copied, query_decoder.ray.* renamed readout.*, the packet heads dropped, the conv RGB
+    head (rgb.*) at its fresh init. Loads with the full trainer's --init. -> receipt."""
+    ck = torch.load(src_path, map_location="cpu", weights_only=False)
+    old = ck.get("cfg", {})
+    if old.get("readout_version") != "shared_ray_v1":
+        raise ValueError("source must be a shared_ray_v1 checkpoint")
+    cfg = config_from_dict(old, **{"readout_version": "legacy", "read_strict": True, "w_lpips": 0.0, **overrides})
+    cfg.check()
+    dst = MAVTGrainPrior(cfg)
+    own = dst.state_dict()
+    sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
+    moved = {("readout." + k[len("query_decoder.ray."):] if k.startswith("query_decoder.ray.") else k): v
+             for k, v in sd.items() if not k.startswith(("query_decoder.heads.", "rgb."))}   # rgb: never trained there
+    for k, v in moved.items():
+        if k in own:
+            if own[k].shape != v.shape:
+                raise ValueError(f"{k}: {tuple(v.shape)} vs {tuple(own[k].shape)}")
+            own[k] = v
+    fresh = sorted(k for k in own if k not in moved and not k.startswith("stems.dino."))
+    out = dict(model=own, cfg=dataclasses.asdict(cfg), step=int(ck.get("step", -1)), source=str(src_path))
+    torch.save(out, out_path)
+    return dict(step=out["step"], fresh=fresh, copied=len(moved))
