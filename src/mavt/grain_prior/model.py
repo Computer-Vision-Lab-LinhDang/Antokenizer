@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Optional
 
 import math
+import dataclasses
 
 import torch
 import torch.nn as nn
@@ -79,10 +80,13 @@ class MAVTGrainPrior(nn.Module):
         self.upd = nn.ModuleList([UpdateHead(cfg, Dt) for _ in range(cfg.refine_passes)])
         self.recur = Recurrence(cfg)
         self.appear = Appearance(cfg)
-        self.readout = Readout(cfg, Dt)
+        self.readout = Readout(cfg if cfg.readout_version == "legacy" else dataclasses.replace(cfg, readout_version="legacy"), Dt)
         self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
+        if cfg.readout_version != "legacy":
+            from .shared import SharedQueryDecoder
+            self.query_decoder = SharedQueryDecoder(cfg, Dt)
         self.lpips = None
         if cfg.w_lpips > 0:
             from ..dino_v0.losses import LPIPSLoss, ignore_lpips_keys
@@ -150,6 +154,49 @@ class MAVTGrainPrior(nn.Module):
         h[:, sc.H_VIEW + 1 + j] = rec.get("view", torch.zeros_like(t))
 
     # ============================================================================== public decoder
+    def encode_source(self, image, kappa=None):
+        """C-only NVS encoder. Target images, depths and target cameras are not arguments.
+
+        image is [B,3,H,W] in [-1,1]. Supplied source intrinsics establish calibrated
+        metric mode; they do not supply target depth or an additional hidden scene code.
+        """
+        if image.ndim != 4 or image.shape[1:] != (3,self.cfg.image_size,self.cfg.image_size):
+            raise ValueError('source image has incorrect shape')
+        B,dev = image.shape[0],image.device
+        known = torch.full((B,),kappa is not None,dtype=torch.bool,device=dev)
+        mode = torch.full((B,),M_STATIC if kappa is not None else M_IMAGE,device=dev)
+        return self.encode_anchor(self.stems(image),mode,known,known,kappa)[0]
+
+    def prepare_state(self, S, record_id=None, mode='anchor'):
+        from .query import prepare_state
+        return prepare_state(self,S,record_id,mode)
+
+    def read_points(self, view, query):
+        if not hasattr(self,'query_decoder'): raise ValueError('legacy has no point field')
+        return self.query_decoder.read_points(view,query)
+
+    def read_rays(self, view, query, chunk=None):
+        if not hasattr(self,'query_decoder'): raise ValueError('use legacy decode for legacy checkpoints')
+        return self.query_decoder.read_rays(view,query,chunk)
+
+    def decode_packet(self, packet, tasks=('rgb','depth','feature')):
+        return self.query_decoder.decode(packet,tasks)
+
+    def _decode_shared_state(self,S):
+        from .query import RayQuery
+        outputs = []
+        for record_id in [None]+list(range(len(S['recs']))):
+            view = self.prepare_state(S,record_id,'anchor' if record_id is None else 'observed')
+            B = view.scale.shape[0]
+            q = RayQuery(view.record_camera,self.uq.expand(B,-1,-1),self.cfg.render_near,
+                         self.cfg.render_far,self.cfg.render_samples)
+            low = self.decode_packet(self.read_rays(view,q),('depth','feature'))
+            uv = g.cell_centres(self.cfg.image_size,self.uq.device).expand(B,-1,-1)
+            high = self.decode_packet(self.read_rays(view,dataclasses.replace(q,uv=uv)),('rgb',))
+            rgb = high['rgb'].transpose(1,2).reshape(B,3,self.cfg.image_size,self.cfg.image_size)
+            outputs.append(dict(F=low['feature'],depth=low['depth'],rgb=rgb*2-1))
+        return {k:torch.stack([o[k] for o in outputs],1) for k in outputs[0]}
+
     def decode_obs(self, S: dict, der: dict, z: torch.Tensor, xi: torch.Tensor, kappa: torch.Tensor,
                    M: torch.Tensor, r: Optional[torch.Tensor] = None, L: Optional[torch.Tensor] = None,
                    R_t: Optional[tuple] = None) -> dict:
@@ -182,6 +229,8 @@ class MAVTGrainPrior(nn.Module):
         """Public decoding of a closed state: anchor and every record in the queue (replayed memory, own r).
         -> dict(F [B, 1 + n_rec, N, D_t], rgb [B, 1 + n_rec, 3, H, W] in [-1, 1],
         depth [B, 1 + n_rec, N])."""
+        if self.cfg.readout_version != "legacy":
+            return self._decode_shared_state(S)
         der = self.derived(S)
         outs = [self.decode_anchor(S, der)]
         for rec, z in zip(S["recs"], self.replay(S)):
@@ -557,6 +606,8 @@ class MAVTGrainPrior(nn.Module):
     def forward(self, x: torch.Tensor, modality: str, cam: Optional[dict] = None,
                 L: Optional[torch.Tensor] = None, return_outputs: bool = False) -> dict:
         """x in [-1, 1]; L (eval) innovation lengths [B, n - 1] or None."""
+        if self.cfg.readout_version != "legacy":
+            raise ValueError('shared query training uses pilot_step; legacy posterior/prior training is gated')
         if modality not in MODALITIES:
             raise ValueError(f"unknown modality {modality!r}")
         if modality in ("threed", "world") and cam is None:
@@ -583,6 +634,9 @@ def load_grain_prior(ckpt_path: str, device="cpu", strict: bool = True, **overri
     """Checkpoint of scripts/train_grain_prior.py -> (model in eval mode, cfg, step)."""
     from .config import config_from_dict
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    version = ck.get('cfg',{}).get('readout_version','legacy')
+    if overrides.get('readout_version',version) != version:
+        raise ValueError('readout migration must be explicit; use warm_start_query_encoder')
     cfg = config_from_dict(ck.get("cfg", {}), **{"w_lpips": 0.0, **overrides})
     model = MAVTGrainPrior(cfg)
     sd = ck["model"] if "model" in ck else ck

@@ -137,7 +137,8 @@ class Readout(nn.Module):
         self.register_buffer("ucoarse", g.cell_centres(cfg.coarse_grid), persistent=False)
 
     def query_pe(self, B: int, uq=None) -> torch.Tensor:
-        uq = self.uq.expand(B,-1,-1) if uq is None else uq
+        if uq is None:
+            return (self.q_pe(g.fourier(self.uq, self.cfg.pe_freq)).unsqueeze(0) + self.q_type).expand(B, -1, -1)
         return self.q_pe(g.fourier(uq, self.cfg.pe_freq)) + self.q_type
 
     def init(self, pe, c0, z, pg, uq=None) -> torch.Tensor:
