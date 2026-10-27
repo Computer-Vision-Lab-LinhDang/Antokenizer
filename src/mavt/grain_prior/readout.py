@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +34,23 @@ def local_support(uq, uhat, sigma, valid, grid):
     on_screen = valid & torch.isfinite(uhat).all(-1) & ((uhat >= 0) & (uhat <= 1)).all(-1)
     d2 = ((grid * (uq.float().unsqueeze(2) - uhat.float().unsqueeze(1))) ** 2).sum(-1)
     return (on_screen.unsqueeze(1) & (d2 <= 9 * sigma.float().unsqueeze(1).square())).any(-1)
+
+
+def proximity(uq, uhat, sigma, valid, grid) -> torch.Tensor:
+    """log sum_k exp(-|u_q - u^_k|^2 / 2 s_k^2) over valid grains, capped at 0 [B, Q]: about 0 where a grain
+    covers the query, far below where none does (no valid grain: -1e4). Added to the normalised geometry bias it
+    lets the CRSR sink compare against the grain mass at the query, independent of the scene depth scale."""
+    with g.fp32(uq.device):
+        d2 = ((grid * (uq.float().unsqueeze(2) - uhat.float().unsqueeze(1))) ** 2).sum(-1)
+        ln = (-d2 / (2 * sigma.float().unsqueeze(1) ** 2)).masked_fill(~valid.unsqueeze(1), float("-inf"))
+        lse = torch.logsumexp(ln, -1)
+        return torch.where(torch.isfinite(lse), lse.clamp_max(0.0), torch.full_like(lse, -1e4))
+
+
+def projected_radius(sigma, d_anchor, z_target, kappa0, kappa) -> torch.Tensor:
+    """Grain radius on the target image: sigma (anchor cells) x (d_anchor / z_target) x (f_target / f_anchor)."""
+    f = lambda k: k[:, :2].float().prod(-1).sqrt().unsqueeze(-1)
+    return sigma.float() * d_anchor.float() / z_target.float().clamp_min(1e-6) * f(kappa) / f(kappa0)
 
 
 def pool_geom(xi, kappa, kappa0, rho, M, valid) -> torch.Tensor:
@@ -66,6 +85,8 @@ class ReadLayer(nn.Module):
         self.strict = cfg.readout_version != "legacy"
         if self.strict:
             self.temperature = nn.Parameter(torch.zeros(()))
+            if cfg.read_sink:                     # zero key and value, logit learned: starts at a few % of the read
+                self.sink = nn.Parameter(torch.tensor(-4.0))
         elif cfg.read_qk_norm:
             self.qn, self.kn = nn.LayerNorm(d // cfg.heads), nn.LayerNorm(d // cfg.heads)
 
@@ -75,14 +96,40 @@ class ReadLayer(nn.Module):
     def forward(self, a, pe, ktok, vtok, bias, valid):
         Q = self._head_norm(self.wq(self.norm(a)) + self.wpe(pe), getattr(self, "qn", None))
         K = self._head_norm(self.wk(self.nk(ktok)), getattr(self, "kn", None))
+        V = self.wv(self.nv(vtok))
         if self.strict:
             norm = lambda x: F.normalize(x.unflatten(-1, (self.heads, -1)), dim=-1).flatten(-2)
             Q = norm(Q) * (8 * self.temperature.sigmoid()) * (Q.shape[-1] // self.heads) ** .5
             K = norm(K)
-        e = self.wo(attend(Q, K, self.wv(self.nv(vtok)), self.heads, bias, valid, strict=self.strict))
-        if self.strict:
-            e = e * valid.any(-1)[:, None, None].to(e.dtype)
+        if hasattr(self, "sink"):
+            K, V, bias, valid = self._with_sink(K, V, bias, valid)
+            if getattr(self, "track_sink", False):
+                self.last_sink_share = self._sink_share(Q, K, bias, valid)
+            e = self.wo(attend(Q, K, V, self.heads, bias, valid, strict=True))
+        else:
+            e = self.wo(attend(Q, K, V, self.heads, bias, valid, strict=self.strict))
+            if self.strict:
+                e = e * valid.any(-1)[:, None, None].to(e.dtype)
         return a + self.ref(torch.cat([a, e, pe], -1))
+
+    def _with_sink(self, K, V, bias, valid):
+        """Append the sink: zero key (content logit 0 after the q/k normalisation) and zero value, logit = sink."""
+        B, Q = K.shape[0], (bias.shape[-2] if bias is not None else None)
+        z = K.new_zeros(B, 1, K.shape[-1])
+        K, V = torch.cat([K, z], 1), torch.cat([V, z.to(V.dtype)], 1)
+        valid = torch.cat([valid, valid.new_ones(B, 1)], -1)
+        if bias is None:
+            raise ValueError("read_sink needs the geometry bias")
+        bias = torch.cat([bias, self.sink.to(bias.dtype).expand(*bias.shape[:-1], 1)], -1)
+        return K, V, bias, valid
+
+    @torch.no_grad()
+    def _sink_share(self, Q, K, bias, valid) -> float:
+        """Mean attention weight on the sink (diagnostic; explicit softmax, so only on small batches)."""
+        sh = lambda t: t.float().unflatten(-1, (self.heads, -1)).transpose(1, 2)
+        logit = sh(Q) @ sh(K).transpose(-1, -2) / math.sqrt(Q.shape[-1] // self.heads) + bias.float()
+        logit = logit.masked_fill(~valid[:, None, None, :], float("-inf"))
+        return logit.softmax(-1)[..., -1].mean().item()
 
 
 class RGBHead(nn.Module):
@@ -114,11 +161,14 @@ class Readout(nn.Module):
         self.q_pe = nn.Linear(pe2, d)
         self.q_type = nn.Parameter(torch.randn(1, 1, d) * 0.02)                        # pixel query type
         # ---- a^(0)
-        self.mem_tok = nn.Linear(dc, d)
-        self.mem_type = nn.Parameter(torch.randn(2, d) * 0.02)                         # c_0, z_i
-        self.mem_slot = nn.Parameter(torch.randn(1, cfg.n_coarse, d) * 0.02)
-        self.mem_grid = nn.Linear(pe2, d)
-        self.init_ca = CrossAttn(d, cfg.heads)
+        if cfg.read_coarse_init:                  # CRSR: bilinear read of c_0 and z_i at u_q
+            self.coarse_in = nn.Linear(2 * dc, d)
+        else:
+            self.mem_tok = nn.Linear(dc, d)
+            self.mem_type = nn.Parameter(torch.randn(2, d) * 0.02)                     # c_0, z_i
+            self.mem_slot = nn.Parameter(torch.randn(1, cfg.n_coarse, d) * 0.02)
+            self.mem_grid = nn.Linear(pe2, d)
+            self.init_ca = CrossAttn(d, cfg.heads)
         self.poolgeom = mlp2(N_POOLGEOM, d, cfg.mlp_hidden)
         self.mlp_a = mlp2(3 * d, d, cfg.mlp_hidden)
         self.uncond = nn.Parameter(torch.randn(1, cfg.n_cells, d) * 0.02)
@@ -147,11 +197,16 @@ class Readout(nn.Module):
         if cfg.query_init == "uncond":
             uncond = self.uncond.expand(B, -1, -1)
             return (uncond if uq is None else g.read_coarse(uncond, uq, cfg.grid)) + pe
+        pg_q = self.poolgeom(pg).to(pe.dtype).unsqueeze(1).expand(-1, pe.shape[1], -1)
+        if cfg.read_coarse_init:
+            u = self.uq.expand(B, -1, -1) if uq is None else uq
+            cz = torch.cat([g.read_coarse(c0.float(), u, cfg.coarse_grid), g.read_coarse(z.float(), u, cfg.coarse_grid)], -1)
+            return self.mlp_a(torch.cat([pe, self.coarse_in(cz).to(pe.dtype), pg_q], -1))
         grid = self.mem_grid(g.fourier(self.ucoarse, cfg.pe_freq)).unsqueeze(0)
         tok = torch.cat([self.mem_tok(c0.float()) + self.mem_type[0], self.mem_tok(z.float()) + self.mem_type[1]], 1)
         tok = tok + (self.mem_slot + grid).repeat(1, 2, 1)
         ca = self.init_ca(pe, tok.to(pe.dtype))
-        return self.mlp_a(torch.cat([pe, ca, self.poolgeom(pg).to(pe.dtype).unsqueeze(1).expand(-1, pe.shape[1], -1)], -1))
+        return self.mlp_a(torch.cat([pe, ca, pg_q], -1))
 
     def base(self, f_t, P_can, u_k, u_hat, z_cam, sigma, valid, scale, c0, z, pg, uq=None) -> dict:
         """Grains at observation i (f~ [B, G, d_f], P^can, anchor u_k, projection u^ / z / valid, sigma), depth
@@ -168,6 +223,8 @@ class Readout(nn.Module):
         u_q = self.uq.expand(B, -1, -1) if uq is None else uq
         dd = z_cam.float() / sc.view(B, 1) if cfg.tau_d_mode == "median" else z_cam.float()
         lnu = geom_bias(u_q, u_hat, sigma, dd, valid, cfg.grid, cfg.tau_d)              # [B, Q, G]
+        if cfg.read_sink:                         # the sink competes with the grain mass at the query
+            lnu = lnu + proximity(u_q, u_hat, sigma, valid, cfg.grid).unsqueeze(-1)
         bias = lnu.unsqueeze(1) if cfg.geom_bias else None
         a = a0
         for layer in self.layers:

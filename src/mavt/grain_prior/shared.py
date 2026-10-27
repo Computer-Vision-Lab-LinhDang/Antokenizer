@@ -5,7 +5,7 @@ import torch.nn as nn
 from . import geometry as g
 from .layers import mlp2
 from .query import ReadPacket
-from .readout import Readout, pool_geom
+from .readout import Readout, pool_geom, projected_radius
 
 
 def join_packets(packets):
@@ -75,7 +75,10 @@ class SharedQueryDecoder(nn.Module):
         Pcam = view.points @ cam.R.transpose(-1,-2) + cam.t[:,None]
         uh, depth, valid = g.project(Pcam,cam.kappa,self.cfg.z_eps)
         pg = pool_geom(g.se3_log(cam.R,cam.t),cam.kappa,view.kappa0,view.rho,view.motion,valid)
-        o = self.ray.base(view.features,view.points,view.uv,uh,depth,view.sigma,valid,view.scale,
+        sigma = view.sigma
+        if self.cfg.read_radius_scale:
+            sigma = projected_radius(view.sigma,view.points[...,2],depth,view.kappa0,cam.kappa)
+        o = self.ray.base(view.features,view.points,view.uv,uh,depth,sigma,valid,view.scale,
                           view.c0,view.z,pg,uq=query.uv)
         h = o['a']
         if view.innovation is not None:

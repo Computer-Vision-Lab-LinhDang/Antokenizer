@@ -85,6 +85,12 @@ class GrainPriorConfig(CD32Config):
     rgb_from: str = "feature"             # feature: RGB from the predicted DINO feature | hidden: from the decoder state
     read_qk_norm: bool = False            # per-head LayerNorm on q, k of the grain read (gp3: |W_q|, |W_k| grew, softmax saturated)
     readout_version: str = "legacy"      # old checkpoints retain exactly the original decoder
+    # CRSR reader (shared_ray_v1 only): coarse residual init, zero-value sink, radius projected to the target
+    read_coarse_init: bool = False        # a^(0) from the bilinear coarse grid at u_q (no memory cross-attention)
+    read_sink: bool = False               # learned-logit sink with zero value; grain bias carries proximity
+    read_radius_scale: bool = False       # grain radius x (d_anchor / z_target) x (f_target / f_anchor)
+    sigma_param: str = "sigmoid"          # sigmoid: sigma_min + span * sigmoid | log: exp, floor sigma_lo
+    sigma_lo: float = 0.02
     query_version: int = 1
     measurement_version: int = 1         # 1 historical; 2 fixed GT denominator/local support
     render_profile: str = "uniform_midpoint_v1"
@@ -155,6 +161,11 @@ class GrainPriorConfig(CD32Config):
     def check(self) -> None:
         if self.readout_version not in ("legacy", "shared_ray_v1", "shared_field_v1"):
             raise ValueError("unknown readout_version")
+        crsr = self.read_coarse_init or self.read_sink or self.read_radius_scale
+        if crsr and self.readout_version != "shared_ray_v1":
+            raise ValueError("read_coarse_init / read_sink / read_radius_scale need readout_version=shared_ray_v1")
+        if self.sigma_param not in ("sigmoid", "log") or not 0 < self.sigma_lo < self.sigma_min + self.sigma_span:
+            raise ValueError("sigma_param: sigmoid | log, with 0 < sigma_lo < sigma_min + sigma_span")
         if self.query_version != 1 or self.measurement_version not in (1, 2):
             raise ValueError("unsupported query/measurement version")
         if self.render_profile != "uniform_midpoint_v1" or not 0 < self.render_near < self.render_far:

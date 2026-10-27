@@ -41,8 +41,8 @@ def _sample_rays(mask, rays, seed):
     B, H, W = mask.shape
     if not 0 < rays <= H * W:
         raise ValueError("rays must be in [1, H * W]")
-    gen = torch.Generator().manual_seed(seed)
-    return torch.rand(B, H * W, generator=gen).argsort(-1)[:, :rays].to(mask.device)
+    gen = torch.Generator(device=mask.device).manual_seed(seed)                  # on the device: the sort is cheap
+    return torch.rand(B, H * W, generator=gen, device=mask.device).argsort(-1)[:, :rays]
 
 
 def pilot_step(model, source, source_kappa, target, camera, mask, rays=1024, seed=0):
@@ -63,8 +63,11 @@ def pilot_step(model, source, source_kappa, target, camera, mask, rays=1024, see
         view = model.prepare_state(S, mode="novel_view")
         q = RayQuery(camera, uv, cfg.render_near, cfg.render_far, cfg.render_samples)
         rgb = model.decode_packet(model.read_rays(view, q), ("rgb",))["rgb"]
-    l1 = ((rgb.float() - tgt).abs() * m).sum() / (3 * m.sum()).clamp_min(1)
-    return dict(loss=cfg.w_rgb * l1, l1=l1.detach(), rays=rays, readout_version=cfg.readout_version)
+    err = rgb.float() - tgt
+    l1 = (err.abs() * m).sum() / (3 * m.sum()).clamp_min(1)
+    mse = (err.square() * m).sum() / (3 * m.sum()).clamp_min(1)
+    return dict(loss=cfg.w_rgb * l1, l1=l1.detach(), mse=mse.detach(), sigma_mean=S["sigma"].float().mean().detach(),
+                rays=rays, readout_version=cfg.readout_version)
 
 
 def warm_start_query_encoder(ckpt_path, readout_version, **overrides):

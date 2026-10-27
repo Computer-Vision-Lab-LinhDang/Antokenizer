@@ -112,6 +112,15 @@ def gaussian_prior(u_q: torch.Tensor, v: torch.Tensor, s: float, eps: float, gri
         return torch.log((1 - eps) * p + eps / P)
 
 
+
+def sigma_from_raw(raw: torch.Tensor, cfg) -> torch.Tensor:
+    """Grain radius in latent cells. sigmoid: sigma_min + span * sigmoid(raw), whose gradient dies at the floor
+    (gp3: sigma sat at sigma_min from step 75). log: exp(raw) around the old mid value, d log sigma / d raw = 1."""
+    if cfg.sigma_param == "log":
+        hi = cfg.sigma_min + cfg.sigma_span
+        return torch.exp((math.log(cfg.sigma_min + cfg.sigma_span / 2) + raw).clamp(math.log(cfg.sigma_lo), math.log(hi)))
+    return cfg.sigma_min + cfg.sigma_span * torch.sigmoid(raw)
+
 class AnchorHeads(nn.Module):
     """H_C^(6) (+ F_0, P_0) -> c_0, kappa_0 logits, grains (u, rho~, sigma, f)."""
 
@@ -169,5 +178,5 @@ class AnchorHeads(nn.Module):
         h = run(self.blocks, q, [(E, bias, None)])
         h = self.norm(h)
         rho_t = cfg.rho_lo + (cfg.rho_hi - cfg.rho_lo) * torch.sigmoid(self.w_rho(h).squeeze(-1).float())
-        sigma = cfg.sigma_min + cfg.sigma_span * torch.sigmoid(self.w_sigma(h).squeeze(-1).float())
+        sigma = sigma_from_raw(self.w_sigma(h).squeeze(-1).float(), cfg)
         return dict(c0=c0, kappa_logits=kz, u=u, rho_raw=rho_t, sigma=sigma, f=self.w_f(h).float(), h=h)
