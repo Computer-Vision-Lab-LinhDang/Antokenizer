@@ -84,6 +84,16 @@ class GrainPriorConfig(CD32Config):
     rgb_channels: tuple = (256, 128, 64, 32)
     rgb_from: str = "feature"             # feature: RGB from the predicted DINO feature | hidden: from the decoder state
     read_qk_norm: bool = False            # per-head LayerNorm on q, k of the grain read (gp3: |W_q|, |W_k| grew, softmax saturated)
+    readout_version: str = "legacy"      # old checkpoints retain exactly the original decoder
+    query_version: int = 1
+    measurement_version: int = 1         # 1 historical; 2 fixed GT denominator/local support
+    render_profile: str = "uniform_midpoint_v1"
+    innovation_semantics: str = "legacy_image"
+    render_samples: int = 32
+    query_chunk: int = 512
+    render_near: float = 0.1             # source gauge units, never fitted to target labels
+    render_far: float = 4.0
+    background_rgb: tuple = (0.0, 0.0, 0.0)
     # ---- causal prior (stage 8)
     prior_layers: int = 6
     horizons: tuple = (1, 4)
@@ -143,6 +153,20 @@ class GrainPriorConfig(CD32Config):
         return n
 
     def check(self) -> None:
+        if self.readout_version not in ("legacy", "shared_ray_v1", "shared_field_v1"):
+            raise ValueError("unknown readout_version")
+        if self.query_version != 1 or self.measurement_version not in (1, 2):
+            raise ValueError("unsupported query/measurement version")
+        if self.render_profile != "uniform_midpoint_v1" or not 0 < self.render_near < self.render_far:
+            raise ValueError("invalid render profile/bounds")
+        if self.render_samples < 1 or self.query_chunk < 1:
+            raise ValueError("samples and chunk must be positive")
+        if self.innovation_semantics not in ("legacy_image", "disabled", "shared_hidden_v1"):
+            raise ValueError("unsupported innovation semantics")
+        if self.readout_version == "shared_field_v1" and self.innovation_semantics != "disabled":
+            raise ValueError("spatial innovations require the empirical consistency gate")
+        if len(self.background_rgb) != 3 or any(not 0 <= c <= 1 for c in self.background_rgb):
+            raise ValueError("background_rgb must be three values in [0,1]")
         assert self.grid % self.stratum == 0, "stratum must divide the grid"
         assert self.rgb_from in ("feature", "hidden"), "rgb_from: feature | hidden"
         assert self.grid % self.coarse_grid == 0, "coarse_grid must divide the grid"
