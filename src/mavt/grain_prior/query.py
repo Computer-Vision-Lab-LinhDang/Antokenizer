@@ -30,7 +30,10 @@ class Camera:
         if self.kappa.shape != (b,4) or self.R.shape != (b,3,3) or self.t.shape != (b,3):
             raise ValueError('camera requires kappa[B,4], R[B,3,3], t[B,3]')
         eye = torch.eye(3, device=self.R.device).expand(b,-1,-1)
-        if (self.kappa[:,:2] <= 0).any() or not torch.allclose(self.R.transpose(-1,-2) @ self.R, eye, atol=1e-4, rtol=1e-4) or not torch.allclose(torch.linalg.det(self.R), torch.ones(b,device=self.R.device), atol=1e-4):
+        with g.fp32(self.R.device):          # under bf16 autocast R^T R would come back in bf16
+            ok = (self.kappa[:,:2] > 0).all() and torch.allclose(self.R.transpose(-1,-2) @ self.R, eye, atol=1e-4, rtol=1e-4) \
+                and torch.allclose(torch.linalg.det(self.R), torch.ones(b,device=self.R.device), atol=1e-4)
+        if not ok:
             raise ValueError('camera needs positive focal and a proper rotation')
 
 

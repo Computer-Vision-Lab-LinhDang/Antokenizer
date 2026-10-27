@@ -111,3 +111,17 @@ def test_pilot_step_trains_the_crsr_reader():
     sink = [p.grad for n, p in m.named_parameters() if n.endswith(".sink")]
     assert sink and all(g is not None and torch.isfinite(g).all() for g in sink)
     assert m.query_decoder.ray.coarse_in.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("version", ["legacy", "shared_ray_v1", "crsr", "shared_field_v1"])
+def test_pilot_step_runs_under_bf16_autocast(version):
+    """The trainer wraps pilot_step in bf16 autocast; geometry checks and accumulations must stay in fp32."""
+    kw = dict(CRSR, sigma_param="log") if version == "crsr" else dict(readout_version=version, innovation_semantics="disabled")
+    m = MAVTGrainPrior(tiny_config(render_samples=4, **kw))
+    configure_pilot(m, frozen_encoder=False)
+    cam = Camera(torch.tensor([[1.0, 1.0, 0.5, 0.5]]), torch.eye(3)[None], torch.zeros(1, 3))
+    x = torch.rand(1, 3, 64, 64) * 2 - 1
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        r = pilot_step(m, x, cam.kappa, x, cam, torch.ones(1, 64, 64), rays=16, seed=0)
+    r["loss"].backward()
+    assert torch.isfinite(r["loss"]) and all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
