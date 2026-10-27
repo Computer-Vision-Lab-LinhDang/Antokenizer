@@ -193,8 +193,9 @@ def all_mean(t: torch.Tensor) -> torch.Tensor:
 
 # ---------------------------------------------------------------------------- optim
 def plateau_reached(prev: Optional[float], cur: float, tol: float) -> bool:
-    """The loss of the latest window improved on the previous window by less than a fraction tol."""
-    return prev is not None and (prev - cur) < tol * abs(prev)
+    """The loss of the latest window moved from the previous window by less than a fraction tol. A rise is not a
+    plateau: after --init a stage adds data the loss climbs first (gp3 s2/s3 stopped at their first window)."""
+    return prev is not None and abs(prev - cur) < tol * abs(prev)
 
 
 def build_optim(model: torch.nn.Module, args, device=None, plat: Optional[dict] = None):

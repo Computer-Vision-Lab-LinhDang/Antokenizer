@@ -30,7 +30,8 @@ def test_plateau_trigger():
     assert not T.plateau_reached(None, 1.0, 0.01)
     assert not T.plateau_reached(1.0, 0.95, 0.01)          # still 5 % better per window
     assert T.plateau_reached(1.0, 0.995, 0.01)
-    assert T.plateau_reached(1.0, 1.02, 0.01)              # got worse
+    assert not T.plateau_reached(1.0, 1.02, 0.01)          # got worse: a new stage's data mix, not convergence
+    assert T.plateau_reached(1.0, 1.005, 0.01)             # flat within tol either way
 
 
 def test_cosine_schedule_is_unchanged_by_default():
