@@ -83,6 +83,7 @@ class GrainPriorConfig(CD32Config):
     tau_d_mode: str = "median"            # median: depth in units of the anchor median | absolute
     rgb_channels: tuple = (256, 128, 64, 32)
     rgb_from: str = "feature"             # feature: RGB from the predicted DINO feature | hidden: from the decoder state
+    query_grid: int = 0                   # > 0 (legacy, rgb_from=hidden): RGB from a second read on this finer grid
     read_qk_norm: bool = False            # per-head LayerNorm on q, k of the grain read (gp3: |W_q|, |W_k| grew, softmax saturated)
     readout_version: str = "legacy"      # old checkpoints retain exactly the original decoder
     # CRSR reader (shared_ray_v1 only): coarse residual init, zero-value sink, radius projected to the target
@@ -183,6 +184,11 @@ class GrainPriorConfig(CD32Config):
             raise ValueError("background_rgb must be three values in [0,1]")
         assert self.grid % self.stratum == 0, "stratum must divide the grid"
         assert self.rgb_from in ("feature", "hidden"), "rgb_from: feature | hidden"
+        if self.query_grid:
+            up = self.image_size // self.query_grid
+            assert self.readout_version == "legacy" and self.rgb_from == "hidden", "query_grid: legacy, rgb_from=hidden"
+            assert self.query_grid % self.grid == 0 and up * self.query_grid == self.image_size and up & (up - 1) == 0 \
+                and 2 <= up <= 16, "query_grid: a multiple of grid, image_size / query_grid a power of 2 in [2, 16]"
         assert self.grid % self.coarse_grid == 0, "coarse_grid must divide the grid"
         assert self.dim % self.heads == 0
         assert len(self.stem_channels) == 4 and self.image_size // 16 == self.grid, "four stride-2 convs: patch 16"

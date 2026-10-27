@@ -185,3 +185,26 @@ def test_shared_ray_checkpoint_moves_to_the_legacy_pipeline(tmp_path):
     for k, v in src.anchor.state_dict().items():
         assert torch.equal(dst.anchor.state_dict()[k], v)
     assert receipt["step"] == 7 and receipt["fresh"] and all(k.startswith("rgb.") for k in receipt["fresh"])
+
+
+def test_query_grid_needs_the_hidden_legacy_rgb():
+    for bad in (dict(query_grid=8, rgb_from="feature"), dict(query_grid=6), dict(query_grid=2)):
+        with pytest.raises(AssertionError):
+            tiny_config(**{**LEGACY_CRSR, **bad}).check()
+    tiny_config(**LEGACY_CRSR, query_grid=16).check()
+
+
+@pytest.mark.parametrize("modality", ["image", "threed", "world"])
+def test_query_grid_reads_rgb_on_the_finer_grid(modality):
+    """RGB from a 16 x 16 read (4 px cells) of the 64 px tiny image, cell-grid losses unchanged."""
+    from .test_grain_prior import _inputs, _wake
+    m = _wake(MAVTGrainPrior(tiny_config(**LEGACY_CRSR, query_grid=16))).train()
+    assert len(m.rgb.convs) == 2 and m.uq_rgb.shape == (256, 2)
+    x, cam = _inputs(modality, T=3)
+    out = m(x, modality, cam, return_outputs=True)
+    out["loss"].backward()
+    assert torch.isfinite(out["loss"]) and all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+    assert out["outputs"]["rgb"].shape[-2:] == (64, 64) and out["outputs"]["F_hat"].shape[-2] == m.cfg.grid ** 2
+    with torch.no_grad():
+        dec = m.eval().decode(m(x, modality, cam, return_outputs=True)["outputs"]["S"])
+    assert dec["rgb"].shape[-2:] == (64, 64) and torch.isfinite(dec["rgb"]).all()

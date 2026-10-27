@@ -99,6 +99,8 @@ class MAVTGrainPrior(nn.Module):
             elif cfg.phase == "prior":
                 p.requires_grad_(False)
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
+        if cfg.query_grid:
+            self.register_buffer("uq_rgb", g.cell_centres(cfg.query_grid), persistent=False)
 
     # ============================================================================== state helpers
     def derived(self, S: dict) -> dict:
@@ -200,8 +202,9 @@ class MAVTGrainPrior(nn.Module):
 
     def decode_obs(self, S: dict, der: dict, z: torch.Tensor, xi: torch.Tensor, kappa: torch.Tensor,
                    M: torch.Tensor, r: Optional[torch.Tensor] = None, L: Optional[torch.Tensor] = None,
-                   R_t: Optional[tuple] = None) -> dict:
-        """Observation with record (xi, kappa, M[, r, L]) and memory z -> dict(base, F_hat, ...)."""
+                   R_t: Optional[tuple] = None, rgb: bool = True) -> dict:
+        """Observation with record (xi, kappa, M[, r, L]) and memory z -> dict(base, F_hat, ...). With
+        cfg.query_grid (and rgb), a second read on that grid gives the RGB state H_hat (a_rgb, pe_rgb)."""
         cfg = self.cfg
         R, t = g.se3_exp(xi) if R_t is None else R_t
         f_t = self.appear(S["f"].float(), S["u"], z, S["c0"]) if cfg.memory else S["f"].float()
@@ -210,14 +213,26 @@ class MAVTGrainPrior(nn.Module):
         sigma = S["sigma"]
         if cfg.read_radius_scale:                 # radius on this observation's image (1 at the anchor)
             sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa)
-        out = self.readout.base(f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"],
-                                S["c0"], z, pg)
+        grains = (f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"], S["c0"], z, pg)
+        out = self.readout.base(*grains)
         out["tr"] = tr
         out["F_hat"], out["H_hat"] = out["F_base"], out["a"]
         if r is not None:
             out["dF"], dH = self.readout.innovation(out["a"], out["pe"], r, L, return_hidden=True)
             out["F_hat"], out["H_hat"] = out["F_base"] + out["dF"], out["a"] + dH
+        if cfg.query_grid and rgb:
+            fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1))
+            out["a_rgb"], out["pe_rgb"] = fine["a"], fine["pe"]
+            out["H_hat"] = self._rgb_state(out, r, L)
         return out
+
+    def _rgb_state(self, out: dict, r: Optional[torch.Tensor], L: Optional[torch.Tensor]) -> torch.Tensor:
+        """Decoder state on the query_grid read, plus its innovation increment when r is given."""
+        a = out["a_rgb"]
+        if r is None:
+            return a
+        uq = self.uq_rgb.expand(a.shape[0], -1, -1)
+        return a + self.readout.innovation(a, out["pe_rgb"], r, L, return_hidden=True, uq=uq)[1]
 
     def rgb_of(self, F: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
         """RGB in [0, 1] of one observation: from the DINO-space feature F or the decoder state H (cfg.rgb_from)."""
@@ -327,7 +342,7 @@ class MAVTGrainPrior(nn.Module):
         for ell in range(cfg.refine_passes):
             z_l = mem(b)
             xi_l = g.se3_log(R, t)
-            base_l = self.decode_obs(S, der, z_l, xi_l, kappa_of(zeta), M, R_t=(R, t))
+            base_l = self.decode_obs(S, der, z_l, xi_l, kappa_of(zeta), M, R_t=(R, t), rgb=False)
             tr = base_l["tr"]
             passes.append(base_l)
             e, v_bar = self.corr(S["f"], S["u"], tr["u"], tr["valid"], st["Y"], ell)
@@ -345,14 +360,14 @@ class MAVTGrainPrior(nn.Module):
         kappa = kappa_of(zeta)
         z_i = mem(b)
         base = self.decode_obs(S, der, z_i, xi, kappa, M)
-        X_base = self.rgb_of(base["F_base"], base["a"])
+        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"])
         eF = st["F"] - base["F_base"].detach()
         eX = Xi - X_base.detach()
         r = self.innov(eF, eX, z_i, xi, kappa, M)
         keep = (torch.arange(cfg.n_slots, device=dev).view(1, -1) < L.view(-1, 1)).float().unsqueeze(-1)
         r = r * keep
         dF, dH = self.readout.innovation(base["a"], base["pe"], r, L, return_hidden=True)
-        F_hat, H_hat = base["F_base"] + dF, base["a"] + dH
+        F_hat, H_hat = base["F_base"] + dF, (self._rgb_state(base, r, L) if cfg.query_grid else base["a"] + dH)
         rec = dict(xi=xi, M=M, kappa=kappa, b=b, r=r, L=L)
         return dict(rec=rec, z=z_i, base=base, X_base=X_base, F_hat=F_hat, H_hat=H_hat, passes=passes,
                     est0=(xi0, est["M"]))

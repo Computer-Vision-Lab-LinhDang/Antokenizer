@@ -133,19 +133,22 @@ class ReadLayer(nn.Module):
 
 
 class RGBHead(nn.Module):
-    """Feature grid [B, G*G, D_t] -> image [B, 3, 16 G, 16 G] in [0, 1]."""
+    """Feature grid [B, G*G, D_t] -> image [B, 3, 16 G, 16 G] in [0, 1]; on cfg.query_grid Gq: one stride-2
+    upsampling per factor of 2 up to the image (the first rgb_channels)."""
 
     def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
         super().__init__()
         self.cfg = cfg
+        self.side = cfg.query_grid or cfg.grid
+        n_up = (cfg.image_size // self.side).bit_length() - 1
         self.proj = nn.Linear(teacher_dim, cfg.dim)
-        ch = [cfg.dim] + list(cfg.rgb_channels)
-        self.convs = nn.ModuleList([nn.Conv2d(ch[i], ch[i + 1], 3, padding=1) for i in range(4)])
+        ch = [cfg.dim] + list(cfg.rgb_channels)[:n_up]
+        self.convs = nn.ModuleList([nn.Conv2d(ch[i], ch[i + 1], 3, padding=1) for i in range(n_up)])
         self.final = nn.Conv2d(ch[-1], 3, 3, padding=1)
 
     def forward(self, Fh: torch.Tensor) -> torch.Tensor:
         B, N, _ = Fh.shape
-        G = self.cfg.grid
+        G = self.side
         x = self.proj(Fh).transpose(1, 2).reshape(B, -1, G, G)
         for conv in self.convs:
             x = F.gelu(conv(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)))
