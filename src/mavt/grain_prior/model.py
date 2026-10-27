@@ -80,7 +80,8 @@ class MAVTGrainPrior(nn.Module):
         self.upd = nn.ModuleList([UpdateHead(cfg, Dt) for _ in range(cfg.refine_passes)])
         self.recur = Recurrence(cfg)
         self.appear = Appearance(cfg)
-        self.readout = Readout(cfg if cfg.readout_version == "legacy" else dataclasses.replace(cfg, readout_version="legacy"), Dt)
+        # shared readouts own their reader (query_decoder); a second, unused Readout would stall DDP
+        self.readout = Readout(cfg, Dt) if cfg.readout_version == "legacy" else None
         self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
