@@ -72,7 +72,10 @@ def main(argv=None):
         if a.init:
             model,receipt=warm_start_query_encoder(a.init,a.readout)
         else:
-            model,_,_=load_grain_prior(a.checkpoint)
+            # E0 keeps its pretrained legacy decoder. C-only training has no innovation
+            # records, so disabling that path changes no checkpoint tensor or prediction.
+            overrides=dict(innovation_semantics='disabled',measurement_version=2,w_lpips=0.) if a.readout=='legacy' else {}
+            model,_,_=load_grain_prior(a.checkpoint,**overrides)
             if model.cfg.readout_version!=a.readout: p.error('checkpoint readout mismatch')
         if model.cfg.innovation_semantics!='disabled': p.error('pilot requires disabled innovations')
     cfg=model.cfg

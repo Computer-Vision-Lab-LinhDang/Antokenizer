@@ -3,6 +3,10 @@ from pathlib import Path
 import subprocess
 import sys
 import torch
+import hashlib
+import dataclasses
+from mavt.grain_prior.model import MAVTGrainPrior
+from mavt.grain_prior.config import tiny_config
 
 
 def test_scene_runner_dry_run_saves_schedule_and_both_learning_rates(tmp_path):
@@ -17,3 +21,22 @@ def test_scene_runner_dry_run_saves_schedule_and_both_learning_rates(tmp_path):
     assert ck['step']==2 and ck['schedule']['kind']=='cosine'
     assert ck['protocol']=='shared-query-pilot-v1' and ck['optimizer']
     assert ck['cfg']['innovation_semantics']=='disabled'
+
+
+def test_scene_runner_accepts_legacy_control_with_audited_bundle(tmp_path):
+    m=MAVTGrainPrior(tiny_config())
+    ckpt=tmp_path/'legacy.pt'
+    torch.save(dict(cfg=dataclasses.asdict(m.cfg),model=m.state_dict()),ckpt)
+    x=torch.rand(1,3,64,64)*2-1
+    k=torch.tensor([[1.,1.,.5,.5]])
+    bundle=tmp_path/'scene.pt'
+    torch.save(dict(source=x,source_kappa=k,target=x.flip(-1),target_depth=torch.ones(1,64,64),
+                    target_kappa=k,target_R=torch.eye(3)[None],target_t=torch.zeros(1,3)),bundle)
+    row=dict(scene_id='scene',group_id='asset',split='train',source_ids=['a'],target_ids=['b'],
+             tensor_file='scene.pt',sha256=hashlib.sha256(bundle.read_bytes()).hexdigest())
+    manifest=tmp_path/'manifest.jsonl'
+    manifest.write_text(json.dumps(row)+'\n')
+    script=Path(__file__).resolve().parents[2]/'scripts/train_query_scene.py'
+    subprocess.run([sys.executable,str(script),'--manifest',str(manifest),'--checkpoint',str(ckpt),
+                    '--readout','legacy','--steps','1','--warmup','0','--rays','4','--device','cpu',
+                    '--out',str(tmp_path/'control')],check=True)
