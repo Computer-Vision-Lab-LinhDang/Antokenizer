@@ -208,3 +208,12 @@ def test_query_grid_reads_rgb_on_the_finer_grid(modality):
     with torch.no_grad():
         dec = m.eval().decode(m(x, modality, cam, return_outputs=True)["outputs"]["S"])
     assert dec["rgb"].shape[-2:] == (64, 64) and torch.isfinite(dec["rgb"]).all()
+
+
+def test_projected_radius_clip_bounds_the_scale():
+    sigma, d = torch.full((1, 3), 0.5), torch.ones(1, 3)
+    z = torch.tensor([[1e-3, 1.0, 1e3]])
+    k = torch.tensor([[1.0, 1.0, 0.5, 0.5]])
+    assert projected_radius(sigma, d, z, k, k)[0, 0] > 100                       # unbounded: covers the image
+    r = projected_radius(sigma, d, z, k, k, clip=8.0)
+    assert torch.allclose(r, torch.tensor([[4.0, 0.5, 0.0625]]))

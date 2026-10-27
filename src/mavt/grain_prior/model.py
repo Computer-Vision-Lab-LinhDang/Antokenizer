@@ -212,7 +212,7 @@ class MAVTGrainPrior(nn.Module):
         pg = pool_geom(xi, kappa, S["kappa0"], S["rho"], M, tr["valid"])
         sigma = S["sigma"]
         if cfg.read_radius_scale:                 # radius on this observation's image (1 at the anchor)
-            sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa)
+            sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa, cfg.read_radius_clip)
         grains = (f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"], S["c0"], z, pg)
         out = self.readout.base(*grains)
         out["tr"] = tr

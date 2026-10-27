@@ -91,6 +91,7 @@ class GrainPriorConfig(CD32Config):
     read_coarse_init: bool = False        # a^(0) from the bilinear coarse grid at u_q (no memory cross-attention)
     read_sink: bool = False               # learned-logit sink with zero value; grain bias carries proximity
     read_radius_scale: bool = False       # grain radius x (d_anchor / z_target) x (f_target / f_anchor)
+    read_radius_clip: float = 0.0         # > 0: projected radius scale bounded to [1 / clip, clip]
     sigma_param: str = "sigmoid"          # sigmoid: sigma_min + span * sigmoid | log: exp, floor sigma_lo
     sigma_lo: float = 0.02
     query_version: int = 1

@@ -47,10 +47,12 @@ def proximity(uq, uhat, sigma, valid, grid) -> torch.Tensor:
         return torch.where(torch.isfinite(lse), lse.clamp_max(0.0), torch.full_like(lse, -1e4))
 
 
-def projected_radius(sigma, d_anchor, z_target, kappa0, kappa) -> torch.Tensor:
-    """Grain radius on the target image: sigma (anchor cells) x (d_anchor / z_target) x (f_target / f_anchor)."""
+def projected_radius(sigma, d_anchor, z_target, kappa0, kappa, clip: float = 0.0) -> torch.Tensor:
+    """Grain radius on the target image: sigma (anchor cells) x (d_anchor / z_target) x (f_target / f_anchor);
+    clip > 0 bounds that scale to [1 / clip, clip] (a grain near the target camera would cover the image)."""
     f = lambda k: k[:, :2].float().prod(-1).sqrt().unsqueeze(-1)
-    return sigma.float() * d_anchor.float() / z_target.float().clamp_min(1e-6) * f(kappa) / f(kappa0)
+    s = d_anchor.float() / z_target.float().clamp_min(1e-6) * f(kappa) / f(kappa0)
+    return sigma.float() * (s.clamp(1 / clip, clip) if clip > 0 else s)
 
 
 def pool_geom(xi, kappa, kappa0, rho, M, valid) -> torch.Tensor:

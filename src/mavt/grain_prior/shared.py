@@ -77,7 +77,7 @@ class SharedQueryDecoder(nn.Module):
         pg = pool_geom(g.se3_log(cam.R,cam.t),cam.kappa,view.kappa0,view.rho,view.motion,valid)
         sigma = view.sigma
         if self.cfg.read_radius_scale:
-            sigma = projected_radius(view.sigma,view.points[...,2],depth,view.kappa0,cam.kappa)
+            sigma = projected_radius(view.sigma,view.points[...,2],depth,view.kappa0,cam.kappa,self.cfg.read_radius_clip)
         o = self.ray.base(view.features,view.points,view.uv,uh,depth,sigma,valid,view.scale,
                           view.c0,view.z,pg,uq=query.uv)
         h = o['a']
