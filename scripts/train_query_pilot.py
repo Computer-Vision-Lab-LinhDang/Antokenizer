@@ -60,6 +60,7 @@ def build_parser():
     p.add_argument("--num-workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--eval-only", default=None, metavar="CKPT", help="score a checkpoint (PSNR/SSIM/LPIPS/rFID), no training")
     return p
 
 
@@ -83,38 +84,110 @@ def reader_layers(model):
     return list((qd.ray if hasattr(qd, "ray") else qd.field).layers)
 
 
+_LPIPS = None
+
+
+def lpips_metric(dev):
+    """LPIPS-VGG, built once (None when the package is missing)."""
+    global _LPIPS
+    if _LPIPS is None:
+        from mavt.dino_v0 import evaluate as E
+        _LPIPS = E.OptionalLPIPS(dev)
+    return _LPIPS if _LPIPS.available else None
+
+
+@torch.no_grad()
+def decode_images(model, x, use_amp, chunk=8):
+    """Every pixel of x [B, 3, H, W] in [-1, 1] decoded from its closed state, identity camera -> (rgb [B, 3, H, W]
+    in [-1, 1], grain radius per image [B])."""
+    cfg, H, dev = model.cfg, model.cfg.image_size, x.device
+    rgbs, sig = [], []
+    for i in range(0, x.shape[0], chunk):
+        xi = x[i:i + chunk]
+        kappa, cam = identity_camera(cfg, xi.shape[0], dev)
+        uv = g.cell_centres(H, dev)[None].expand(xi.shape[0], -1, -1)
+        with torch.autocast("cuda", torch.bfloat16, enabled=use_amp):
+            S = model.encode_source(xi, kappa)
+            if cfg.readout_version == "legacy":
+                rgb = legacy_queries(model, S, cam, uv)["rgb"]
+            else:
+                q = RayQuery(cam, uv, cfg.render_near, cfg.render_far, cfg.render_samples)
+                rgb = model.decode_packet(model.read_rays(model.prepare_state(S, mode="novel_view"), q), ("rgb",))["rgb"]
+        rgbs.append(rgb.float().transpose(1, 2).reshape(xi.shape[0], 3, H, H) * 2 - 1)
+        sig.append(S["sigma"].float().mean(-1))
+    return torch.cat(rgbs).clamp(-1, 1), torch.cat(sig)
+
+
+def image_scores(rgb, tgt, dev):
+    """Per-image PSNR, SSIM (and LPIPS when available) of [-1, 1] images."""
+    from mavt.dino_v0 import evaluate as E
+    out = dict(psnr=E.psnr(rgb, tgt), ssim=E.ssim(rgb, tgt))
+    lp = lpips_metric(dev)
+    if lp is not None:
+        out["lpips"] = lp(rgb, tgt)
+    return out
+
+
 @torch.no_grad()
 def evaluate(model, x, use_amp):
-    """PSNR over every pixel, mean grain radius and sink share of the reader layers."""
+    """PSNR / SSIM / LPIPS over every pixel of x, mean grain radius and sink share of the reader layers."""
     model.eval()
-    cfg, B, dev = model.cfg, x.shape[0], x.device
-    kappa, cam = identity_camera(cfg, B, dev)
     layers = [l for l in reader_layers(model) if hasattr(l, "sink")]
     for l in layers:
         l.track_sink = True
-    psnr, sig, share = [], [], []
-    for i in range(B):
-        xi, ki = x[i:i + 1], kappa[i:i + 1]
-        ci = Camera(cam.kappa[i:i + 1], cam.R[i:i + 1], cam.t[i:i + 1])
-        uv = g.cell_centres(cfg.image_size, dev)[None]
-        with torch.autocast("cuda", torch.bfloat16, enabled=use_amp):
-            S = model.encode_source(xi, ki)
-            if cfg.readout_version == "legacy":
-                rgb = legacy_queries(model, S, ci, uv)["rgb"]
-            else:
-                q = RayQuery(ci, uv, cfg.render_near, cfg.render_far, cfg.render_samples)
-                rgb = model.decode_packet(model.read_rays(model.prepare_state(S, mode="novel_view"), q), ("rgb",))["rgb"]
-        mse = (rgb.float() - ((xi.float() + 1) / 2).flatten(2).transpose(1, 2)).square().mean()
-        psnr.append(-10 * math.log10(max(mse.item(), 1e-10)))
-        sig.append(S["sigma"].float().mean().item())
+    share = []
+    rgb, sig = [], []
+    for i in range(x.shape[0]):                                    # one image at a time: sink share per image
+        r, s = decode_images(model, x[i:i + 1], use_amp)
+        rgb.append(r); sig.append(s)
         share += [l.last_sink_share for l in layers]
     for l in layers:
         l.track_sink = False
     model.train()
-    out = dict(psnr_val=sum(psnr) / len(psnr), sigma_val=sum(sig) / len(sig))
+    sc = image_scores(torch.cat(rgb), x.float(), x.device)
+    out = {f"{k}_val": v.mean().item() for k, v in sc.items()}
+    out["sigma_val"] = torch.cat(sig).mean().item()
     if share:
         out["sink_share"] = sum(share) / len(share)
     return out
+
+
+@torch.no_grad()
+def eval_only(args):
+    """--eval-only CKPT: PSNR, SSIM, LPIPS, rFID of --eval-images ImageNet validation images (center crop) ->
+    <out>/eval.json and eval.md."""
+    from mavt.dino_v0 import evaluate as E
+    from mavt.dino_v0.data import ImageNetParquet
+    from mavt.grain_prior.model import load_grain_prior
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, cfg, step = load_grain_prior(args.eval_only, device=dev)
+    use_amp = args.bf16 and dev.type == "cuda"
+    val = ImageNetParquet(args.imagenet, "validation", cfg.image_size, train=False)
+    n = min(args.eval_images, len(val)) if args.eval_images > 0 else len(val)
+    ld = torch.utils.data.DataLoader(torch.utils.data.Subset(val, range(n)), batch_size=32, num_workers=args.num_workers)
+    fid = E.OptionalFID(dev)
+    acc, t0 = {}, time.time()
+    for b in ld:
+        x = b["data"].to(dev)
+        rgb, sig = decode_images(model, x, use_amp)
+        for k, v in {**image_scores(rgb, x.float(), dev), "sigma": sig}.items():
+            acc.setdefault(k, []).append(v.float().cpu())
+        if fid.available:
+            fid.update(x, rgb)
+    res = {k: torch.cat(v).mean().item() for k, v in acc.items()}
+    res.update(rfid=fid.compute() if fid.available else None, n_images=n, step=step, ckpt=args.eval_only,
+               readout=cfg.readout_version, state_numbers=cfg.state_numbers([]), seconds=round(time.time() - t0),
+               notes=[r for r in (fid.reason, getattr(_LPIPS, "reason", "")) if r])
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "eval.json"), "w") as fh:
+        json.dump(res, fh, indent=1)
+    f = lambda v, d=2: "-" if v is None else f"{v:.{d}f}"
+    md = ["| ckpt step | n | PSNR | SSIM | LPIPS | rFID | numbers |", "|---|---|---|---|---|---|---|",
+          f"| {step} | {n} | {f(res.get('psnr'))} | {f(res.get('ssim'), 3)} | {f(res.get('lpips'), 3)} | {f(res.get('rfid'))} "
+          f"| {res['state_numbers']} |"]
+    open(os.path.join(args.out, "eval.md"), "w").write("\n".join(md) + "\n")
+    print("\n".join(md), flush=True)
+    return 0
 
 
 def lr_factor(step, args):
@@ -162,6 +235,8 @@ def allreduce_grads(params, world):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.eval_only:
+        return eval_only(args)
     rank, world, _, dev = base.setup_dist(args.dry_run)
     torch.manual_seed(args.seed)                                   # same init on every rank
     sets = parse_sets(args.set)
