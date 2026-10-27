@@ -63,7 +63,10 @@ class ReadLayer(nn.Module):
         self.nk, self.nv = nn.LayerNorm(d), nn.LayerNorm(d)
         self.wk, self.wv, self.wo = nn.Linear(d, d), nn.Linear(d, d), nn.Linear(d, d)
         self.ref = mlp2(3 * d, d, cfg.mlp_hidden)
-        if cfg.read_qk_norm:
+        self.strict = cfg.readout_version != "legacy"
+        if self.strict:
+            self.temperature = nn.Parameter(torch.zeros(()))
+        elif cfg.read_qk_norm:
             self.qn, self.kn = nn.LayerNorm(d // cfg.heads), nn.LayerNorm(d // cfg.heads)
 
     def _head_norm(self, x, ln):
@@ -72,7 +75,13 @@ class ReadLayer(nn.Module):
     def forward(self, a, pe, ktok, vtok, bias, valid):
         Q = self._head_norm(self.wq(self.norm(a)) + self.wpe(pe), getattr(self, "qn", None))
         K = self._head_norm(self.wk(self.nk(ktok)), getattr(self, "kn", None))
-        e = self.wo(attend(Q, K, self.wv(self.nv(vtok)), self.heads, bias, valid))
+        if self.strict:
+            norm = lambda x: F.normalize(x.unflatten(-1, (self.heads, -1)), dim=-1).flatten(-2)
+            Q = norm(Q) * (8 * self.temperature.sigmoid()) * (Q.shape[-1] // self.heads) ** .5
+            K = norm(K)
+        e = self.wo(attend(Q, K, self.wv(self.nv(vtok)), self.heads, bias, valid, strict=self.strict))
+        if self.strict:
+            e = e * valid.any(-1)[:, None, None].to(e.dtype)
         return a + self.ref(torch.cat([a, e, pe], -1))
 
 
@@ -127,33 +136,35 @@ class Readout(nn.Module):
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
         self.register_buffer("ucoarse", g.cell_centres(cfg.coarse_grid), persistent=False)
 
-    def query_pe(self, B: int) -> torch.Tensor:
-        return (self.q_pe(g.fourier(self.uq, self.cfg.pe_freq)).unsqueeze(0) + self.q_type).expand(B, -1, -1)
+    def query_pe(self, B: int, uq=None) -> torch.Tensor:
+        uq = self.uq.expand(B,-1,-1) if uq is None else uq
+        return self.q_pe(g.fourier(uq, self.cfg.pe_freq)) + self.q_type
 
-    def init(self, pe, c0, z, pg) -> torch.Tensor:
+    def init(self, pe, c0, z, pg, uq=None) -> torch.Tensor:
         cfg = self.cfg
         B = pe.shape[0]
         if cfg.query_init == "uncond":
-            return self.uncond.expand(B, -1, -1) + pe
+            uncond = self.uncond.expand(B, -1, -1)
+            return (uncond if uq is None else g.read_coarse(uncond, uq, cfg.grid)) + pe
         grid = self.mem_grid(g.fourier(self.ucoarse, cfg.pe_freq)).unsqueeze(0)
         tok = torch.cat([self.mem_tok(c0.float()) + self.mem_type[0], self.mem_tok(z.float()) + self.mem_type[1]], 1)
         tok = tok + (self.mem_slot + grid).repeat(1, 2, 1)
         ca = self.init_ca(pe, tok.to(pe.dtype))
         return self.mlp_a(torch.cat([pe, ca, self.poolgeom(pg).to(pe.dtype).unsqueeze(1).expand(-1, pe.shape[1], -1)], -1))
 
-    def base(self, f_t, P_can, u_k, u_hat, z_cam, sigma, valid, scale, c0, z, pg) -> dict:
+    def base(self, f_t, P_can, u_k, u_hat, z_cam, sigma, valid, scale, c0, z, pg, uq=None) -> dict:
         """Grains at observation i (f~ [B, G, d_f], P^can, anchor u_k, projection u^ / z / valid, sigma), depth
         scale of the gauge [B], c_0, z_i, PoolGeom -> dict(a0, a, F_base, F_init, depth_grain, depth_dense,
         support [B, Q])."""
         cfg = self.cfg
         B = f_t.shape[0]
-        pe = self.query_pe(B)
-        a0 = self.init(pe, c0, z, pg)
+        pe = self.query_pe(B, uq)
+        a0 = self.init(pe, c0, z, pg, uq)
         sc = scale.float().view(B, 1, 1)
         kt = self.ktok(torch.cat([f_t.float(), g.fourier(P_can.float() / sc, cfg.pe_freq),
                                   g.fourier(u_k.float(), cfg.pe_freq)], -1)).to(a0.dtype)
         vt = self.vtok(f_t.float()).to(a0.dtype)
-        u_q = self.uq.expand(B, -1, -1)
+        u_q = self.uq.expand(B, -1, -1) if uq is None else uq
         dd = z_cam.float() / sc.view(B, 1) if cfg.tau_d_mode == "median" else z_cam.float()
         lnu = geom_bias(u_q, u_hat, sigma, dd, valid, cfg.grid, cfg.tau_d)              # [B, Q, G]
         bias = lnu.unsqueeze(1) if cfg.geom_bias else None
@@ -173,7 +184,7 @@ class Readout(nn.Module):
                     support_v1=support, support_v2=support_v2)
 
     def innovation(self, a: torch.Tensor, pe: torch.Tensor, r: torch.Tensor, L: torch.Tensor,
-                   return_hidden: bool = False):
+                   return_hidden: bool = False, uq=None):
         """dF [B, Q, D_t] from the own-view innovation slots r [B, n_slots, d_r] (prefix L [B]); exactly 0 at L = 0.
         return_hidden: also the state increment dH [B, Q, dim] (the input of f_out), 0 at L = 0."""
         cfg = self.cfg
@@ -183,10 +194,11 @@ class Readout(nn.Module):
         ok = torch.arange(cfg.n_slots, device=r.device).view(1, -1) < L.view(-1, 1)
         sig = torch.where(ok, rf[..., 3], torch.ones_like(rf[..., 3])).clamp_min(cfg.sigma_min)   # slots past L: 0
         with g.fp32(a.device):
-            d2 = ((cfg.grid * (self.uq.view(1, -1, 1, 2) - rf[..., :2].unsqueeze(1))) ** 2).sum(-1)
+            u_q = self.uq.expand(B,-1,-1) if uq is None else uq
+            d2 = ((cfg.grid * (u_q.unsqueeze(2) - rf[..., :2].unsqueeze(1))) ** 2).sum(-1)
             br = (-d2 / (2 * sig.unsqueeze(1) ** 2)).unsqueeze(1)
         q = self.f_q(torch.cat([a, pe], -1))
         on = (L > 0).float().view(B, 1, 1)
-        dH = self.r_ca(q, tok, br, ok)
+        dH = self.r_ca(q, tok, br, ok, strict=cfg.readout_version != "legacy")
         dF = self.f_out(dH).float() * on
         return (dF, dH * on.to(dH.dtype)) if return_hidden else dF
