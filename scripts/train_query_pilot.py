@@ -6,7 +6,8 @@ shared_ray_v1 with or without the CRSR flags, shared_field_v1). Same loss for ev
 
 The target is the source image seen by an identity camera at fov_init: per-ray RGB L1 on --rays sampled pixels.
 Eval (rank 0) decodes every pixel of --eval-images validation images: PSNR, grain radius, sink share.
-lr: linear warmup, then constant (the gp3 failure appeared at constant lr). --dry-run: tiny config, CPU, synthetic.
+lr: linear warmup, then constant or cosine to --min-lr-ratio. --skip-gn: drop an update whose grad norm (before
+clipping) exceeds it (LVSM). --ema: eval also with an EMA of the weights. --dry-run: tiny config, CPU, synthetic.
 """
 import argparse
 import dataclasses
@@ -42,7 +43,11 @@ def build_parser():
     p.add_argument("--frozen-encoder", action="store_true")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--lr", type=float, default=6e-4)
-    p.add_argument("--warmup", type=int, default=200)
+    p.add_argument("--warmup", type=int, default=1000)
+    p.add_argument("--schedule", choices=("constant", "cosine"), default="constant")
+    p.add_argument("--min-lr-ratio", type=float, default=0.1, help="cosine: final lr / peak lr")
+    p.add_argument("--skip-gn", type=float, default=0.0, help="skip the update when grad norm > this (0: off)")
+    p.add_argument("--ema", type=float, default=0.0, help="EMA decay of the weights for eval (0: off)")
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--batch", type=int, default=256, help="global images per step")
@@ -110,6 +115,34 @@ def evaluate(model, x, use_amp):
     if share:
         out["sink_share"] = sum(share) / len(share)
     return out
+
+
+def lr_factor(step, args):
+    if step <= args.warmup:
+        return step / max(1, args.warmup)
+    if args.schedule == "constant":
+        return 1.0
+    prog = min(1.0, (step - args.warmup) / max(1, args.steps - args.warmup))
+    return args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
+
+
+class EMA:
+    """fp32 shadow of the trainable weights (rank 0); swap() exchanges it with the live weights for eval."""
+    def __init__(self, params, decay):
+        self.params, self.decay = params, decay
+        self.shadow = [p.detach().float().clone() for p in params]
+
+    @torch.no_grad()
+    def update(self):
+        for s, p in zip(self.shadow, self.params):
+            s.lerp_(p.detach().float(), 1 - self.decay)
+
+    @torch.no_grad()
+    def swap(self):
+        for s, p in zip(self.shadow, self.params):
+            tmp = p.detach().clone()
+            p.copy_(s.to(p.dtype))
+            s.copy_(tmp.float())
 
 
 def allreduce_grads(params, world):
@@ -193,10 +226,12 @@ def main(argv=None):
         print(f"trainable {n_par / 1e6:.2f} M, readout {cfg.readout_version}, world {world}, batch/rank {per_rank}", flush=True)
 
     log = open(os.path.join(args.out, "log.jsonl"), "a") if rank == 0 else None
+    ema = EMA(params, args.ema) if args.ema > 0 and rank == 0 else None
+    n_skip = 0
     t_last = time.time()
     for step in range(1, args.steps + 1):
         for gr in opt.param_groups:
-            gr["lr"] = args.lr * min(1.0, step / max(1, args.warmup))
+            gr["lr"] = args.lr * lr_factor(step, args)
         x = next(data)["data"].to(dev, non_blocking=True)
         r = step_loss(x, args.seed * 1_000_003 + step * world + rank)
         opt.zero_grad(set_to_none=False)
@@ -207,13 +242,18 @@ def main(argv=None):
         allreduce_grads(params, world)
         gn = torch.nn.utils.clip_grad_norm_(params, args.grad_clip if args.grad_clip > 0 else float("inf"))
         finite = bool(torch.isfinite(gn))
-        if finite:
+        ok = finite and not (args.skip_gn > 0 and float(gn) > args.skip_gn)   # same gn on every rank
+        if ok:
             opt.step()
+            if ema is not None:
+                ema.update()
+        else:
+            n_skip += 1
         if step % args.log_every == 0 or step == 1:
             stats = torch.stack([r["l1"], r["mse"], r["sigma_mean"]]).float()
             stats = base.all_mean(stats)
             rec = dict(step=step, l1=stats[0].item(), psnr=-10 * math.log10(max(stats[1].item(), 1e-10)),
-                       sigma=stats[2].item(), grad_norm=float(gn), skipped=not finite, lr=opt.param_groups[0]["lr"],
+                       sigma=stats[2].item(), grad_norm=float(gn), skipped=not ok, n_skipped=n_skip, lr=opt.param_groups[0]["lr"],
                        it_s=args.log_every / max(1e-6, time.time() - t_last) if step > 1 else 0.0)
             temps = [8 * torch.sigmoid(l.temperature).item() for l in reader_layers(model) if hasattr(l, "temperature")]
             sinks = [l.sink.item() for l in reader_layers(model) if hasattr(l, "sink")]
@@ -223,13 +263,18 @@ def main(argv=None):
                 rec["sink_logit"] = sum(sinks) / len(sinks)
             if rank == 0 and (step % args.eval_every == 0 or step == args.steps):
                 rec.update(evaluate(model, x_val, use_amp))
+                if ema is not None:
+                    ema.swap()
+                    rec.update({k + "_ema": v for k, v in evaluate(model, x_val, use_amp).items()})
+                    ema.swap()
             if rank == 0:
                 print(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in rec.items()), flush=True)
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
             t_last = time.time()
         if rank == 0 and (step % args.ckpt_every == 0 or step == args.steps):
-            ck = dict(model=model.state_dict(), opt=opt.state_dict(), step=step, cfg=dataclasses.asdict(cfg), args=vars(args))
+            ck = dict(model=model.state_dict(), opt=opt.state_dict(), step=step, cfg=dataclasses.asdict(cfg), args=vars(args),
+                      ema=None if ema is None else ema.shadow, n_skipped=n_skip)
             torch.save(ck, os.path.join(args.out, "last.pt.tmp"))
             os.replace(os.path.join(args.out, "last.pt.tmp"), os.path.join(args.out, "last.pt"))
     if world > 1:                                                  # the hand-reduced replicas must still agree
