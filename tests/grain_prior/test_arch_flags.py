@@ -436,3 +436,79 @@ def test_read_normalizer_config_checks():
                 dict(read_normalizer="topk", read_topk=2, geom_bias=False), dict(entmax_alpha_init=2.5)):
         with pytest.raises(ValueError):
             tiny_config(**bad).check()
+
+
+# ------------------------------------------------------------------------------------------------ 1.5
+def test_prev_read_centres_follow_the_grain_motion():
+    from mavt.grain_prior.readout import PrevRead
+    cfg = tiny_config(read_prev_frame=True)
+    pr = PrevRead(cfg, 16)
+    uq = torch.rand(1, 5, 2) * 0.5 + 0.25
+    u_prev = uq.clone()                                             # one grain under each query
+    shift = torch.tensor([0.1, -0.05])
+    valid, s = torch.ones(1, 5, dtype=torch.bool), torch.full((1, 5), 0.5)
+    c = pr.centres(uq, u_prev + shift, u_prev, valid, valid, s)
+    assert torch.allclose(c, uq - shift, atol=1e-4)
+    c0 = pr.centres(uq, u_prev + shift, u_prev, valid, torch.zeros_like(valid), s)   # no previous projection
+    assert torch.allclose(c0, uq)
+
+
+def test_prev_read_reads_only_the_detached_previous_feature():
+    from mavt.grain_prior.readout import PrevRead
+    cfg = tiny_config(read_prev_frame=True)
+    pr = PrevRead(cfg, 16)
+    torch.nn.init.normal_(pr.mix.weight, 0, 0.1)
+    F_prev = torch.randn(2, cfg.n_cells, 16, requires_grad=True)
+    uq, u = torch.rand(2, 7, 2), torch.rand(2, 4, 2)
+    valid, s = torch.ones(2, 4, dtype=torch.bool), torch.full((2, 4), 0.5)
+    out = pr(F_prev, uq, u, u, valid, valid, s)
+    assert out.shape == (2, 7, cfg.dim)
+    out.sum().backward()
+    assert F_prev.grad is None and pr.mix.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("kw", [dict(), QG])
+def test_prev_read_is_zero_at_init(kw):
+    on, off = _model(read_prev_frame=True, **kw).eval(), _model(**kw).eval()
+    off.load_state_dict({k: v for k, v in on.state_dict().items() if "prev_read" not in k})
+    x, cam = _inputs("video", T=3)
+    with torch.no_grad():
+        a, b = on(x, "video", cam, return_outputs=True)["outputs"], off(x, "video", cam, return_outputs=True)["outputs"]
+    assert torch.allclose(a["F_hat"], b["F_hat"], atol=1e-5) and torch.allclose(a["rgb"], b["rgb"], atol=1e-5)
+
+
+def _woken_prev(**kw):
+    m = _wake(_model(read_prev_frame=True, **kw)).eval()
+    return m
+
+
+@pytest.mark.parametrize("modality,moves", [("video", True), ("world", True), ("threed", False)])
+def test_prev_read_acts_on_video_and_world_only(modality, moves):
+    m = _woken_prev()
+    x, cam = _inputs(modality, T=3)
+    with torch.no_grad():
+        a = m(x, modality, cam, return_outputs=True)["outputs"]
+        m.readout.prev_read.mix.weight.zero_()
+        b = m(x, modality, cam, return_outputs=True)["outputs"]
+    assert torch.allclose(a["F_hat"][:, 0], b["F_hat"][:, 0])           # the anchor has no previous frame
+    assert (not torch.allclose(a["F_hat"][:, 1:], b["F_hat"][:, 1:])) == moves
+
+
+@pytest.mark.parametrize("kw", [dict(), QG])
+def test_prev_read_decode_of_the_closed_state_matches_without_fold(kw):
+    m = _woken_prev(**kw)
+    T = m.cfg.queue + 1                                              # no record folded into z_b
+    x, cam = _inputs("video", T=T)
+    with torch.no_grad():
+        o = m(x, "video", cam, return_outputs=True)["outputs"]
+        dec = m.decode(sc.deserialize(m.cfg, sc.serialize(m.cfg, o["S"])))
+    assert torch.allclose(dec["F"], o["F_hat"], atol=1e-4) and torch.allclose(dec["rgb"], o["rgb"], atol=1e-4)
+
+
+def test_prev_read_trains_with_L_pred():
+    m = _wake(_model(read_prev_frame=True, w_pred_frame=0.5, innov_stopgrad_base=True)).train()
+    x, cam = _inputs("video", T=3)
+    out = m(x, "video", cam)
+    out["loss"].backward()
+    assert "pred_feat" in out["parts"] and torch.isfinite(out["loss"])
+    assert _nonzero(_grads(m, "readout.prev_read."))

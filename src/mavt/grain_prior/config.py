@@ -107,6 +107,9 @@ class GrainPriorConfig(CD32Config):
     rgb_pw_mlp_ratio: float = 4.0         # 3.3: hidden ratio of its four 1x1 MLP blocks on the query grid
     rgb_in_feat: bool = False             # 3.3: H_in = H + Linear(up_bilinear(sg[F^])) from the feature grid
     read_split_layer2: bool = False       # 3.4: last ReadLayer has two copies: a_F (feature grid) and a_X (RGB grid)
+    # 1.5 (not cd32's prev_read / w_pred, which are inherited, saved in the s1-s3 configs and unused here)
+    read_prev_frame: bool = False         # 1.5: a += Mix(WindowRead3x3(sg[F^_{t-1}]) at u_q - du_q), video / world only
+    w_pred_frame: float = 0.0             # 1.5: L_pred = feat_loss(F_base incl. the previous-frame read, F) on targets
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
     read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
     entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
@@ -249,6 +252,8 @@ class GrainPriorConfig(CD32Config):
             assert n_up >= 1 and self.dim % (4 ** n_up) == 0, "pointwise head: PixelShuffle divides dim by 4 per stage"
         if self.read_split_layer2 and not self.query_grid:
             raise ValueError("read_split_layer2 needs query_grid (a second read for RGB)")
+        if self.w_pred_frame < 0:
+            raise ValueError("w_pred_frame >= 0")
         if self.read_normalizer not in ("softmax", "entmax15", "topk"):
             raise ValueError("read_normalizer: softmax | entmax15 | topk")
         if self.read_normalizer == "topk" and (self.read_topk < 1 or not self.geom_bias):

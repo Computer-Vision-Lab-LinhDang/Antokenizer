@@ -318,6 +318,45 @@ class ReadLayer(nn.Module):
         return logit.softmax(-1)[..., -1].mean().item()
 
 
+class PrevRead(nn.Module):
+    """1.5: read of the previous decoded feature grid (no state numbers: the decoder has decoded it already).
+
+    du_q = sum_j w_qj (u^_j(t) - u^_j(t-1)), w_qj = softmax_j(-|grid (u_q - u^_j(t))|^2 / 2 sigma_j^2) over the
+    grains projected in both observations; nine bilinear taps of W_p sg[F^_{t-1}] at u_q - du_q + {-1, 0, 1}^2 /
+    grid -> Mix (zero-init) -> [B, Q, dim]."""
+
+    def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
+        super().__init__()
+        self.grid = cfg.grid
+        self.proj = nn.Linear(teacher_dim, cfg.dim)
+        self.mix = nn.Linear(9 * cfg.dim, cfg.dim)
+        nn.init.zeros_(self.mix.weight)
+        nn.init.zeros_(self.mix.bias)
+        r = torch.tensor([-1.0, 0.0, 1.0]) / cfg.grid
+        oy, ox = torch.meshgrid(r, r, indexing="ij")
+        self.register_buffer("offsets", torch.stack([ox, oy], -1).reshape(9, 2), persistent=False)
+
+    def centres(self, u_q, u_now, u_prev, valid_now, valid_prev, sigma) -> torch.Tensor:
+        """u_q - du_q [B, Q, 2] (u_q where no grain is projected in both observations)."""
+        with g.fp32(u_q.device):
+            both = valid_now & valid_prev & torch.isfinite(u_now).all(-1) & torch.isfinite(u_prev).all(-1)
+            un = torch.nan_to_num(u_now.float())
+            du = torch.where(both.unsqueeze(-1), un - torch.nan_to_num(u_prev.float()), torch.zeros_like(un))
+            d2 = ((self.grid * (u_q.float().unsqueeze(2) - un.unsqueeze(1))) ** 2).sum(-1)
+            ln = (-d2 / (2 * sigma.float().unsqueeze(1) ** 2)).masked_fill(~both.unsqueeze(1), float("-inf"))
+            has = both.any(-1).view(-1, 1, 1)
+            w = torch.where(has, ln.softmax(-1), torch.zeros_like(ln)).nan_to_num(0.0)
+            return u_q.float() - w @ du
+
+    def forward(self, F_prev, u_q, u_now, u_prev, valid_now, valid_prev, sigma) -> torch.Tensor:
+        B, N, _ = F_prev.shape
+        c = self.centres(u_q, u_now, u_prev, valid_now, valid_prev, sigma)
+        img = self.proj(F_prev.detach().to(self.proj.weight.dtype)).transpose(1, 2).reshape(B, -1, self.grid, self.grid)
+        pts = (c.unsqueeze(2) + self.offsets) * 2 - 1                                # [B, Q, 9, 2]
+        taps = F.grid_sample(img.float(), pts, mode="bilinear", padding_mode="border", align_corners=False)
+        return self.mix(taps.permute(0, 2, 3, 1).flatten(2).to(self.mix.weight.dtype))
+
+
 class PointLN(nn.Module):
     """LayerNorm over the channel axis of an NCHW map at every point (no spatial statistics)."""
 
@@ -467,6 +506,8 @@ class Readout(nn.Module):
         if cfg.read_coarse_kv:                    # 2.1: coarse slot tokens [c_0; z_i] + slot PE, shared by the layers
             self.coarse_kv_tok = nn.Linear(2 * dc, d)
             self.coarse_kv_pe = nn.Linear(pe2, d)
+        if cfg.read_prev_frame:                   # 1.5
+            self.prev_read = PrevRead(cfg, teacher_dim)
         self.w_out = nn.Linear(d, teacher_dim)
         self.depth = mlp2(d, 1, cfg.mlp_hidden)
         # ---- innovation read

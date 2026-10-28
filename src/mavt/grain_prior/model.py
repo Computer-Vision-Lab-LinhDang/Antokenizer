@@ -203,10 +203,13 @@ class MAVTGrainPrior(nn.Module):
 
     def decode_obs(self, S: dict, der: dict, z: torch.Tensor, xi: torch.Tensor, kappa: torch.Tensor,
                    M: torch.Tensor, r: Optional[torch.Tensor] = None, L: Optional[torch.Tensor] = None,
-                   R_t: Optional[tuple] = None, rgb: bool = True, grain_keep: Optional[torch.Tensor] = None) -> dict:
+                   R_t: Optional[tuple] = None, rgb: bool = True, grain_keep: Optional[torch.Tensor] = None,
+                   prev: Optional[dict] = None) -> dict:
         """Observation with record (xi, kappa, M[, r, L]) and memory z -> dict(base, F_hat, ...). With
         cfg.query_grid (and rgb), a second read on that grid gives the RGB state H_hat (a_rgb, pe_rgb).
-        grain_keep [B, G] bool (evaluation only): grains read as if invalid where False."""
+        grain_keep [B, G] bool (evaluation only): grains read as if invalid where False.
+        prev (1.5, read_prev_frame): dict(F, u, valid) of the previously decoded observation (`_prev_of`); its
+        read joins a (and a_rgb) before the innovation, F_base = W_out a; static views ignore it."""
         cfg = self.cfg
         R, t = g.se3_exp(xi) if R_t is None else R_t
         f_t = self.appear(S["f"].float(), S["u"], z, S["c0"]) if cfg.memory else S["f"].float()
@@ -218,6 +221,10 @@ class MAVTGrainPrior(nn.Module):
         grains = (f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"], S["c0"], z, pg)
         out = self.readout.base(*grains, grain_keep=grain_keep)
         out["tr"] = tr
+        use_prev = cfg.read_prev_frame and prev is not None
+        if use_prev:
+            out["a"] = self._add_prev(out["a"], self.uq.expand(f_t.shape[0], -1, -1), prev, tr, sigma, S)
+            out["F_base"] = self.readout.w_out(out["a"]).float()
         out["F_hat"], out["H_hat"] = out["F_base"], out["a"]
         if r is not None:
             out["dF"], dH = self.readout.innovation(out["a"], out["pe"], r, L, return_hidden=True)
@@ -226,8 +233,21 @@ class MAVTGrainPrior(nn.Module):
             fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
                                      grain_keep=grain_keep)
             out["a_rgb"], out["pe_rgb"] = fine["a"], fine["pe"]
+            if use_prev:
+                out["a_rgb"] = self._add_prev(fine["a"], self.uq_rgb.expand(f_t.shape[0], -1, -1), prev, tr, sigma, S)
             out["H_hat"] = self._rgb_state(out, r, L)
         return out
+
+    def _add_prev(self, a, uq, prev, tr, sigma, S) -> torch.Tensor:
+        """1.5: a + PrevRead(sg[F^_{t-1}]) on video / world observations (0 on static views)."""
+        moving = (S["h"][:, sc.H_MODE] != M_STATIC).view(-1, 1, 1)
+        p = self.readout.prev_read(prev["F"], uq, tr["u"], prev["u"], tr["valid"], prev["valid"], sigma)
+        return a + p.to(a.dtype) * moving.to(a.dtype)
+
+    @staticmethod
+    def _prev_of(o: dict) -> dict:
+        """1.5: what the next observation reads of this decoded one (decoded feature, grain projections)."""
+        return dict(F=o["F_hat"], u=o["tr"]["u"], valid=o["tr"]["valid"])
 
     def _rgb_state(self, out: dict, r: Optional[torch.Tensor], L: Optional[torch.Tensor], sg=None) -> torch.Tensor:
         """Decoder state on the query_grid read, plus its innovation increment when r is given. sg (1.1): a
@@ -301,7 +321,10 @@ class MAVTGrainPrior(nn.Module):
         der = self.derived(S)
         outs = [self.decode_anchor(S, der)]
         for rec, z in zip(S["recs"], self.replay(S)):
-            outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"]))
+            # 1.5: the previous decoded observation in the queue (the anchor for the first record: the encoder
+            # read the same one as long as no record was folded into z_b)
+            prev = self._prev_of(outs[-1]) if self.cfg.read_prev_frame else None
+            outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"], prev=prev))
         Fh = torch.stack([o["F_hat"] for o in outs], 1)
         Hh = torch.stack([o["H_hat"] for o in outs], 1)
         A0 = torch.stack([o["a0"] for o in outs], 1)
@@ -330,9 +353,11 @@ class MAVTGrainPrior(nn.Module):
         return S, A
 
     def encode_target(self, S: dict, der: dict, st: dict, Xi: torch.Tensor, t_i: torch.Tensor, z_prev: torch.Tensor,
-                      static: torch.Tensor, known: torch.Tensor, cam_i: Optional[tuple], L: torch.Tensor) -> dict:
+                      static: torch.Tensor, known: torch.Tensor, cam_i: Optional[tuple], L: torch.Tensor,
+                      prev_obs: Optional[dict] = None) -> dict:
         """Posterior coding of observation i from S_{i-1}. st: stems of observation i (F, P, Y, g); Xi in [0, 1];
-        cam_i (xi, kappa) given cameras (used where known); static [B] bool; L [B] prefix length."""
+        cam_i (xi, kappa) given cameras (used where known); static [B] bool; L [B] prefix length; prev_obs (1.5) the
+        decoded observation i - 1 (`_prev_of`)."""
         cfg = self.cfg
         B = Xi.shape[0]
         dev = Xi.device
@@ -408,7 +433,7 @@ class MAVTGrainPrior(nn.Module):
             xi = torch.where(known.view(B, 1), cam_i[0].float(), xi)
         kappa = kappa_of(zeta)
         z_i = mem(b)
-        base = self.decode_obs(S, der, z_i, xi, kappa, M)
+        base = self.decode_obs(S, der, z_i, xi, kappa, M, prev=prev_obs)
         X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"])
         eF = st["F"] - base["F_base"].detach()
         eX = Xi - X_base.detach()
@@ -482,11 +507,14 @@ class MAVTGrainPrior(nn.Module):
         Hh = [out0["H_hat"]]
         z_cur = S["c0"].float()
         tg = []
+        prev = self._prev_of(out0) if cfg.read_prev_frame else None
         for i in range(1, n):
             t_i = torch.full((B,), 0.0 if kind == "static" else i * cfg.frame_seconds, device=dev)
             L = L_given[:, i - 1].to(dev).long() if L_given is not None else self.sample_L(B, dev)
             cam_i = None if cam is None else (xi_cam[:, i], kappa_cam[:, i])
-            o = self.encode_target(S, der, st[i], X01[:, i], t_i, z_cur, static, known, cam_i, L)
+            o = self.encode_target(S, der, st[i], X01[:, i], t_i, z_cur, static, known, cam_i, L, prev)
+            if cfg.read_prev_frame:
+                prev = dict(F=o["F_hat"], u=o["base"]["tr"]["u"], valid=o["base"]["tr"]["valid"])
             o["rec"]["view"] = torch.full((B,), float(i), device=dev)
             self.append_and_fold(S, o["rec"], t_i)
             z_cur = torch.where(static.view(B, 1, 1), z_cur, o["z"])
@@ -520,6 +548,10 @@ class MAVTGrainPrior(nn.Module):
             Xb = torch.stack(Xb_list, 1)
             lb = self._rec(Xb, X01[:, 1:], torch.stack(Fb, 1), Ft[:, 1:], parts, diag, "base", lpips=False)
             loss = loss + cfg.w_base * lb
+            if cfg.w_pred_frame > 0:                                  # 1.5: L_pred on the prediction branch
+                lpred = feat_loss(torch.stack(Fb, 1), Ft[:, 1:], cfg.w_logn)
+                parts["pred_feat"] = lpred.detach()
+                loss = loss + cfg.w_pred_frame * lpred
             Ms = torch.stack([o["rec"]["M"] for o in tg], 1)
             lm = (Ms ** 2).sum(-1).mean()
             parts["motion"] = lm.detach()
