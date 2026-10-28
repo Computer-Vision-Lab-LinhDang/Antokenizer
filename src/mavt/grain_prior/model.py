@@ -366,6 +366,14 @@ class MAVTGrainPrior(nn.Module):
             if isinstance(mod, ReadLayer):
                 mod.step = int(step)
 
+    def set_diag(self, on: bool) -> None:
+        """3.1: compute the read diagnostics (shares, effective support, error bands) only when on; the trainer
+        turns them on for the steps it logs. Losses and the other diagnostics do not depend on it."""
+        self.diag_read = bool(on)
+        for mod in self.modules():
+            if isinstance(mod, Readout):
+                mod.diag_on = self.diag_read
+
     def w_geom_eff(self) -> float:
         """1.2: w_geom x min(1, step / w_geom_ramp_steps) (w_geom when the ramp is off)."""
         cfg = self.cfg
@@ -789,7 +797,8 @@ class MAVTGrainPrior(nn.Module):
         diag["sigma_mean"] = S["sigma"].mean()
         if kind != "image":
             diag["rho_std"] = S["rho"].std(-1).mean()
-        self._diag_read(outs, rgb, X01, Ft, diag)                     # 3.1
+        if getattr(self, "diag_read", True):
+            self._diag_read(outs, rgb, X01, Ft, diag)                 # 3.1
         if not tg:
             return
         n = rgb.shape[1]

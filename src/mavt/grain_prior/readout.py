@@ -174,6 +174,7 @@ class ReadLayer(nn.Module):
             self.alpha_raw = nn.Parameter(torch.full((cfg.heads,), math.log(a0 / (1 - a0))))
         self.step = 0                             # 2.4 anneal: set by MAVTGrainPrior.set_step
         self.chunk = cfg.query_chunk              # query block of the explicit reads and the diagnostics
+        self.act_ckpt = cfg.read_act_ckpt         # False: keep every chunk's activations (faster, more memory)
         self.collect_diag = False                 # set by Readout on the last layer: shares / effective support
         self.last_diag = None
 
@@ -302,7 +303,7 @@ class ReadLayer(nn.Module):
         recomputed in backward (activation checkpoint) when gradients flow, so the peak holds one block of
         [B, H, q, ne] probabilities and basis, not all Q. No tensor of size [B, Q, G, d] exists."""
         outs = []
-        ckpt = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (Q, K, V, Vr))
+        ckpt = self.act_ckpt and torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (Q, K, V, Vr))
         for sl in self._chunks(Q.shape[1]):
             b, v, r = self._rows(sl, bias, valid, relpos)
             args = (Q[:, sl], K, V, b, v, strict, r, Vr, n_fine)
@@ -536,6 +537,7 @@ class Readout(nn.Module):
     def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
         super().__init__()
         self.cfg = cfg
+        self.diag_on = True                       # 3.1: MAVTGrainPrior.set_diag (off between log steps)
         d, pf, dc = cfg.dim, cfg.pe_freq, cfg.d_coarse
         pe2, pe3 = g.pe_dim(2, pf), g.pe_dim(3, pf)
         self.q_pe = nn.Linear(pe2, d)
@@ -635,7 +637,7 @@ class Readout(nn.Module):
             layers[-1] = self.last_x
         a = a0
         for i, layer in enumerate(layers):
-            layer.collect_diag = i == len(layers) - 1 and uq is None      # 3.1: the feature-grid read only
+            layer.collect_diag = self.diag_on and i == len(layers) - 1 and uq is None   # 3.1: feature-grid read
             a = layer(a, pe, kt, vt, bias, valid, ctok=ctok, cbias=cbias, relpos=relpos)
         diag = layers[-1].last_diag
         with g.fp32(a.device):

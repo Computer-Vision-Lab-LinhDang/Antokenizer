@@ -199,6 +199,11 @@ def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def log_due(step: int, every: int, steps: int) -> bool:
+    """True when the trainer logs after reaching `step` (every `every` steps and at the last step)."""
+    return step % every == 0 or step == steps
+
+
 def all_mean(t: torch.Tensor) -> torch.Tensor:
     if is_dist():
         t = t.clone()
@@ -767,6 +772,8 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
             ctx = ddp.no_sync() if (is_dist() and not sync) else _null()
             if hasattr(model, "set_step"):                      # grain_prior 1.2: loss ramps read the global step
                 model.set_step(step)
+            if hasattr(model, "set_diag"):                      # grain_prior 3.1: read diagnostics on log steps only
+                model.set_diag(log_due(step + 1, args.log_every, args.steps))
             with ctx:
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
                     out = ddp(*inputs)
@@ -795,7 +802,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
         step += 1
         steps_since += 1
 
-        if step % args.log_every == 0 or step == args.steps:
+        if log_due(step, args.log_every, args.steps):
             # one modality: loss_<k>, diag_<k>; mixed: keys already carry the modality (image/loss_rgb, ...)
             pl, pd = ("", "") if mixed else ("loss_", "diag_")
             named = ([(pl + k, out["parts"][k]) for k in sorted(out["parts"])]

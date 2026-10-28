@@ -135,6 +135,7 @@ class GrainPriorConfig(CD32Config):
     innovation_semantics: str = "legacy_image"
     render_samples: int = 32
     query_chunk: int = 512
+    read_act_ckpt: bool = True           # 2.2 / 2.4 explicit reads: recompute each query chunk in backward
     render_near: float = 0.1             # source gauge units, never fitted to target labels
     render_far: float = 4.0
     background_rgb: tuple = (0.0, 0.0, 0.0)
