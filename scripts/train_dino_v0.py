@@ -671,6 +671,8 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
                 inputs, n_clips = (x, modality, cam), x.shape[0]
             sync = micro == args.grad_accum - 1
             ctx = ddp.no_sync() if (is_dist() and not sync) else _null()
+            if hasattr(model, "set_step"):                      # grain_prior 1.2: loss ramps read the global step
+                model.set_step(step)
             with ctx:
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
                     out = ddp(*inputs)
