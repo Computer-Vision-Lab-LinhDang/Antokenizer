@@ -348,3 +348,91 @@ def test_defaults_add_no_parameters():
     for name in ("w_mid", "norm_mid", "coarse_kv", "wk_c", "wv_rel", "last_x", "pw.", "in_feat", "rgb.low.",
                  "tau_c", "beta_c", "prev_read", "sem_head", "alpha"):
         assert not any(name in k for k in keys), name
+
+
+# ------------------------------------------------------------------------------------------------ 2.4
+def test_entmax_alpha2_is_sparsemax_and_alpha15_is_sparse():
+    from mavt.grain_prior.layers import entmax_bisect
+    x = torch.tensor([[0.5, 0.2, -1.0, float("-inf")]])
+    p2 = entmax_bisect(x, torch.tensor(2.0))
+    assert torch.allclose(p2, torch.tensor([[0.65, 0.35, 0.0, 0.0]]), atol=1e-5)
+    p15 = entmax_bisect(torch.tensor([[3.0, 2.9, 0.0, -2.0, float("-inf")]]), torch.tensor(1.5))
+    assert p15.sum() == pytest.approx(1.0, abs=1e-5) and (p15[0, 2:] == 0).all() and (p15[0, :2] > 0).all()
+
+
+def test_entmax_gradients_match_finite_differences():
+    from mavt.grain_prior.layers import entmax_bisect
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)
+    alpha = torch.tensor([1.3, 1.5, 1.8], dtype=torch.float64).view(1, 3, 1).requires_grad_()
+    w = torch.randn(2, 3, 5, dtype=torch.float64)
+    f = lambda x_, a_: (entmax_bisect(x_, a_, n_iter=80) * w).sum()
+    assert torch.autograd.gradcheck(f, (x, alpha), eps=1e-6, atol=1e-5)
+
+
+def _rl(cfg, seed=0):
+    torch.manual_seed(seed)
+    return ReadLayer(cfg, cfg.dim)
+
+
+def test_read_normalizer_entmax_near_alpha1_is_the_softmax_read():
+    cfg = tiny_config(**LEGACY_CRSR)
+    soft = _rl(cfg)
+    ent = _rl(tiny_config(read_normalizer="entmax15", entmax_alpha_init=1.0, alpha_anneal_steps=100, **LEGACY_CRSR))
+    ent.load_state_dict(soft.state_dict(), strict=False)
+    x = {k: v for k, v in _read_inputs(cfg, far=False)[0].items() if k not in ("ctok", "cbias")}
+    with torch.no_grad():
+        ent.step = 0
+        assert torch.allclose(soft(**x), ent(**x), atol=1e-5)
+        ent.step = 100                                              # alpha = 1.5: sparse, a different read
+        assert not torch.allclose(soft(**x), ent(**x), atol=1e-4)
+
+
+def test_read_normalizer_entmax_learns_alpha_per_head():
+    cfg = tiny_config(read_normalizer="entmax15", entmax_alpha_init=1.5, **LEGACY_CRSR)
+    layer = _rl(cfg)
+    assert layer.alpha().shape == (1, cfg.heads, 1, 1) and torch.allclose(layer.alpha(), torch.tensor(1.5))
+    x = {k: v for k, v in _read_inputs(cfg, far=False)[0].items() if k not in ("ctok", "cbias")}
+    layer(**x).sum().backward()
+    assert layer.alpha_raw.grad is not None and torch.isfinite(layer.alpha_raw.grad).all()
+
+
+def test_read_normalizer_topk_reads_only_the_k_nearest_grains():
+    cfg1 = tiny_config(read_normalizer="topk", read_topk=1, **LEGACY_CRSR)
+    top, soft = _rl(cfg1), _rl(tiny_config(**LEGACY_CRSR))
+    soft.load_state_dict(top.state_dict())
+    gen = torch.Generator().manual_seed(3)
+    B, Q, G, d = 2, 5, 6, cfg1.dim
+    bias = torch.randn(B, 1, Q, G, generator=gen)
+    valid = torch.ones(B, G, dtype=torch.bool)
+    a, pe = torch.randn(B, Q, d, generator=gen), torch.randn(B, Q, d, generator=gen)
+    kt, vt = torch.randn(B, G, d, generator=gen), torch.randn(B, G, d, generator=gen)
+    with torch.no_grad():
+        out = top(a, pe, kt, vt, bias, valid)
+        best = bias[:, 0].argmax(-1)                                 # [B, Q]
+        for q in range(Q):
+            only = torch.nn.functional.one_hot(best[:, q], G).bool()
+            ref = soft(a[:, q:q + 1], pe[:, q:q + 1], kt, vt, bias[:, :, q:q + 1], only)
+            assert torch.allclose(out[:, q:q + 1], ref, atol=1e-5)
+        topG = _rl(tiny_config(read_normalizer="topk", read_topk=G, **LEGACY_CRSR))
+        topG.load_state_dict(top.state_dict())
+        assert torch.allclose(topG(a, pe, kt, vt, bias, valid), soft(a, pe, kt, vt, bias, valid), atol=1e-5)
+
+
+@pytest.mark.parametrize("kw", [dict(read_normalizer="entmax15"), dict(read_normalizer="topk", read_topk=2),
+                                dict(read_normalizer="topk", read_topk=2, read_coarse_kv=True),
+                                dict(read_normalizer="entmax15", read_coarse_kv=True, read_relpos_value=True)])
+def test_read_normalizer_on_the_full_pipeline(kw):
+    m = _model(**kw, **LEGACY_CRSR).train()
+    x, cam = _inputs("world", T=3)
+    out = m(x, "world", cam, step=10)
+    out["loss"].backward()
+    assert torch.isfinite(out["loss"]) and all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
+    assert all(l.step == 10 for l in m.readout.layers)
+
+
+def test_read_normalizer_config_checks():
+    for bad in (dict(read_normalizer="sparsemax"), dict(read_normalizer="topk", read_topk=0),
+                dict(read_normalizer="topk", read_topk=2, geom_bias=False), dict(entmax_alpha_init=2.5)):
+        with pytest.raises(ValueError):
+            tiny_config(**bad).check()

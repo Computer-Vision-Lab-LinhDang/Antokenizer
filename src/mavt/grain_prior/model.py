@@ -34,7 +34,7 @@ from .layers import mlp2
 from .losses import feat_loss, huber_log_depth, pose_loss, sample_cells
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
-from .readout import Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
+from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
 from .refinement import CorrRead, UpdateHead
 from .trunk import Bank, PInit, StreamD
 
@@ -258,8 +258,11 @@ class MAVTGrainPrior(nn.Module):
         return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None)
 
     def set_step(self, step: int) -> None:
-        """1.2: the trainer's global step (loss ramps)."""
+        """1.2: the trainer's global step (loss ramps); 2.4: the entmax alpha anneal of every read layer."""
         self.global_step = int(step)
+        for mod in self.modules():
+            if isinstance(mod, ReadLayer):
+                mod.step = int(step)
 
     def w_geom_eff(self) -> float:
         """1.2: w_geom x min(1, step / w_geom_ramp_steps) (w_geom when the ramp is off)."""

@@ -107,6 +107,10 @@ class GrainPriorConfig(CD32Config):
     rgb_pw_mlp_ratio: float = 4.0         # 3.3: hidden ratio of its four 1x1 MLP blocks on the query grid
     rgb_in_feat: bool = False             # 3.3: H_in = H + Linear(up_bilinear(sg[F^])) from the feature grid
     read_split_layer2: bool = False       # 3.4: last ReadLayer has two copies: a_F (feature grid) and a_X (RGB grid)
+    read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
+    read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
+    entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
+    alpha_anneal_steps: int = 0           # 2.4 entmax15: > 0: alpha = init -> 1.5 over these steps, not learned
     state_noise_bits: int = 0             # 3.5: train-time U(-D/2, D/2) on f and c_0, D = batch (max - min) / 2^bits
     geom_noise_px: float = 0.0            # 3.5: train-time Gaussian noise on u (pixels)
     sigma_param: str = "sigmoid"          # sigmoid: sigma_min + span * sigmoid | log: exp, floor sigma_lo
@@ -245,6 +249,12 @@ class GrainPriorConfig(CD32Config):
             assert n_up >= 1 and self.dim % (4 ** n_up) == 0, "pointwise head: PixelShuffle divides dim by 4 per stage"
         if self.read_split_layer2 and not self.query_grid:
             raise ValueError("read_split_layer2 needs query_grid (a second read for RGB)")
+        if self.read_normalizer not in ("softmax", "entmax15", "topk"):
+            raise ValueError("read_normalizer: softmax | entmax15 | topk")
+        if self.read_normalizer == "topk" and (self.read_topk < 1 or not self.geom_bias):
+            raise ValueError("read_normalizer=topk needs read_topk >= 1 and the geometry bias (it ranks the grains)")
+        if not 1.0 <= self.entmax_alpha_init <= 2.0 or self.alpha_anneal_steps < 0:
+            raise ValueError("entmax_alpha_init in [1, 2], alpha_anneal_steps >= 0")
         if self.innov_stopgrad_base and not self.w_base > 0:
             raise ValueError("innov_stopgrad_base: L_base must be on (w_base > 0), it is the only loss of the base")
         assert self.w_geom_dense >= 0 and self.w_geom_ramp_steps >= 0 and self.state_noise_bits >= 0 \

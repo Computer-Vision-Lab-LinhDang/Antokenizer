@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 from . import geometry as g
 from .config import GrainPriorConfig
-from .layers import BIAS_FLOOR, CrossAttn, attend, mlp2
+from .layers import BIAS_FLOOR, CrossAttn, attend, entmax_bisect, mlp2
 
 N_POOLGEOM = 18
 
@@ -132,6 +132,11 @@ def pyramid_target(X: torch.Tensor, n: int) -> torch.Tensor:
     return pyr_up(pyr_down(X, n), n)
 
 
+def _v3(valid: torch.Tensor) -> torch.Tensor:
+    """valid [B, ne] (shared by the queries) or [B, nq, ne] -> broadcastable [B, 1 or nq, ne]."""
+    return valid.unsqueeze(1) if valid.dim() == 2 else valid
+
+
 class ReadLayer(nn.Module):
     def __init__(self, cfg: GrainPriorConfig, d_pe: int):
         super().__init__()
@@ -161,19 +166,54 @@ class ReadLayer(nn.Module):
             self.R = cfg.relpos_rank
             self.wv_rel = nn.Linear(d, self.R * d, bias=False)
             nn.init.zeros_(self.wv_rel.weight)
+        self.normalizer, self.topk = cfg.read_normalizer, cfg.read_topk
+        self.alpha_init, self.alpha_steps = cfg.entmax_alpha_init, cfg.alpha_anneal_steps
+        if self.normalizer == "entmax15" and not self.alpha_steps:   # 2.4: learned alpha per head in (1, 2)
+            a0 = min(max(cfg.entmax_alpha_init, 1.05), 1.95) - 1
+            self.alpha_raw = nn.Parameter(torch.full((cfg.heads,), math.log(a0 / (1 - a0))))
+        self.step = 0                             # 2.4 anneal: set by MAVTGrainPrior.set_step
         self.collect_diag = False                 # set by Readout on the last layer: shares / effective support
         self.last_diag = None
+
+    def alpha(self) -> torch.Tensor:
+        """2.4: entmax alpha [1, H, 1, 1]: learned 1 + sigmoid(raw), or init -> 1.5 over alpha_anneal_steps."""
+        if hasattr(self, "alpha_raw"):
+            return (1 + torch.sigmoid(self.alpha_raw.float())).view(1, -1, 1, 1)
+        t = min(1.0, self.step / self.alpha_steps)
+        return torch.full((1, self.heads, 1, 1), self.alpha_init + (1.5 - self.alpha_init) * t,
+                          device=self.wq.weight.device)
+
+    def _normalize(self, logit: torch.Tensor) -> torch.Tensor:
+        if self.normalizer != "entmax15":
+            return logit.softmax(-1)
+        alpha = self.alpha()
+        if not hasattr(self, "alpha_raw") and float(alpha.flatten()[0]) < 1.001:
+            return logit.softmax(-1)                                  # anneal start: alpha = 1 is softmax
+        return entmax_bisect(logit.float(), alpha)
+
+    def _topk_valid(self, bias, valid):
+        """2.4 topk: per query keep the read_topk valid grains of largest geometry bias -> valid [B, Q, G]."""
+        if bias is None:
+            raise ValueError("read_normalizer=topk needs the geometry bias")
+        if self.topk >= valid.shape[-1]:
+            return valid
+        score = bias[:, 0].float().masked_fill(~_v3(valid), float("-inf"))
+        keep = torch.zeros_like(score, dtype=torch.bool).scatter_(-1, score.topk(self.topk, -1).indices, True)
+        return keep & _v3(valid)
 
     def _head_norm(self, x, ln):
         return ln(x.unflatten(-1, (self.heads, -1))).flatten(-2) if hasattr(self, "qn") else x
 
     def forward(self, a, pe, ktok, vtok, bias, valid, ctok=None, cbias=None, phi=None):
         """a, pe [B, Q, d]; grain tokens ktok / vtok [B, G, d]; bias [B, 1, Q, G] or None; valid [B, G];
-        ctok [B, n_c, d] + cbias [B, Q, n_c] (2.1); phi [B, Q, G, R] (2.2)."""
+        ctok [B, n_c, d] + cbias [B, Q, n_c] (2.1); phi [B, Q, G, R] (2.2). With read_normalizer=topk valid
+        becomes per query [B, Q, G] before the coarse slots and the sink are appended."""
         Q = self._head_norm(self.wq(self.norm(a)) + self.wpe(pe), getattr(self, "qn", None))
         K = self._head_norm(self.wk(self.nk(ktok)), getattr(self, "kn", None))
         V = self.wv(self.nv(vtok))
         n_fine = K.shape[1]
+        if self.normalizer == "topk":
+            valid = self._topk_valid(bias, valid)
         if self.strict:
             norm = lambda x: F.normalize(x.unflatten(-1, (self.heads, -1)), dim=-1).flatten(-2)
             Q = norm(Q) * (8 * self.temperature.sigmoid()) * (Q.shape[-1] // self.heads) ** .5
@@ -191,21 +231,21 @@ class ReadLayer(nn.Module):
             K, V = torch.cat([K, Kc.to(K.dtype)], 1), torch.cat([V, Vc.to(V.dtype)], 1)
             cb = (cbias.float() + self.beta_c).unsqueeze(1).expand(-1, bias.shape[1], -1, -1)
             bias = torch.cat([bias.float(), cb], -1)
-            valid = torch.cat([valid, valid.new_ones(valid.shape[0], n_coarse)], -1)
+            valid = torch.cat([valid, valid.new_ones(*valid.shape[:-1], n_coarse)], -1)
         has_sink = hasattr(self, "sink")
         if has_sink:
             K, V, bias, valid = self._with_sink(K, V, bias, valid)
             if getattr(self, "track_sink", False):
                 self.last_sink_share = self._sink_share(Q, K, bias, valid)
         strict = self.strict or has_sink or self.coarse_kv
-        if self.relpos:
+        if self.relpos or self.normalizer == "entmax15":
             e, p = self._attend_explicit(Q, K, V, bias, valid, strict, phi, Vr, n_fine)
         else:
             e = attend(Q, K, V, self.heads, bias, valid, strict=strict)
             p = None
         e = self.wo(e)
         if strict and not (has_sink or self.coarse_kv):
-            e = e * valid.any(-1)[:, None, None].to(e.dtype)
+            e = e * _v3(valid).any(-1, keepdim=True).to(e.dtype)
         if self.collect_diag:
             self.last_diag = self._diag(Q, K, bias, valid, strict, p, n_fine, n_coarse, has_sink)
         return a + self.ref(torch.cat([a, e, pe], -1))
@@ -216,7 +256,7 @@ class ReadLayer(nn.Module):
         dh = d // self.heads
         sh = lambda t: t.float().unflatten(-1, (self.heads, dh)).transpose(1, 2)
         logit = sh(Q) @ sh(K).transpose(-1, -2) / math.sqrt(dh)
-        ok = valid.view(B, 1, 1, -1)
+        ok = _v3(valid).unsqueeze(1)
         has = ok.any(-1, keepdim=True)
         ok = ok | ~has
         if bias is not None:
@@ -227,13 +267,13 @@ class ReadLayer(nn.Module):
         return logit.masked_fill(~ok, float("-inf")), has
 
     def _attend_explicit(self, Q, K, V, bias, valid, strict, phi, Vr, n_fine):
-        """2.2 read with position-dependent values. a = softmax(logits) [B, H, nq, ne];
+        """Explicit read (2.2 position-dependent values, 2.4 entmax). a = normalize(logits) [B, H, nq, ne];
         e = a V + sum_r (a[:, :, :, :G] * phi_r) V_r with V_r = W_r f (heads split): R weighted sums, each
         temporary of size [B, H, nq, G]; no tensor of size [B, nq, G, d] exists."""
         B, nq, d = Q.shape
         dh = d // self.heads
         logit, has = self._logits(Q, K, bias, valid, strict)
-        p = logit.softmax(-1)
+        p = self._normalize(logit)
         sh = lambda t: t.float().unflatten(-1, (self.heads, dh)).transpose(1, 2)
         out = p @ sh(V)
         if Vr is not None and phi is not None:
@@ -263,7 +303,7 @@ class ReadLayer(nn.Module):
         B, Q = K.shape[0], (bias.shape[-2] if bias is not None else None)
         z = K.new_zeros(B, 1, K.shape[-1])
         K, V = torch.cat([K, z], 1), torch.cat([V, z.to(V.dtype)], 1)
-        valid = torch.cat([valid, valid.new_ones(B, 1)], -1)
+        valid = torch.cat([valid, valid.new_ones(*valid.shape[:-1], 1)], -1)
         if bias is None:
             raise ValueError("read_sink needs the geometry bias")
         bias = torch.cat([bias, self.sink.to(bias.dtype).expand(*bias.shape[:-1], 1)], -1)
@@ -274,7 +314,7 @@ class ReadLayer(nn.Module):
         """Mean attention weight on the sink (diagnostic; explicit softmax, so only on small batches)."""
         sh = lambda t: t.float().unflatten(-1, (self.heads, -1)).transpose(1, 2)
         logit = sh(Q) @ sh(K).transpose(-1, -2) / math.sqrt(Q.shape[-1] // self.heads) + bias.float()
-        logit = logit.masked_fill(~valid[:, None, None, :], float("-inf"))
+        logit = logit.masked_fill(~_v3(valid).unsqueeze(1), float("-inf"))
         return logit.softmax(-1)[..., -1].mean().item()
 
 
