@@ -31,7 +31,7 @@ from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
+from .losses import band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
@@ -677,15 +677,7 @@ class MAVTGrainPrior(nn.Module):
         Fi = torch.stack([o["F_init"] for o in outs], 1)
         diag["init_cos_all"] = F.cosine_similarity(Fi.float(), Ft.float(), -1).mean()
         err = (rgb.float() - X01.float()).flatten(0, 1)                # [B n, 3, S, S]
-        E = torch.fft.rfft2(err).abs().pow(2)
-        S_img = err.shape[-1]
-        fy = torch.fft.fftfreq(S_img, device=err.device).view(-1, 1)
-        fx = torch.fft.rfftfreq(S_img, device=err.device).view(1, -1)
-        fr = (fx ** 2 + fy ** 2).sqrt()
-        tot = E.sum().clamp_min(1e-12)
-        diag["err_low_frac"] = E[..., fr < 1 / 32].sum() / tot
-        diag["err_mid_frac"] = E[..., (fr >= 1 / 32) & (fr < 1 / 8)].sum() / tot
-        diag["err_high_frac"] = E[..., fr >= 1 / 8].sum() / tot
+        diag["err_low_frac"], diag["err_mid_frac"], diag["err_high_frac"] = band_fractions(err)
         if ds and "fine_share_q" in ds[0]:
             X = X01.float().flatten(0, 1)
             hf = (X - pyr_up(pyr_down(X, 1), 1)).pow(2).mean(1, keepdim=True)              # [B n, 1, S, S]

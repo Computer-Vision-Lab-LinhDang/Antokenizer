@@ -75,3 +75,14 @@ def semantic_teacher(name: str, dim: int):
 def sem_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """1 - cos per sample, mean."""
     return (1 - F.cosine_similarity(pred.float(), target.float(), dim=-1)).mean()
+
+
+def band_fractions(err: torch.Tensor) -> tuple:
+    """Energy fractions of err [..., S, S] in the low (< 1/32), mid and high (>= 1/8 cycles / px) radial bands."""
+    E = torch.fft.rfft2(err.float()).abs().pow(2)
+    S = err.shape[-1]
+    fy = torch.fft.fftfreq(S, device=err.device).view(-1, 1)
+    fx = torch.fft.rfftfreq(S, device=err.device).view(1, -1)
+    fr = (fx ** 2 + fy ** 2).sqrt()
+    tot = E.sum().clamp_min(1e-12)
+    return E[..., fr < 1 / 32].sum() / tot, E[..., (fr >= 1 / 32) & (fr < 1 / 8)].sum() / tot, E[..., fr >= 1 / 8].sum() / tot
