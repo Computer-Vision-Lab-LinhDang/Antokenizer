@@ -139,7 +139,7 @@ def mechanism_batch(model, batch: dict, modality: str, L_list: list, k_list: lis
             res[f"at2/{s}_hf_spearman"] = _spearman(d[f"{s}_share_q"], cell)
     es = d["eff_support_q"].float().flatten()
     res["at3/eff_support_mean"] = es.mean().item()
-    res["at3/eff_support_p10"], res["at3/eff_support_p90"] = [v.item() for v in es.quantile(torch.tensor([0.1, 0.9]))]
+    res["at3/eff_support_p10"], res["at3/eff_support_p90"] = [v.item() for v in es.quantile(es.new_tensor([0.1, 0.9]))]
     return res
 
 
@@ -162,20 +162,22 @@ def _nest(flat: dict) -> dict:
 def evaluate_mechanism(model, batches: Iterable[dict], modality: str, L_list: list, k_list: list,
                        limit: int = 0, autocast=None) -> dict:
     """Mean over the clips of every check (batches: dict(data [B, 3, T, H, W], c2w, K, depth) as the eval loaders)."""
+    if model.cfg.phase != "codec":
+        raise ValueError("evaluate_mechanism reads codec checkpoints (phase 'prior' trains only the causal prior)")
     model.eval()
     dev = next(model.parameters()).device
-    tot, seen = {}, 0
+    tot, cnt, seen = {}, {}, 0
     for b in batches:
         b = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in b.items()}
         with autocast() if autocast is not None else _null():
             r = mechanism_batch(model, b, modality, L_list, k_list)
         B = b["data"].shape[0]
-        for k, v in r.items():
-            tot[k] = tot.get(k, 0.0) + v * B
+        for k, v in r.items():                                     # CD5 / CD6 need B > 1: own clip count
+            tot[k], cnt[k] = tot.get(k, 0.0) + v * B, cnt.get(k, 0) + B
         seen += B
         if limit and seen >= limit:
             break
-    res = _nest({k: v / max(seen, 1) for k, v in tot.items()})
+    res = _nest({k: v / cnt[k] for k, v in tot.items()})
     res["n_clips"] = seen
     return res
 
@@ -224,11 +226,17 @@ def main(argv=None) -> int:
     dev = torch.device("cpu" if args.dry_run else args.device)
     amp = args.bf16 and not args.dry_run
     torch.manual_seed(args.seed)
-    over = {"dino_repo": args.dino_repo} if args.dino_repo else {}
+    over = {}
+    if args.set:
+        from train_cd32 import _tuples, parse_sets
+        over = _tuples(parse_sets(args.set))
+    if args.dino_repo:
+        over["dino_repo"] = args.dino_repo
     if args.ckpt:
         model, cfg, step = load_grain_prior(args.ckpt, dev, **over)
     else:
-        cfg = tiny_config(read_coarse_kv=True, readout_version="legacy", read_strict=True, read_sink=True)
+        cfg = tiny_config(**{**dict(read_coarse_kv=True, readout_version="legacy", read_strict=True, read_sink=True),
+                             **over})
         model, step = MAVTGrainPrior(cfg).to(dev).eval(), -1
     L_list = ev.parse_L(args.L_list, cfg.n_slots)
     k_list = [int(k) for k in args.k_list.split(",") if k.strip()]
@@ -239,6 +247,10 @@ def main(argv=None) -> int:
         for mod in ("video", "threed", "world"):
             res["clips"][mod] = run(ev.synthetic_loader(mod, cfg, cfg.queue + 1, 2, 2, args.seed), mod, 0)
     else:
+        if args.imagenet:
+            ld = ev.imagenet_loader(args.imagenet, cfg.image_size, args.batch, args.num_workers, args.image_limit,
+                                    args.seed)
+            res["clips"]["imagenet"] = run(ld, "image", args.image_limit)
         for man in [m for m in (args.openvid or "").split(",") if m.strip()]:
             name = "video " + os.path.basename(man.rstrip("/")).split(".")[0]
             res["clips"][name] = run(ev.video_loader(man, args, cfg.image_size), "video", args.video_limit)

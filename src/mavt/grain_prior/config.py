@@ -103,14 +103,14 @@ class GrainPriorConfig(CD32Config):
     relpos_rank: int = 8                  # 2.2: R (even): R / 2 Fourier directions x (sin, cos)
     rgb_coarse_start: bool = False        # 2.3: X^ = clamp(sg[X~0] + R), X~0 = pyr_up(RGBLow(a0)); L1 to pyr_up(pyr_down(X))
     w_rgb_coarse: float = 1.0             # 2.3: weight of that L1
-    rgb_head: str = "legacy"              # 3.3: legacy conv head | pointwise (1x1 MLPs + PixelShuffle, RF <= 16 px)
+    rgb_head: str = "legacy"              # 3.3: legacy conv head | pointwise (1x1 MLPs + PixelShuffle, RF <= 16 px; image / side <= 4)
     rgb_pw_mlp_ratio: float = 4.0         # 3.3: hidden ratio of its four 1x1 MLP blocks on the query grid
     rgb_in_feat: bool = False             # 3.3: H_in = H + Linear(up_bilinear(sg[F^])) from the feature grid
     read_split_layer2: bool = False       # 3.4: last ReadLayer has two copies: a_F (feature grid) and a_X (RGB grid)
     # 1.5 (not cd32's prev_read / w_pred, which are inherited, saved in the s1-s3 configs and unused here)
     read_prev_frame: bool = False         # 1.5: a += Mix(WindowRead3x3(sg[F^_{t-1}]) at u_q - du_q), video / world only
     w_pred_frame: float = 0.0             # 1.5: L_pred = feat_loss(F_base incl. the previous-frame read, F) on targets
-    sem_target: str = ""                  # 2.5: "" off | stub | dinov3txt | siglip2 (external: attach model.sem_teacher)
+    sem_target: str = ""                  # 2.5: "" off | stub | dinov3txt | siglip2 (external: model.set_sem_teacher)
     w_sem: float = 0.0                    # 2.5: weight of 1 - cos(SemHead(mean c_0), teacher embedding), training only
     sem_dim: int = 768                    # 2.5: teacher embedding width
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
@@ -253,6 +253,9 @@ class GrainPriorConfig(CD32Config):
             side = self.query_grid or self.grid
             n_up = (self.image_size // side).bit_length() - 1
             assert n_up >= 1 and self.dim % (4 ** n_up) == 0, "pointwise head: PixelShuffle divides dim by 4 per stage"
+            if n_up > 2:
+                raise ValueError("rgb_head=pointwise keeps a receptive field <= 16 px only for image / side <= 4: "
+                                 "use query_grid >= image_size / 4")
         if self.read_split_layer2 and not self.query_grid:
             raise ValueError("read_split_layer2 needs query_grid (a second read for RGB)")
         if self.sem_target not in ("", "stub", "dinov3txt", "siglip2") or self.w_sem < 0 or \

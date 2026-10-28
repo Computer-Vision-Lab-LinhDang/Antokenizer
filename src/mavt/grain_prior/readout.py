@@ -288,11 +288,15 @@ class ReadLayer(nn.Module):
     def _diag(self, Q, K, bias, valid, strict, p, n_fine, n_coarse, has_sink) -> dict:
         """3.1: per-query effective support 1 / sum_j a_j^2 and the fine / coarse / sink shares (mean over heads),
         per-grain attention mass (sum over queries); fp32 probabilities [B, H, Q, ne] without gradient."""
+        logit, has = self._logits(Q, K, bias, valid, strict)
         if p is None:
-            p = self._logits(Q, K, bias, valid, strict)[0].softmax(-1)
+            p = logit.softmax(-1)
         p = p.float()
+        if strict and not (has_sink or n_coarse):                     # rows without a valid grain read nothing
+            p = p * has.float()
         n_c = n_fine + n_coarse
-        return dict(eff_support_q=(1.0 / p.pow(2).sum(-1).clamp_min(1e-12)).mean(1),
+        p2 = p.pow(2).sum(-1)
+        return dict(eff_support_q=((p2 > 0).float() / p2.clamp_min(1e-12)).mean(1),
                     fine_share_q=p[..., :n_fine].sum(-1).mean(1),
                     coarse_share_q=p[..., n_fine:n_c].sum(-1).mean(1),
                     sink_share_q=(p[..., n_c:].sum(-1).mean(1) if has_sink else torch.zeros_like(p[:, 0, :, 0])),
@@ -418,7 +422,8 @@ class RGBHead(nn.Module):
     head's last layer output (zero at init, no sigmoid). rgb_head=pointwise (3.3) swaps the conv trunk for
     PointwiseRGB. rgb_in_feat (3.3): the head input is H + W up_bilinear(sg[F^]) (F^ on the feature grid)."""
 
-    def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
+    def __init__(self, cfg: GrainPriorConfig, teacher_dim: int, feat_dim: Optional[int] = None):
+        """teacher_dim: width of the head input (dim for rgb_from=hidden, else D_t); feat_dim: D_t (rgb_in_feat)."""
         super().__init__()
         self.cfg = cfg
         self.side = cfg.query_grid or cfg.grid
@@ -440,7 +445,7 @@ class RGBHead(nn.Module):
                 nn.init.zeros_(last.weight)
                 nn.init.zeros_(last.bias)
         if cfg.rgb_in_feat:
-            self.in_feat = nn.Linear(teacher_dim, cfg.dim)
+            self.in_feat = nn.Linear(feat_dim or teacher_dim, cfg.dim)
             nn.init.zeros_(self.in_feat.weight)
             nn.init.zeros_(self.in_feat.bias)
 
@@ -562,8 +567,11 @@ class Readout(nn.Module):
         lnu = geom_bias(u_q, u_hat, sigma, dd, valid, cfg.grid, cfg.tau_d)              # [B, Q, G]
         sink_on = cfg.read_sink or (cfg.read_coarse_kv and cfg.coarse_sink)
         prox = proximity(u_q, u_hat, sigma, valid, cfg.grid) if (sink_on or cfg.read_coarse_kv) else None
+        lnu_depth = lnu                           # 2.1: nu stays normalised; read_sink keeps its trained coupling
         if sink_on:                               # the sink competes with the grain mass at the query
             lnu = lnu + prox.unsqueeze(-1)
+        if not cfg.read_coarse_kv:
+            lnu_depth = lnu
         bias = lnu.unsqueeze(1) if cfg.geom_bias else None
         ctok = cbias = phi = None
         if cfg.read_coarse_kv:                    # 2.1: logit_c = beta_c - proximity(u_q) (+ content), 16 slots
@@ -577,11 +585,11 @@ class Readout(nn.Module):
             layers[-1] = self.last_x
         a = a0
         for i, layer in enumerate(layers):
-            layer.collect_diag = i == len(layers) - 1
+            layer.collect_diag = i == len(layers) - 1 and uq is None      # 3.1: the feature-grid read only
             a = layer(a, pe, kt, vt, bias, valid, ctok=ctok, cbias=cbias, phi=phi)
         diag = layers[-1].last_diag
         with g.fp32(a.device):
-            nu = lnu.exp() * valid.unsqueeze(1)
+            nu = lnu_depth.exp() * valid.unsqueeze(1)
             support = valid.any(-1, keepdim=True).expand(-1, lnu.shape[1])
             far = z_cam.float().masked_fill(~valid, 0).amax(-1, keepdim=True).clamp_min(1.0)
             d_grain = torch.where(support, (nu * z_cam.float().unsqueeze(1)).sum(-1), far.expand_as(support).float())

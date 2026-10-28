@@ -543,7 +543,7 @@ def test_semantic_teacher_plugs_in_and_external_ones_need_it():
     x, _ = _inputs("image")
     with pytest.raises(NotImplementedError):
         m(x, "image")
-    m.sem_teacher = lambda frames: torch.ones(frames.shape[0], 16)
+    m.set_sem_teacher(lambda frames: torch.ones(frames.shape[0], 16))
     out = m(x, "image")
     assert torch.isfinite(out["loss"]) and "sem" in out["parts"]
 
@@ -552,3 +552,57 @@ def test_semantic_config_checks():
     for bad in (dict(sem_target="clip"), dict(w_sem=1.0), dict(sem_target="stub", w_sem=-1.0)):
         with pytest.raises(ValueError):
             tiny_config(**bad).check()
+
+
+# ------------------------------------------------------------------------------------------------ review fixes
+@pytest.mark.parametrize("kw", [dict(rgb_from="hidden"), dict(LEGACY_CRSR, query_grid=8)])
+def test_rgb_in_feat_reads_the_dino_width(kw):
+    """in_feat maps D_t (not the head input width) to dim: stub DINO width 48 != dim 32."""
+    m = _wake(_model(rgb_in_feat=True, stub_dino_dim=48, **kw)).train()
+    x, cam = _inputs("video", T=2)
+    out = m(x, "video", cam)
+    out["loss"].backward()
+    assert torch.isfinite(out["loss"]) and _nonzero(_grads(m, "rgb.in_feat."))
+
+
+def test_coarse_kv_keeps_the_depth_weights_normalised():
+    """read_coarse_kv: the proximity shift of the sink / coarse logits stays out of nu, so depth_grain is a convex
+    combination of the grain depths."""
+    m = _wake(_model(read_coarse_kv=True, **LEGACY_CRSR)).eval()
+    x, cam = _inputs("threed", T=2)
+    seen = _record_decodes(m)
+    with torch.no_grad():
+        m(x, "threed", cam)
+    o = seen[-1]
+    z, v = o["tr"]["z"].float(), o["tr"]["valid"]
+    lo = z.masked_fill(~v, float("inf")).amin(-1, keepdim=True)
+    hi = z.masked_fill(~v, -float("inf")).amax(-1, keepdim=True)
+    assert ((o["depth_grain"] >= lo - 1e-4) & (o["depth_grain"] <= hi + 1e-4)).all()
+
+
+def test_read_diagnostics_ignore_rows_the_read_zeroes():
+    cfg = tiny_config(**LEGACY_CRSR)                               # strict reader with a sink
+    cfg_ns = tiny_config(readout_version="legacy", read_strict=True)
+    for c in (cfg, cfg_ns):
+        layer = ReadLayer(c, c.dim)
+        layer.collect_diag = True
+        x = {k: v for k, v in _read_inputs(c, far=False)[0].items() if k not in ("ctok", "cbias")}
+        x["valid"] = torch.zeros_like(x["valid"])                  # no valid grain at all
+        with torch.no_grad():
+            layer(**x)
+        d = layer.last_diag
+        assert torch.count_nonzero(d["fine_share_q"]) == 0 and torch.count_nonzero(d["grain_mass"]) == 0
+
+
+def test_read_diagnostics_only_on_the_feature_grid():
+    m = _model(**QG).eval()
+    seen = _record_decodes(m)
+    with torch.no_grad():
+        m(_inputs("image")[0], "image")
+    assert seen[-1]["diag"] is not None and seen[-1]["diag"]["fine_share_q"].shape[-1] == m.cfg.n_cells
+
+
+def test_pointwise_head_bounds_the_receptive_field():
+    with pytest.raises(ValueError):
+        tiny_config(rgb_head="pointwise", dim=256).check()          # no query_grid: 16 x upsampling, RF > 16 px
+    tiny_config(rgb_head="pointwise", **QG).check()                 # 4 x upsampling

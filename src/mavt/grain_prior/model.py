@@ -82,7 +82,7 @@ class MAVTGrainPrior(nn.Module):
         self.appear = Appearance(cfg)
         # shared readouts own their reader (query_decoder); a second, unused Readout would stall DDP
         self.readout = Readout(cfg, Dt) if cfg.readout_version == "legacy" else None
-        self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt)
+        self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt, feat_dim=Dt)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
         if cfg.sem_target:                                            # 2.5: head on c_0; the teacher is not a module

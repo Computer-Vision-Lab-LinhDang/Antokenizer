@@ -56,3 +56,24 @@ def test_mechanism_cli_dry_run(tmp_path):
     res = json.loads((out / "mechanism.json").read_text())
     assert {"video", "threed", "world"} <= set(res["clips"])
     assert (out / "mechanism.md").read_text().startswith("# Mechanism checks")
+
+
+def test_mechanism_averages_each_key_over_the_clips_that_have_it(model):
+    """CD5 / CD6 need two clips in a batch: a batch of one clip must not dilute their mean."""
+    one = {k: v[:1] for k, v in _batch("video").items()}
+    res = EM.evaluate_mechanism(model, [_batch("video"), one], "video", L_list=[0], k_list=[1])
+    ref = EM.evaluate_mechanism(model, [_batch("video")], "video", L_list=[0], k_list=[1])
+    assert res["n_clips"] == 3 and res["cd6"]["psnr_mean_state"] == pytest.approx(ref["cd6"]["psnr_mean_state"])
+
+
+def test_mechanism_rejects_prior_phase_checkpoints():
+    m = MAVTGrainPrior(tiny_config(phase="prior")).eval()
+    with pytest.raises(ValueError):
+        EM.evaluate_mechanism(m, [_batch("threed")], "threed", L_list=[0], k_list=[1])
+
+
+def test_mechanism_cli_applies_set_overrides(tmp_path):
+    out = tmp_path / "mech"
+    assert EM.main(["--dry-run", "--out", str(out), "--L-list", "0", "--k-list", "1", "--set", "read_coarse_kv=false"]) == 0
+    res = json.loads((out / "mechanism.json").read_text())
+    assert "at2" not in res["clips"]["video"]

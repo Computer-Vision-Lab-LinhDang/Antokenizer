@@ -68,7 +68,8 @@ class StubSemanticTeacher:
 
 def semantic_teacher(name: str, dim: int):
     """2.5: the built-in teacher of sem_target, or None for the external ones (dinov3txt, siglip2), which need their
-    weights: attach `model.sem_teacher = callable(frames [B, 3, H, W] in [-1, 1]) -> [B, sem_dim]`."""
+    weights: attach with `model.set_sem_teacher(fn)`, fn(frames [B, 3, H, W] in [-1, 1]) -> [B, sem_dim] (plain
+    assignment of an nn.Module would register it in the state_dict)."""
     return StubSemanticTeacher(dim) if name == "stub" else None
 
 
