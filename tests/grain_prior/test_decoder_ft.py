@@ -144,3 +144,9 @@ def test_trainer_decoder_finetune_from_a_checkpoint(tmp_path):
     b = torch.load(base / "last.pt", weights_only=False)["model"]
     assert torch.equal(ck["model"]["anchor.w_c.weight"], b["anchor.w_c.weight"])          # encoder frozen
     assert any(k.startswith("disc.") for k in ck["model"])
+
+
+@pytest.mark.parametrize("ch", [1, 7, 64, 100])
+def test_patch_disc_builds_for_any_width(ch):
+    from mavt.grain_prior.losses import PatchDisc
+    assert PatchDisc(ch, 3)(torch.rand(1, 3, 64, 64)).shape[1] == 1

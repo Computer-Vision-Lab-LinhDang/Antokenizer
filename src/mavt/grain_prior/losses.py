@@ -63,7 +63,8 @@ class PatchDisc(nn.Module):
         mods, c = [nn.Conv2d(3, channels, 4, 2, 1), nn.LeakyReLU(0.2)], channels
         for i in range(1, layers + 1):
             c2 = channels * min(2 ** i, 8)
-            mods += [nn.Conv2d(c, c2, 4, 2 if i < layers else 1, 1), nn.GroupNorm(min(32, c2 // 4), c2),
+            groups = max(g for g in range(1, 33) if c2 % g == 0 and g <= max(1, c2 // 4))   # divides c2
+            mods += [nn.Conv2d(c, c2, 4, 2 if i < layers else 1, 1), nn.GroupNorm(groups, c2),
                      nn.LeakyReLU(0.2)]
             c = c2
         mods.append(nn.Conv2d(c, 1, 4, 1, 1))

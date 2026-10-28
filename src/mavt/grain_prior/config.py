@@ -118,7 +118,8 @@ class GrainPriorConfig(CD32Config):
     gan_start: int = 0                    # generator adversarial weight 0 before this step (D trains from step 0)
     disc_channels: int = 64               # PatchGAN width
     disc_layers: int = 3                  # PatchGAN stride-2 layers
-    train_scope: str = "all"              # all | decoder: only readout.*, rgb.* (and disc.*) are trained
+    train_scope: str = "all"              # all | decoder: only readout.*, rgb.* (and disc.*) are trained; meant for
+                                          # images: on clips appear / recur / beta (memory, motion) stay frozen too
     rgb_ctx_blocks: int = 0               # ConvNeXt blocks (7 x 7 depthwise, zero-init) before the RGB head
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
     read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
