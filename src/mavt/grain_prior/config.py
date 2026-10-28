@@ -110,6 +110,9 @@ class GrainPriorConfig(CD32Config):
     # 1.5 (not cd32's prev_read / w_pred, which are inherited, saved in the s1-s3 configs and unused here)
     read_prev_frame: bool = False         # 1.5: a += Mix(WindowRead3x3(sg[F^_{t-1}]) at u_q - du_q), video / world only
     w_pred_frame: float = 0.0             # 1.5: L_pred = feat_loss(F_base incl. the previous-frame read, F) on targets
+    sem_target: str = ""                  # 2.5: "" off | stub | dinov3txt | siglip2 (external: attach model.sem_teacher)
+    w_sem: float = 0.0                    # 2.5: weight of 1 - cos(SemHead(mean c_0), teacher embedding), training only
+    sem_dim: int = 768                    # 2.5: teacher embedding width
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
     read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
     entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
@@ -252,6 +255,9 @@ class GrainPriorConfig(CD32Config):
             assert n_up >= 1 and self.dim % (4 ** n_up) == 0, "pointwise head: PixelShuffle divides dim by 4 per stage"
         if self.read_split_layer2 and not self.query_grid:
             raise ValueError("read_split_layer2 needs query_grid (a second read for RGB)")
+        if self.sem_target not in ("", "stub", "dinov3txt", "siglip2") or self.w_sem < 0 or \
+                (self.w_sem > 0 and not self.sem_target) or self.sem_dim < 1:
+            raise ValueError("sem_target: '' | stub | dinov3txt | siglip2; w_sem >= 0 and needs a sem_target")
         if self.w_pred_frame < 0:
             raise ValueError("w_pred_frame >= 0")
         if self.read_normalizer not in ("softmax", "entmax15", "topk"):

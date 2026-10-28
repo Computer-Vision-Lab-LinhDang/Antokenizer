@@ -51,3 +51,27 @@ def sample_cells(x: torch.Tensor, u: torch.Tensor, grid: int) -> torch.Tensor:
     out = F.grid_sample(img, (u.float() * 2 - 1).unsqueeze(1), mode="bilinear", padding_mode="border",
                         align_corners=False)
     return out.view(B, -1)
+
+
+class StubSemanticTeacher:
+    """2.5 stub teacher (tests, dry runs): a fixed random projection of the 4 x 4 average-pooled image [B, 48] to
+    [B, dim]. Not a module: no parameters, nothing in the state_dict, never trained."""
+
+    def __init__(self, dim: int, seed: int = 0):
+        self.W = torch.randn(48, dim, generator=torch.Generator().manual_seed(seed)) / 48 ** 0.5
+
+    @torch.no_grad()
+    def __call__(self, frames: torch.Tensor) -> torch.Tensor:
+        x = F.adaptive_avg_pool2d(frames.float(), 4).flatten(1)
+        return x @ self.W.to(x.device)
+
+
+def semantic_teacher(name: str, dim: int):
+    """2.5: the built-in teacher of sem_target, or None for the external ones (dinov3txt, siglip2), which need their
+    weights: attach `model.sem_teacher = callable(frames [B, 3, H, W] in [-1, 1]) -> [B, sem_dim]`."""
+    return StubSemanticTeacher(dim) if name == "stub" else None
+
+
+def sem_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """1 - cos per sample, mean."""
+    return (1 - F.cosine_similarity(pred.float(), target.float(), dim=-1)).mean()

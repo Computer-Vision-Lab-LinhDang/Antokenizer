@@ -27,11 +27,11 @@ from ..cd32.depth import cell_log_inv_depth
 from ..cd32.losses import psnr
 from . import geometry as g
 from . import schema as sc
-from .anchor import AnchorHeads, Stems, StreamC
+from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import feat_loss, huber_log_depth, pose_loss, sample_cells
+from .losses import feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
@@ -85,6 +85,9 @@ class MAVTGrainPrior(nn.Module):
         self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
+        if cfg.sem_target:                                            # 2.5: head on c_0; the teacher is not a module
+            self.sem_head = SemanticHead(cfg)
+            self.set_sem_teacher(semantic_teacher(cfg.sem_target, cfg.sem_dim))
         if cfg.readout_version != "legacy":
             from .shared import SharedQueryDecoder
             self.query_decoder = SharedQueryDecoder(cfg, Dt)
@@ -276,6 +279,24 @@ class MAVTGrainPrior(nn.Module):
                 raise ValueError("rgb_coarse_start needs a0 or low")
             low = self.rgb.low_image(a0)
         return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None)
+
+    def set_sem_teacher(self, fn) -> None:
+        """2.5: frames [B, 3, H, W] in [-1, 1] -> [B, sem_dim], run under no_grad in training only. Stored outside
+        the module tree, so a teacher network stays out of state_dict, DDP and the optimizer."""
+        object.__setattr__(self, "sem_teacher", fn)
+
+    def _sem(self, S: dict, frames0: torch.Tensor, parts: dict) -> torch.Tensor:
+        """2.5: w_sem (1 - cos(SemHead(c_0), teacher(X_0))) on the anchor."""
+        cfg = self.cfg
+        teacher = getattr(self, "sem_teacher", None)
+        if teacher is None:
+            raise NotImplementedError(f"sem_target={cfg.sem_target!r} needs its weights: call "
+                                      "model.set_sem_teacher(fn), fn(frames in [-1, 1]) -> [B, sem_dim]")
+        with torch.no_grad():
+            tgt = teacher(frames0)
+        ls = sem_loss(self.sem_head(S["c0"]), tgt)
+        parts["sem"] = ls.detach()
+        return cfg.w_sem * ls
 
     def set_step(self, step: int) -> None:
         """1.2: the trainer's global step (loss ramps); 2.4: the entmax alpha anneal of every read layer."""
@@ -562,6 +583,8 @@ class MAVTGrainPrior(nn.Module):
         lc = torch.stack(code).mean()
         parts["code"] = lc.detach()
         loss = loss + cfg.w_code * lc
+        if self.training and cfg.w_sem > 0:                            # 2.5
+            loss = loss + self._sem(S, frames[:, 0], parts)
         # ---- geometry labels
         if lid is not None:
             loss = loss + self._geom(S, der, outs, lid, lmask, s_scene, parts, diag)

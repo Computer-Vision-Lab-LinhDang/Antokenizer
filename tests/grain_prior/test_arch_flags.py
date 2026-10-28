@@ -512,3 +512,43 @@ def test_prev_read_trains_with_L_pred():
     out["loss"].backward()
     assert "pred_feat" in out["parts"] and torch.isfinite(out["loss"])
     assert _nonzero(_grads(m, "readout.prev_read."))
+
+
+# ------------------------------------------------------------------------------------------------ 2.5
+def test_stub_semantic_teacher_is_fixed_and_shaped():
+    from mavt.grain_prior.losses import StubSemanticTeacher
+    t = StubSemanticTeacher(24)
+    x = torch.rand(3, 3, 64, 64) * 2 - 1
+    a, b = t(x), StubSemanticTeacher(24)(x)
+    assert a.shape == (3, 24) and torch.equal(a, b) and not torch.allclose(a[0], a[1])
+
+
+def test_semantic_head_trains_c0_and_leaves_the_state_alone():
+    m = _model(sem_target="stub", w_sem=1.0, sem_dim=24).train()
+    x, cam = _inputs("video", T=2)
+    out = m(x, "video", cam, return_outputs=True)
+    assert "sem" in out["parts"] and 0 <= out["parts"]["sem"] <= 2
+    out["loss"].backward()
+    assert _nonzero(_grads(m, "sem_head.")) and _nonzero(_grads(m, "anchor.w_c."))
+    S = out["outputs"]["S"]
+    assert [f.numel() for f in sc.serialize(m.cfg, S)] == [m.cfg.state_numbers([int(S["recs"][0]["L"][b])])
+                                                           for b in range(2)]
+    assert not any("teacher" in k for k in m.state_dict())
+    with torch.no_grad():
+        assert "sem" not in m.eval()(x, "video", cam)["parts"]              # train only
+
+
+def test_semantic_teacher_plugs_in_and_external_ones_need_it():
+    m = _model(sem_target="siglip2", w_sem=1.0, sem_dim=16).train()
+    x, _ = _inputs("image")
+    with pytest.raises(NotImplementedError):
+        m(x, "image")
+    m.sem_teacher = lambda frames: torch.ones(frames.shape[0], 16)
+    out = m(x, "image")
+    assert torch.isfinite(out["loss"]) and "sem" in out["parts"]
+
+
+def test_semantic_config_checks():
+    for bad in (dict(sem_target="clip"), dict(w_sem=1.0), dict(sem_target="stub", w_sem=-1.0)):
+        with pytest.raises(ValueError):
+            tiny_config(**bad).check()

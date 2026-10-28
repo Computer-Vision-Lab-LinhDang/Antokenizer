@@ -205,3 +205,15 @@ class AnchorHeads(nn.Module):
         rho_t = cfg.rho_lo + (cfg.rho_hi - cfg.rho_lo) * torch.sigmoid(self.w_rho(h).squeeze(-1).float())
         sigma = sigma_from_raw(self.w_sigma(h).squeeze(-1).float(), cfg)
         return dict(c0=c0, kappa_logits=kz, u=u, rho_raw=rho_t, sigma=sigma, f=self.w_f(h).float(), h=h)
+
+
+class SemanticHead(nn.Module):
+    """2.5: Mean over the coarse slots of c_0 -> MLP -> [B, sem_dim] (aligned with a text-image teacher in training;
+    reads the state, adds no number to it)."""
+
+    def __init__(self, cfg: GrainPriorConfig):
+        super().__init__()
+        self.mlp = mlp2(cfg.d_coarse, cfg.sem_dim, cfg.mlp_hidden)
+
+    def forward(self, c0: torch.Tensor) -> torch.Tensor:
+        return self.mlp(c0.float().mean(1))
