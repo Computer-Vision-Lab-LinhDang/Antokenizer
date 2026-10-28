@@ -113,6 +113,13 @@ class GrainPriorConfig(CD32Config):
     sem_target: str = ""                  # 2.5: "" off | stub | dinov3txt | siglip2 (external: model.set_sem_teacher)
     w_sem: float = 0.0                    # 2.5: weight of 1 - cos(SemHead(mean c_0), teacher embedding), training only
     sem_dim: int = 768                    # 2.5: teacher embedding width
+    # decoder fine-tuning for FID (plan 2026-10-28 A; all off by default)
+    w_gan: float = 0.0                    # > 0: PatchGAN hinge loss on the decoded frames (generator weight)
+    gan_start: int = 0                    # generator adversarial weight 0 before this step (D trains from step 0)
+    disc_channels: int = 64               # PatchGAN width
+    disc_layers: int = 3                  # PatchGAN stride-2 layers
+    train_scope: str = "all"              # all | decoder: only readout.*, rgb.* (and disc.*) are trained
+    rgb_ctx_blocks: int = 0               # ConvNeXt blocks (7 x 7 depthwise, zero-init) before the RGB head
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
     read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
     entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
@@ -261,6 +268,10 @@ class GrainPriorConfig(CD32Config):
         if self.sem_target not in ("", "stub", "dinov3txt", "siglip2") or self.w_sem < 0 or \
                 (self.w_sem > 0 and not self.sem_target) or self.sem_dim < 1:
             raise ValueError("sem_target: '' | stub | dinov3txt | siglip2; w_sem >= 0 and needs a sem_target")
+        if self.w_gan < 0 or self.gan_start < 0 or self.rgb_ctx_blocks < 0 or self.disc_layers < 1:
+            raise ValueError("w_gan, gan_start, rgb_ctx_blocks >= 0; disc_layers >= 1")
+        if self.train_scope not in ("all", "decoder") or (self.train_scope == "decoder" and self.phase != "codec"):
+            raise ValueError("train_scope: all | decoder (decoder: phase codec only)")
         if self.w_pred_frame < 0:
             raise ValueError("w_pred_frame >= 0")
         if self.read_normalizer not in ("softmax", "entmax15", "topk"):

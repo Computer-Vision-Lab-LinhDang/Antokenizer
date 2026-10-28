@@ -414,6 +414,22 @@ class PointMLP(nn.Module):
         return x + self.fc2(F.gelu(self.fc1(self.norm(x))))
 
 
+class ConvNeXtBlock(nn.Module):
+    """x + W_2 GELU(W_1 LN(DW7x7(x))) on an NCHW map, W_2 zero-init (identity at init): spatial context for the RGB
+    head (rgb_ctx_blocks; each block widens the receptive field by 6 query cells)."""
+
+    def __init__(self, c: int, ratio: float):
+        super().__init__()
+        h = int(c * ratio)
+        self.dw = nn.Conv2d(c, c, 7, padding=3, groups=c)
+        self.norm, self.fc1, self.fc2 = PointLN(c), nn.Conv2d(c, h, 1), nn.Conv2d(h, c, 1)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        return x + self.fc2(F.gelu(self.fc1(self.norm(self.dw(x)))))
+
+
 class PointwiseRGB(nn.Module):
     """3.3: query-grid state [B, dim, s, s] -> residual image [B, 3, S, S] (no sigmoid; the caller composes).
 
@@ -466,6 +482,8 @@ class RGBHead(nn.Module):
             ch = [cfg.dim] + list(cfg.rgb_channels)[:n_up]
             self.convs = nn.ModuleList([nn.Conv2d(ch[i], ch[i + 1], 3, padding=1) for i in range(n_up)])
             self.final = nn.Conv2d(ch[-1], 3, 3, padding=1)
+        if cfg.rgb_ctx_blocks:
+            self.ctx = nn.ModuleList([ConvNeXtBlock(cfg.dim, cfg.rgb_pw_mlp_ratio) for _ in range(cfg.rgb_ctx_blocks)])
         self.coarse = cfg.rgb_coarse_start
         if self.coarse:
             self.low = mlp2(cfg.dim, 3, cfg.mlp_hidden)                 # RGBLow on a^(0) of the cell grid
@@ -497,6 +515,8 @@ class RGBHead(nn.Module):
             f = F.interpolate(f, size=(G, G), mode="bilinear", align_corners=False)
             x = x + f.flatten(2).transpose(1, 2)
         x = x.transpose(1, 2).reshape(B, -1, G, G)
+        for blk in getattr(self, "ctx", ()):
+            x = blk(x)
         if self.pointwise:
             return self.pw(x).float()
         for conv in self.convs:

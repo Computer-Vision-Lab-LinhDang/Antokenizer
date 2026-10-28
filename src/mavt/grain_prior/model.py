@@ -32,7 +32,7 @@ from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
+from .losses import PatchDisc, band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
@@ -97,11 +97,17 @@ class MAVTGrainPrior(nn.Module):
             from ..dino_v0.losses import LPIPSLoss, ignore_lpips_keys
             self.lpips = LPIPSLoss()
             self.register_load_state_dict_post_hook(ignore_lpips_keys)
+        if cfg.w_gan > 0:                                             # decoder fine-tuning for FID
+            self.disc = PatchDisc(cfg.disc_channels, cfg.disc_layers)
         for n, p in self.named_parameters():                          # T1 / T2: the prior waits; T3: only it
             if n.startswith("prior."):
                 p.requires_grad_(cfg.phase == "prior")
             elif cfg.phase == "prior":
                 p.requires_grad_(False)
+        if cfg.train_scope == "decoder":                              # frozen encoder: the decoder and D train
+            for n, p in self.named_parameters():
+                if not n.startswith(("readout.", "rgb.", "disc.")):
+                    p.requires_grad_(False)
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
         self.global_step = 0                                          # 1.2: set by forward(step=) / set_step
         if cfg.query_grid:
@@ -283,7 +289,7 @@ class MAVTGrainPrior(nn.Module):
 
     # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
     _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
-                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head"}
+                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx"}
 
     def new_param_prefixes(self) -> tuple:
         """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):
@@ -310,7 +316,7 @@ class MAVTGrainPrior(nn.Module):
                        r"|^corr\.w[qkvo]\.weight$"
                        r"|^readout\.(layers\.\d+|last_x)\.(wq|wpe|wk|wv|wo|wk_c|wv_c|wv_rel|ref\.\d+)\.weight$"
                        r"|^readout\.(f_q|mlp_a)\.\d+\.weight$|^readout\.prev_read\.mix\.weight$"
-                       r"|^rgb\.pw\.blocks\.\d+\.fc[12]\.weight$")
+                       r"|^rgb\.pw\.blocks\.\d+\.fc[12]\.weight$|^rgb\.ctx\.\d+\.fc[12]\.weight$")
     _ATTN_SCALARS = ("temperature", "sink", "tau_c", "beta_c", "alpha_raw")
 
     def optim_groups(self) -> list:
@@ -663,7 +669,35 @@ class MAVTGrainPrior(nn.Module):
             lp = self.lpips(a * 2 - 1, b * 2 - 1)
             parts["lpips"] = lp.detach()
             loss = loss + cfg.w_lpips * lp
+        if lpips and cfg.w_gan > 0 and self.training:
+            loss = loss + self._gan(rgb, X01, parts)
         return loss
+
+    def _gan_terms(self, fake: torch.Tensor, real: torch.Tensor) -> tuple:
+        """Hinge GAN terms on images in [-1, 1]: g = -mean D(fake) through D with detached parameters (gradient to
+        the decoder only); d = (relu(1 - D(real)) + relu(1 + D(sg[fake]))) / 2 (gradient to D only). Both enter one
+        backward."""
+        frozen = {k: v.detach() for k, v in self.disc.named_parameters()}
+        g = -torch.func.functional_call(self.disc, frozen, (fake,)).float().mean()
+        d = 0.5 * (F.relu(1 - self.disc(real).float()).mean() + F.relu(1 + self.disc(fake.detach()).float()).mean())
+        return g, d
+
+    def gan_weight(self) -> float:
+        cfg = self.cfg
+        return cfg.w_gan if self.global_step >= cfg.gan_start else 0.0
+
+    def _gan(self, rgb: torch.Tensor, X01: torch.Tensor, parts: dict) -> torch.Tensor:
+        """Adversarial loss on the decoded frames (a random subset of lpips_max_frames, as LPIPS)."""
+        a, b = rgb.flatten(0, 1) * 2 - 1, X01.flatten(0, 1) * 2 - 1
+        k = self.cfg.lpips_max_frames
+        if 0 < k < a.shape[0]:
+            sel = torch.randperm(a.shape[0], device=a.device)[:k]
+            a, b = a[sel], b[sel]
+        g, d = self._gan_terms(a, b.to(a.dtype))
+        w = self.gan_weight()
+        parts["gan_g"], parts["gan_d"] = g.detach(), d.detach()
+        parts["gan_w"] = torch.tensor(float(w), device=a.device)
+        return w * g + d
 
     def _geom(self, S, der, outs, lid, lmask, s_scene, parts, diag) -> torch.Tensor:
         """Huber log-depth of the anchor grains and of the grain / dense depth readouts on every observation.

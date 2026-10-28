@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from . import geometry as g
@@ -51,6 +52,29 @@ def sample_cells(x: torch.Tensor, u: torch.Tensor, grid: int) -> torch.Tensor:
     out = F.grid_sample(img, (u.float() * 2 - 1).unsqueeze(1), mode="bilinear", padding_mode="border",
                         align_corners=False)
     return out.view(B, -1)
+
+
+class PatchDisc(nn.Module):
+    """PatchGAN discriminator (Isola et al. 2017, as in VQGAN) on images in [-1, 1]: conv 4 x 4 stride 2 per layer,
+    GroupNorm (no batch statistics under DDP), LeakyReLU 0.2 -> a map of patch logits."""
+
+    def __init__(self, channels: int = 64, layers: int = 3):
+        super().__init__()
+        mods, c = [nn.Conv2d(3, channels, 4, 2, 1), nn.LeakyReLU(0.2)], channels
+        for i in range(1, layers + 1):
+            c2 = channels * min(2 ** i, 8)
+            mods += [nn.Conv2d(c, c2, 4, 2 if i < layers else 1, 1), nn.GroupNorm(min(32, c2 // 4), c2),
+                     nn.LeakyReLU(0.2)]
+            c = c2
+        mods.append(nn.Conv2d(c, 1, 4, 1, 1))
+        self.net = nn.Sequential(*mods)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, 0, 0.02)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class StubSemanticTeacher:
