@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Optional
 
 import math
+import re
 import dataclasses
 
 import torch
@@ -301,6 +302,38 @@ class MAVTGrainPrior(nn.Module):
             if new:
                 out.append(k)
         return tuple(out)
+
+    # Muon / AdamW split (--optimizer muon): hidden matrices of the blocks and the reads go to Muon; inputs, output
+    # heads, stems and the RGB convs to AdamW (io); 1-D and scalars to AdamW without decay, attention scalars at 0.1 lr
+    _MUON = re.compile(r"(^|\.)blocks\.\d+\.(ca\.\d+\.(q|kv|out)|sa\.(qkv|out)|mlp\.\d+)\.weight$"
+                       r"|^(stream_d\.read|appear\.ca|readout\.r_ca)\.(q|kv|out)\.weight$"
+                       r"|^corr\.w[qkvo]\.weight$"
+                       r"|^readout\.(layers\.\d+|last_x)\.(wq|wpe|wk|wv|wo|wk_c|wv_c|wv_rel|ref\.\d+)\.weight$"
+                       r"|^readout\.(f_q|mlp_a)\.\d+\.weight$|^readout\.prev_read\.mix\.weight$"
+                       r"|^rgb\.pw\.blocks\.\d+\.fc[12]\.weight$")
+    _ATTN_SCALARS = ("temperature", "sink", "tau_c", "beta_c", "alpha_raw")
+
+    def optim_groups(self) -> list:
+        """One row per trainable parameter: dict(name, param, kind = muon | io | scalar | attn_scalar, splits,
+        lr_scale). splits: blocks of a fused weight that Muon orthogonalises separately (qkv 3, kv 2, wv_rel R)."""
+        rows = []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            leaf = n.rsplit(".", 1)[-1]
+            splits, lr_scale = 1, 1.0
+            if leaf in self._ATTN_SCALARS:
+                kind, lr_scale = "attn_scalar", 0.1
+            elif p.ndim < 2:
+                kind = "scalar"
+            elif self._MUON.search(n) and (p.ndim == 2 or p.shape[2:].numel() == 1):
+                kind = "muon"
+                splits = (3 if n.endswith("qkv.weight") else 2 if n.endswith(".kv.weight")
+                          else self.cfg.relpos_rank if n.endswith("wv_rel.weight") else 1)
+            else:
+                kind = "io"
+            rows.append(dict(name=n, param=p, kind=kind, splits=splits, lr_scale=lr_scale))
+        return rows
 
     def set_sem_teacher(self, fn) -> None:
         """2.5: frames [B, 3, H, W] in [-1, 1] -> [B, sem_dim], run under no_grad in training only. Stored outside
