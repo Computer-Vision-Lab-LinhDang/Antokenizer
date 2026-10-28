@@ -104,6 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--init", default=None, metavar="CKPT",
                    help="start from the model weights of this checkpoint (optimizer and schedule fresh); "
                         "for staged training; ignored when the run resumes")
+    p.add_argument("--init-new-ok", action="store_true",
+                   help="with --init: the modules of newly enabled flags (model.new_param_prefixes) may be missing")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
     # ---- speed: mixed-modality steps, DDP, compile
@@ -259,12 +261,18 @@ def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args, 
     os.replace(tmp, path)
 
 
-def init_weights(path: str, model) -> int:
-    """Model weights of another run (strict except the frozen DINO prefix), nothing else -> its step."""
+def init_weights(path: str, model, new_ok: bool = False) -> int:
+    """Model weights of another run (strict except the frozen DINO prefix), nothing else -> its step. new_ok: keys
+    under model.new_param_prefixes() (modules of newly enabled flags) may be missing and keep their fresh init."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
     sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+    fresh = model.new_param_prefixes() if new_ok and hasattr(model, "new_param_prefixes") else ()
+    if fresh:
+        kept = [k for k in missing if k.startswith(fresh)]
+        missing = [k for k in missing if not k.startswith(fresh)]
+        print(f"--init-new-ok: {len(kept)} keys of new modules start fresh: {sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in kept})}", flush=True)
     if missing or unexpected:
         raise RuntimeError(f"--init mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
     return int(ck.get("step", -1))
@@ -557,7 +565,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
         set_fused(opt, fused)
         log(f"resumed from {resume} at step {step}")
     elif args.init:
-        step0 = init_weights(args.init, model)
+        step0 = init_weights(args.init, model, new_ok=args.init_new_ok)
         log(f"initialised from {args.init} (step {step0}); optimizer and schedule start fresh")
     use_amp = args.bf16 and dev.type == "cuda"
     mixed = args.mix_modalities

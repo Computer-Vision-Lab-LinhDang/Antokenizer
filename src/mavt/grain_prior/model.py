@@ -280,6 +280,28 @@ class MAVTGrainPrior(nn.Module):
             low = self.rgb.low_image(a0)
         return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None)
 
+    # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
+    _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
+                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head"}
+
+    def new_param_prefixes(self) -> tuple:
+        """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):
+        `--init-new-ok` lets them keep their fresh init when warm-starting from a checkpoint trained without them.
+        dino_multi_layer also widens anchor.src_type, which no warm start can fill (load_state_dict raises)."""
+        cfg = self.cfg
+        out = []
+        for k in self.state_dict():
+            seg = k.split(".")
+            new = bool(self._NEW_SEGMENTS & set(seg[:-1] + [seg[-1]]))
+            new |= cfg.rgb_coarse_start and k.startswith("rgb.low.")
+            new |= cfg.dino_multi_layer and (k.startswith("anchor.src.3.") or
+                                             (k.startswith("stream_c.blocks.") and ".ca.1." in k))
+            new |= (cfg.read_coarse_kv and cfg.coarse_sink and not cfg.read_sink and seg[0] == "readout"
+                    and seg[-1] == "sink")
+            if new:
+                out.append(k)
+        return tuple(out)
+
     def set_sem_teacher(self, fn) -> None:
         """2.5: frames [B, 3, H, W] in [-1, 1] -> [B, sem_dim], run under no_grad in training only. Stored outside
         the module tree, so a teacher network stays out of state_dict, DDP and the optimizer."""

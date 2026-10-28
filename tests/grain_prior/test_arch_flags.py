@@ -606,3 +606,35 @@ def test_pointwise_head_bounds_the_receptive_field():
     with pytest.raises(ValueError):
         tiny_config(rgb_head="pointwise", dim=256).check()          # no query_grid: 16 x upsampling, RF > 16 px
     tiny_config(rgb_head="pointwise", **QG).check()                 # 4 x upsampling
+
+
+# ------------------------------------------------------------------------------------------------ --init-new-ok
+def test_new_param_prefixes_cover_exactly_the_new_keys():
+    old = set(_model(**QG).state_dict())
+    kw = dict(read_prev_frame=True, read_coarse_kv=True, rgb_coarse_start=True, read_relpos_value=True,
+              read_split_layer2=True, rgb_in_feat=True, dino_multi_layer=True, sem_target="stub",
+              read_normalizer="entmax15", rgb_head="pointwise", **QG)
+    m = _model(**kw)
+    new = set(m.state_dict()) - old
+    pre = m.new_param_prefixes()
+    assert new and all(k.startswith(pre) for k in new if k != "anchor.src_type")    # widened, not new
+    assert not any(k.startswith(pre) for k in old)
+    assert _model(**QG).new_param_prefixes() == ()
+
+
+def test_init_new_ok_allows_only_the_new_flag_modules(tmp_path):
+    from .test_grain_prior import _script
+    tr = _script("train_dino_v0")
+    src = _model(**QG)
+    p = tmp_path / "old.pt"
+    torch.save(dict(model=src.state_dict(), step=800), p)
+    dst = _model(read_prev_frame=True, read_coarse_kv=True, rgb_coarse_start=True, **QG)
+    with pytest.raises(RuntimeError):
+        tr.init_weights(str(p), dst)
+    assert tr.init_weights(str(p), dst, new_ok=True) == 800
+    assert torch.equal(dst.readout.w_out.weight, src.readout.w_out.weight)
+    sd = dict(src.state_dict())
+    sd.pop("readout.w_out.weight")                                   # an old key missing: still an error
+    torch.save(dict(model=sd, step=800), p)
+    with pytest.raises(RuntimeError):
+        tr.init_weights(str(p), _model(read_prev_frame=True, **QG), new_ok=True)
