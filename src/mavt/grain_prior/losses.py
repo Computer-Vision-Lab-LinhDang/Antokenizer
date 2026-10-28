@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from . import geometry as g
@@ -51,3 +52,63 @@ def sample_cells(x: torch.Tensor, u: torch.Tensor, grid: int) -> torch.Tensor:
     out = F.grid_sample(img, (u.float() * 2 - 1).unsqueeze(1), mode="bilinear", padding_mode="border",
                         align_corners=False)
     return out.view(B, -1)
+
+
+class PatchDisc(nn.Module):
+    """PatchGAN discriminator (Isola et al. 2017, as in VQGAN) on images in [-1, 1]: conv 4 x 4 stride 2 per layer,
+    GroupNorm (no batch statistics under DDP), LeakyReLU 0.2 -> a map of patch logits."""
+
+    def __init__(self, channels: int = 64, layers: int = 3):
+        super().__init__()
+        mods, c = [nn.Conv2d(3, channels, 4, 2, 1), nn.LeakyReLU(0.2)], channels
+        for i in range(1, layers + 1):
+            c2 = channels * min(2 ** i, 8)
+            groups = max(g for g in range(1, 33) if c2 % g == 0 and g <= max(1, c2 // 4))   # divides c2
+            mods += [nn.Conv2d(c, c2, 4, 2 if i < layers else 1, 1), nn.GroupNorm(groups, c2),
+                     nn.LeakyReLU(0.2)]
+            c = c2
+        mods.append(nn.Conv2d(c, 1, 4, 1, 1))
+        self.net = nn.Sequential(*mods)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, 0, 0.02)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class StubSemanticTeacher:
+    """2.5 stub teacher (tests, dry runs): a fixed random projection of the 4 x 4 average-pooled image [B, 48] to
+    [B, dim]. Not a module: no parameters, nothing in the state_dict, never trained."""
+
+    def __init__(self, dim: int, seed: int = 0):
+        self.W = torch.randn(48, dim, generator=torch.Generator().manual_seed(seed)) / 48 ** 0.5
+
+    @torch.no_grad()
+    def __call__(self, frames: torch.Tensor) -> torch.Tensor:
+        x = F.adaptive_avg_pool2d(frames.float(), 4).flatten(1)
+        return x @ self.W.to(x.device)
+
+
+def semantic_teacher(name: str, dim: int):
+    """2.5: the built-in teacher of sem_target, or None for the external ones (dinov3txt, siglip2), which need their
+    weights: attach with `model.set_sem_teacher(fn)`, fn(frames [B, 3, H, W] in [-1, 1]) -> [B, sem_dim] (plain
+    assignment of an nn.Module would register it in the state_dict)."""
+    return StubSemanticTeacher(dim) if name == "stub" else None
+
+
+def sem_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """1 - cos per sample, mean."""
+    return (1 - F.cosine_similarity(pred.float(), target.float(), dim=-1)).mean()
+
+
+def band_fractions(err: torch.Tensor) -> tuple:
+    """Energy fractions of err [..., S, S] in the low (< 1/32), mid and high (>= 1/8 cycles / px) radial bands."""
+    E = torch.fft.rfft2(err.float()).abs().pow(2)
+    S = err.shape[-1]
+    fy = torch.fft.fftfreq(S, device=err.device).view(-1, 1)
+    fx = torch.fft.rfftfreq(S, device=err.device).view(1, -1)
+    fr = (fx ** 2 + fy ** 2).sqrt()
+    tot = E.sum().clamp_min(1e-12)
+    return E[..., fr < 1 / 32].sum() / tot, E[..., (fr >= 1 / 32) & (fr < 1 / 8)].sum() / tot, E[..., fr >= 1 / 8].sum() / tot

@@ -7,6 +7,9 @@
     grains: one per 2 x 2 stratum, soft location u_k inside the stratum, conditional grain query
     q_k = f_g[ReadCoarse(c_0, u_k), Mean(c_0), PE(u_k)], two read-refine blocks over (H_C, F_0, P_0) with a
     Gaussian spatial prior plus exploration -> f_k (60), rho_k, sigma_k = 0.4 + 1.1 sigmoid
+
+    dino_multi_layer (1.4): F_mid = W_mid LN(concat of the frozen DINO layers dino_layers[:-1]) [N, dim] is a further
+    evidence source of stream C (second cross-attention per block) and of the grain read (fourth source).
 """
 from __future__ import annotations
 
@@ -59,6 +62,11 @@ class Stems(nn.Module):
         self.w_pe = nn.Linear(g.pe_dim(2, cfg.pe_freq), cfg.dim)
         self.norm = nn.LayerNorm(cfg.dim)
         self.w_g = nn.Linear(cfg.dim, cfg.d_coarse)
+        if cfg.dino_multi_layer:
+            n_mid = len(cfg.dino_layers) - 1
+            assert n_mid >= 1, "dino_multi_layer needs at least two entries in dino_layers"
+            self.norm_mid = nn.LayerNorm(n_mid * self.dino.out_dim)
+            self.w_mid = nn.Linear(n_mid * self.dino.out_dim, cfg.dim)
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
 
     @property
@@ -70,12 +78,16 @@ class Stems(nn.Module):
 
     def forward(self, frames: torch.Tensor) -> dict:
         cfg = self.cfg
-        Ft, _, _ = self.dino(frames)
+        Ft, layers, _ = self.dino(frames)
         Ft = Ft.float().detach()
         P = self.pixel(frames)
         Y = self.norm(self.w_f(Ft.to(P.dtype)) + P + self.pe2d())
         gi = torch.tanh(self.w_g(pool_coarse(Y, cfg.grid, cfg.coarse_grid)))
-        return dict(F=Ft, P=P, Y=Y, g=gi)
+        out = dict(F=Ft, P=P, Y=Y, g=gi)
+        if cfg.dino_multi_layer:
+            mid = torch.cat([l.float().detach() for l in layers[:-1]], -1)
+            out["F_mid"] = self.w_mid(self.norm_mid(mid).to(P.dtype))
+        return out
 
 
 class StreamC(nn.Module):
@@ -86,17 +98,23 @@ class StreamC(nn.Module):
         self.cfg = cfg
         dc = cfg.d_coarse
         self.init = mlp2(g.pe_dim(2, cfg.pe_freq) + 2 * dc, cfg.dim, cfg.mlp_hidden)
-        self.blocks = nn.ModuleList([Block(cfg.dim, cfg.heads, 1, True, cfg.mlp_ratio) for _ in range(cfg.layers)])
+        n_ctx = 2 if cfg.dino_multi_layer else 1
+        self.blocks = nn.ModuleList([Block(cfg.dim, cfg.heads, n_ctx, True, cfg.mlp_ratio) for _ in range(cfg.layers)])
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
 
-    def forward(self, Y0: torch.Tensor, g0: torch.Tensor) -> torch.Tensor:
+    def forward(self, Y0: torch.Tensor, g0: torch.Tensor, F_mid: torch.Tensor = None) -> torch.Tensor:
         cfg = self.cfg
         B = Y0.shape[0]
         u = self.uq.expand(B, -1, -1)
         x = torch.cat([g.fourier(u, cfg.pe_freq), g.read_coarse(g0.float(), u, cfg.coarse_grid),
                        g0.float().mean(1, keepdim=True).expand(-1, cfg.n_cells, -1)], -1)
         h = self.init(x.to(Y0.dtype))
-        return run(self.blocks, h, [(Y0, None, None)])
+        ctx = [(Y0, None, None)]
+        if cfg.dino_multi_layer:
+            if F_mid is None:
+                raise ValueError("dino_multi_layer: stream C needs F_mid")
+            ctx.append((F_mid.to(Y0.dtype), None, None))
+        return run(self.blocks, h, ctx)
 
 
 def gaussian_prior(u_q: torch.Tensor, v: torch.Tensor, s: float, eps: float, grid: int,
@@ -133,8 +151,10 @@ class AnchorHeads(nn.Module):
         self.score = mlp2(d + dc, 1, cfg.mlp_hidden)
         self.offset = zero_last(mlp2(d, 2, cfg.mlp_hidden))
         self.q_init = mlp2(2 * dc + pe2, d, cfg.mlp_hidden)
-        self.src = nn.ModuleList([nn.Linear(d, d), nn.Linear(teacher_dim, d), nn.Linear(d, d)])
-        self.src_type = nn.Parameter(torch.randn(3, d) * 0.02)
+        self.n_src = 4 if cfg.dino_multi_layer else 3
+        self.src = nn.ModuleList([nn.Linear(d, d), nn.Linear(teacher_dim, d), nn.Linear(d, d)]
+                                 + ([nn.Linear(d, d)] if cfg.dino_multi_layer else []))
+        self.src_type = nn.Parameter(torch.randn(self.n_src, d) * 0.02)
         self.blocks = nn.ModuleList([Block(d, cfg.heads, 1, True, cfg.mlp_ratio) for _ in range(cfg.grain_blocks)])
         self.norm = nn.LayerNorm(d)
         self.w_f = nn.Linear(d, cfg.d_f)
@@ -154,7 +174,7 @@ class AnchorHeads(nn.Module):
         self.register_buffer("box_lo", lo, persistent=False)
         self.register_buffer("box_hi", lo + s / G, persistent=False)
 
-    def forward(self, H: torch.Tensor, F0: torch.Tensor, P0: torch.Tensor) -> dict:
+    def forward(self, H: torch.Tensor, F0: torch.Tensor, P0: torch.Tensor, F_mid: torch.Tensor = None) -> dict:
         cfg = self.cfg
         B, N, d = H.shape
         c0 = torch.tanh(self.w_c(pool_coarse(H, cfg.grid, cfg.coarse_grid))).float()
@@ -171,12 +191,29 @@ class AnchorHeads(nn.Module):
         # ---- conditional grain query, read-refine over (H_C, F_0, P_0)
         q = self.q_init(torch.cat([g.read_coarse(c0, u, cfg.coarse_grid), c0.mean(1, keepdim=True).expand(-1, cfg.n_grains, -1),
                                    g.fourier(u, cfg.pe_freq)], -1).to(H.dtype))
-        E = torch.cat([self.src[0](H) + self.src_type[0], self.src[1](F0.to(H.dtype)) + self.src_type[1],
-                       self.src[2](P0) + self.src_type[2]], 1)
+        srcs = [self.src[0](H) + self.src_type[0], self.src[1](F0.to(H.dtype)) + self.src_type[1],
+                self.src[2](P0) + self.src_type[2]]
+        if cfg.dino_multi_layer:
+            if F_mid is None:
+                raise ValueError("dino_multi_layer: the grain read needs F_mid")
+            srcs.append(self.src[3](F_mid.to(H.dtype)) + self.src_type[3])
+        E = torch.cat(srcs, 1)
         lp = gaussian_prior(u, self.uq, cfg.grain_read_s, cfg.corr_eps, cfg.grid)       # [B, G, N]
-        bias = lp.repeat(1, 1, 3).unsqueeze(1)
+        bias = lp.repeat(1, 1, self.n_src).unsqueeze(1)
         h = run(self.blocks, q, [(E, bias, None)])
         h = self.norm(h)
         rho_t = cfg.rho_lo + (cfg.rho_hi - cfg.rho_lo) * torch.sigmoid(self.w_rho(h).squeeze(-1).float())
         sigma = sigma_from_raw(self.w_sigma(h).squeeze(-1).float(), cfg)
         return dict(c0=c0, kappa_logits=kz, u=u, rho_raw=rho_t, sigma=sigma, f=self.w_f(h).float(), h=h)
+
+
+class SemanticHead(nn.Module):
+    """2.5: Mean over the coarse slots of c_0 -> MLP -> [B, sem_dim] (aligned with a text-image teacher in training;
+    reads the state, adds no number to it)."""
+
+    def __init__(self, cfg: GrainPriorConfig):
+        super().__init__()
+        self.mlp = mlp2(cfg.d_coarse, cfg.sem_dim, cfg.mlp_hidden)
+
+    def forward(self, c0: torch.Tensor) -> torch.Tensor:
+        return self.mlp(c0.float().mean(1))

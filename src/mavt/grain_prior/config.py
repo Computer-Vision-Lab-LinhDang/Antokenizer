@@ -92,6 +92,41 @@ class GrainPriorConfig(CD32Config):
     read_sink: bool = False               # learned-logit sink with zero value; grain bias carries proximity
     read_radius_scale: bool = False       # grain radius x (d_anchor / z_target) x (f_target / f_anchor)
     read_radius_clip: float = 0.0         # > 0: projected radius scale bounded to [1 / clip, clip]
+    # ---- 2026-10 architecture flags (all default off: checkpoints s1-s3 and their state_dict keys unchanged)
+    innov_stopgrad_base: bool = False     # 1.1: F^ = sg[F_base] + dF, H^ = sg[a] + dH per sample where L_b > 0
+    w_geom_dense: float = 1.0             # 1.2: weight of the depth_dense terms inside the depth loss (0: off)
+    w_geom_ramp_steps: int = 0            # 1.2: > 0: w_geom ramps linearly 0 -> w_geom over this many steps
+    dino_multi_layer: bool = False        # 1.4: F_mid from dino_layers[:-1] as a further evidence source (C only)
+    read_coarse_kv: bool = False          # 2.1: the 16 coarse slots (c_0, z_i) join the grain softmax of every read
+    coarse_sink: bool = True              # 2.1: with read_coarse_kv, also append the zero-value sink (off: ablation)
+    read_relpos_value: bool = False       # 2.2: value depends on the relative position (low rank, R bases)
+    relpos_rank: int = 8                  # 2.2: R (even): R / 2 Fourier directions x (sin, cos)
+    rgb_coarse_start: bool = False        # 2.3: X^ = clamp(sg[X~0] + R), X~0 = pyr_up(RGBLow(a0)); L1 to pyr_up(pyr_down(X))
+    w_rgb_coarse: float = 1.0             # 2.3: weight of that L1
+    rgb_head: str = "legacy"              # 3.3: legacy conv head | pointwise (1x1 MLPs + PixelShuffle, RF <= 16 px; image / side <= 4)
+    rgb_pw_mlp_ratio: float = 4.0         # 3.3: hidden ratio of its four 1x1 MLP blocks on the query grid
+    rgb_in_feat: bool = False             # 3.3: H_in = H + Linear(up_bilinear(sg[F^])) from the feature grid
+    read_split_layer2: bool = False       # 3.4: last ReadLayer has two copies: a_F (feature grid) and a_X (RGB grid)
+    # 1.5 (not cd32's prev_read / w_pred, which are inherited, saved in the s1-s3 configs and unused here)
+    read_prev_frame: bool = False         # 1.5: a += Mix(WindowRead3x3(sg[F^_{t-1}]) at u_q - du_q), video / world only
+    w_pred_frame: float = 0.0             # 1.5: L_pred = feat_loss(F_base incl. the previous-frame read, F) on targets
+    sem_target: str = ""                  # 2.5: "" off | stub | dinov3txt | siglip2 (external: model.set_sem_teacher)
+    w_sem: float = 0.0                    # 2.5: weight of 1 - cos(SemHead(mean c_0), teacher embedding), training only
+    sem_dim: int = 768                    # 2.5: teacher embedding width
+    # decoder fine-tuning for FID (plan 2026-10-28 A; all off by default)
+    w_gan: float = 0.0                    # > 0: PatchGAN hinge loss on the decoded frames (generator weight)
+    gan_start: int = 0                    # generator adversarial weight 0 before this step (D trains from step 0)
+    disc_channels: int = 64               # PatchGAN width
+    disc_layers: int = 3                  # PatchGAN stride-2 layers
+    train_scope: str = "all"              # all | decoder: only readout.*, rgb.* (and disc.*) are trained; meant for
+                                          # images: on clips appear / recur / beta (memory, motion) stay frozen too
+    rgb_ctx_blocks: int = 0               # ConvNeXt blocks (7 x 7 depthwise, zero-init) before the RGB head
+    read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
+    read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
+    entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
+    alpha_anneal_steps: int = 0           # 2.4 entmax15: > 0: alpha = init -> 1.5 over these steps, not learned
+    state_noise_bits: int = 0             # 3.5: train-time U(-D/2, D/2) on f and c_0, D = batch (max - min) / 2^bits
+    geom_noise_px: float = 0.0            # 3.5: train-time Gaussian noise on u (pixels)
     sigma_param: str = "sigmoid"          # sigmoid: sigma_min + span * sigmoid | log: exp, floor sigma_lo
     sigma_lo: float = 0.02
     query_version: int = 1
@@ -100,6 +135,7 @@ class GrainPriorConfig(CD32Config):
     innovation_semantics: str = "legacy_image"
     render_samples: int = 32
     query_chunk: int = 512
+    read_act_ckpt: bool = True           # 2.2 / 2.4 explicit reads: recompute each query chunk in backward
     render_near: float = 0.1             # source gauge units, never fitted to target labels
     render_far: float = 4.0
     background_rgb: tuple = (0.0, 0.0, 0.0)
@@ -161,6 +197,22 @@ class GrainPriorConfig(CD32Config):
             n += self.n_coarse * self.d_coarse + sum(self.target_numbers(int(L)) for L in Ls)
         return n
 
+    def full_budget(self, stratum: int, ceiling: int = 12288) -> int:
+        """1.3: largest d_f such that an image state (header + C) of this config at `stratum` fits `ceiling`
+        scalars, counted by the ledger (`state_numbers`, the same count `schema.serialize` writes)."""
+        probe = dataclasses.replace(self, stratum=stratum, d_f=0)
+        base = probe.state_numbers([])                                   # header + grains x 4 + c_0 + kappa_0
+        d_f = (ceiling - base) // probe.n_grains
+        if d_f < 1:
+            raise ValueError(f"no feature budget at stratum {stratum} under {ceiling}")
+        assert dataclasses.replace(self, stratum=stratum, d_f=d_f).state_numbers([]) <= ceiling
+        assert dataclasses.replace(self, stratum=stratum, d_f=d_f + 1).state_numbers([]) > ceiling
+        return d_f
+
+    def full_budget_config(self, stratum: int, ceiling: int = 12288) -> "GrainPriorConfig":
+        """1.3 preset: this config with `stratum` and d_f = full_budget(stratum)."""
+        return dataclasses.replace(self, stratum=stratum, d_f=self.full_budget(stratum, ceiling))
+
     def check(self) -> None:
         if self.readout_version not in ("legacy", "shared_ray_v1", "shared_field_v1"):
             raise ValueError("unknown readout_version")
@@ -199,6 +251,41 @@ class GrainPriorConfig(CD32Config):
         assert self.phase in ("codec", "prior")
         assert len(self.corr_s) >= self.refine_passes
         assert self.fov_min < self.fov_init < self.fov_max
+        # ---- 2026-10 flags
+        if self.read_coarse_kv and not self.geom_bias:
+            raise ValueError("read_coarse_kv needs the geometry bias (the coarse bias joins it)")
+        if self.read_relpos_value and (self.relpos_rank < 2 or self.relpos_rank % 2):
+            raise ValueError("relpos_rank must be an even number >= 2")
+        if self.rgb_head not in ("legacy", "pointwise"):
+            raise ValueError("rgb_head: legacy | pointwise")
+        if self.rgb_head == "pointwise":
+            side = self.query_grid or self.grid
+            n_up = (self.image_size // side).bit_length() - 1
+            assert n_up >= 1 and self.dim % (4 ** n_up) == 0, "pointwise head: PixelShuffle divides dim by 4 per stage"
+            if n_up > 2:
+                raise ValueError("rgb_head=pointwise keeps a receptive field <= 16 px only for image / side <= 4: "
+                                 "use query_grid >= image_size / 4")
+        if self.read_split_layer2 and not self.query_grid:
+            raise ValueError("read_split_layer2 needs query_grid (a second read for RGB)")
+        if self.sem_target not in ("", "stub", "dinov3txt", "siglip2") or self.w_sem < 0 or \
+                (self.w_sem > 0 and not self.sem_target) or self.sem_dim < 1:
+            raise ValueError("sem_target: '' | stub | dinov3txt | siglip2; w_sem >= 0 and needs a sem_target")
+        if self.w_gan < 0 or self.gan_start < 0 or self.rgb_ctx_blocks < 0 or self.disc_layers < 1:
+            raise ValueError("w_gan, gan_start, rgb_ctx_blocks >= 0; disc_layers >= 1")
+        if self.train_scope not in ("all", "decoder") or (self.train_scope == "decoder" and self.phase != "codec"):
+            raise ValueError("train_scope: all | decoder (decoder: phase codec only)")
+        if self.w_pred_frame < 0:
+            raise ValueError("w_pred_frame >= 0")
+        if self.read_normalizer not in ("softmax", "entmax15", "topk"):
+            raise ValueError("read_normalizer: softmax | entmax15 | topk")
+        if self.read_normalizer == "topk" and (self.read_topk < 1 or not self.geom_bias):
+            raise ValueError("read_normalizer=topk needs read_topk >= 1 and the geometry bias (it ranks the grains)")
+        if not 1.0 <= self.entmax_alpha_init <= 2.0 or self.alpha_anneal_steps < 0:
+            raise ValueError("entmax_alpha_init in [1, 2], alpha_anneal_steps >= 0")
+        if self.innov_stopgrad_base and not self.w_base > 0:
+            raise ValueError("innov_stopgrad_base: L_base must be on (w_base > 0), it is the only loss of the base")
+        assert self.w_geom_dense >= 0 and self.w_geom_ramp_steps >= 0 and self.state_noise_bits >= 0 \
+            and self.geom_noise_px >= 0
 
 
 def tiny_config(**kw) -> GrainPriorConfig:

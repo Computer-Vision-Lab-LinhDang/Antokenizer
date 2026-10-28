@@ -52,9 +52,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-lr-ratio", type=float, default=0.05, help="cosine floor as a fraction of --lr")
     p.add_argument("--wd", type=float, default=0.05)
     p.add_argument("--warmup", type=int, default=2000)
-    p.add_argument("--schedule", choices=("cosine", "plateau"), default="cosine",
+    p.add_argument("--schedule", choices=("cosine", "plateau", "wsd"), default="cosine",
                    help="cosine over --steps | plateau: constant lr until the train loss stops improving, then a "
-                        "cosine decay of --decay-steps and stop (--steps is the cap)")
+                        "cosine decay of --decay-steps and stop (--steps is the cap) | wsd: warmup, constant, linear "
+                        "decay over the last --decay-steps (or from --decay-start: a decay branch)")
+    p.add_argument("--decay-start", type=int, default=-1,
+                   help="wsd: step where the decay starts (-1: --steps - --decay-steps). Decay branch of a stable "
+                        "checkpoint at step k: --resume <ckpt> --out <branch> --decay-start k --steps k + D")
+    p.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw",
+                   help="adamw | muon: Muon on the model's hidden matrices (model.optim_groups), AdamW on the rest")
+    p.add_argument("--muon-momentum", type=float, default=0.95)
+    p.add_argument("--ema", type=float, default=0.0, help="> 0: EMA of the weights (saved in last_ema.pt)")
+    p.add_argument("--clip-mode", choices=("fixed", "median"), default="fixed",
+                   help="fixed: --grad-clip | median: --clip-mult x median of the last --clip-window grad norms")
+    p.add_argument("--clip-mult", type=float, default=2.0)
+    p.add_argument("--clip-window", type=int, default=200)
     p.add_argument("--plateau-window", type=int, default=500, help="steps per loss window (plateau)")
     p.add_argument("--plateau-tol", type=float, default=0.01,
                    help="plateau when a window's mean loss improves on the previous one by less than this fraction")
@@ -104,6 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--init", default=None, metavar="CKPT",
                    help="start from the model weights of this checkpoint (optimizer and schedule fresh); "
                         "for staged training; ignored when the run resumes")
+    p.add_argument("--init-new-ok", action="store_true",
+                   help="with --init: the modules of newly enabled flags (model.new_param_prefixes) may be missing")
     p.add_argument("--wandb", default=None, help="wandb project (offline unless WANDB_MODE says otherwise)")
     p.add_argument("--use-checkpoint", action=argparse.BooleanOptionalAction, default=False)
     # ---- speed: mixed-modality steps, DDP, compile
@@ -185,6 +199,11 @@ def is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def log_due(step: int, every: int, steps: int) -> bool:
+    """True when the trainer logs after reaching `step` (every `every` steps and at the last step)."""
+    return step % every == 0 or step == steps
+
+
 def all_mean(t: torch.Tensor) -> torch.Tensor:
     if is_dist():
         t = t.clone()
@@ -200,9 +219,44 @@ def plateau_reached(prev: Optional[float], cur: float, tol: float) -> bool:
     return prev is not None and abs(prev - cur) < tol * abs(prev)
 
 
+def muon_groups(model: torch.nn.Module, args) -> list:
+    """Optimizer groups of --optimizer muon from model.optim_groups(): one group per (kind, splits, lr_scale);
+    weight decay on muon / io, none on scalars."""
+    if not hasattr(model, "optim_groups"):
+        raise SystemExit("--optimizer muon needs a model with optim_groups()")
+    groups = {}
+    for r in model.optim_groups():
+        key = (r["kind"], r["splits"], r["lr_scale"])
+        g = groups.setdefault(key, dict(params=[], names=[], kind=r["kind"], splits=r["splits"],
+                                        lr_scale=r["lr_scale"], lr=args.lr * r["lr_scale"],
+                                        weight_decay=args.wd if r["kind"] in ("muon", "io") else 0.0))
+        g["params"].append(r["param"])
+        g["names"].append(r["name"])
+    return list(groups.values())
+
+
+def param_group_table(groups: list) -> str:
+    """Every parameter with its group (written to <out>/param_groups.txt and summarised in the log)."""
+    lines = []
+    for g in groups:
+        n = sum(p.numel() for p in g["params"])
+        lines.append(f"## {g['kind']} splits={g['splits']} lr_scale={g['lr_scale']} wd={g['weight_decay']} "
+                     f"tensors={len(g['params'])} params={n / 1e6:.3f}M")
+        lines += [f"  {name} {tuple(p.shape)}" for name, p in zip(g["names"], g["params"])]
+    return "\n".join(lines) + "\n"
+
+
 def build_optim(model: torch.nn.Module, args, device=None, plat: Optional[dict] = None):
     """AdamW (decay on >= 2-D weights only) + warmup / cosine LambdaLR. Fused AdamW (one kernel set for all
-    params) when device is a GPU, the default implementation otherwise or if fused is unavailable."""
+    params) when device is a GPU, the default implementation otherwise or if fused is unavailable.
+    --optimizer muon: MuonAdamW over model.optim_groups(); --schedule wsd: warmup-stable-decay."""
+    if getattr(args, "optimizer", "adamw") == "muon":
+        from mavt.muon import MuonAdamW
+        groups = muon_groups(model, args)
+        opt = MuonAdamW([{k: v for k, v in g.items() if k != "names"} for g in groups], lr=args.lr,
+                        momentum=args.muon_momentum)
+        opt.param_names = [g["names"] for g in groups]
+        return opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda_of(args, plat))
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -218,8 +272,15 @@ def build_optim(model: torch.nn.Module, args, device=None, plat: Optional[dict] 
             print(f"fused AdamW unavailable ({ex}); using the default AdamW", flush=True)
     if opt is None:
         opt = torch.optim.AdamW(groups(), **kw)
+    return opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda_of(args, plat))
 
+
+def lr_lambda_of(args, plat: Optional[dict]):
     def lr_lambda(step: int) -> float:
+        if getattr(args, "schedule", "cosine") == "wsd":
+            from mavt.muon import wsd_factor
+            return wsd_factor(step, args.warmup, args.steps, args.decay_steps, args.min_lr_ratio,
+                              getattr(args, "decay_start", -1))
         if step < args.warmup:
             return (step + 1) / max(1, args.warmup)
         if getattr(args, "schedule", "cosine") == "plateau":           # plat["decay_start"] < 0: not decaying yet
@@ -231,7 +292,7 @@ def build_optim(model: torch.nn.Module, args, device=None, plat: Optional[dict] 
         prog = min(1.0, (step - args.warmup) / max(1, args.steps - args.warmup))
         return args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog))
 
-    return opt, torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    return lr_lambda
 
 
 def set_fused(opt: torch.optim.Optimizer, fused: bool) -> None:
@@ -252,19 +313,35 @@ def trainable_state(model: torch.nn.Module) -> dict:
     return {k: v for k, v in model.state_dict().items() if not k.startswith(FROZEN_PREFIX)}
 
 
-def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args, plat: Optional[dict] = None) -> None:
+def save_ckpt(path: str, model, opt, sched, step: int, cfg: DinoV0Config, args, plat: Optional[dict] = None,
+              extra: Optional[dict] = None) -> None:
+    """extra (--ema, --clip-mode median): {"ema": {name: tensor}, "clip": state}; with an EMA a second file
+    <path stem>_ema.pt holds the EMA weights in the same format (every eval script reads it unchanged)."""
     tmp = path + ".tmp"
     torch.save(dict(model=trainable_state(model), optim=opt.state_dict(), sched=sched.state_dict(),
-                    step=step, cfg=dataclasses.asdict(cfg), args=vars(args), plateau=plat), tmp)
+                    step=step, cfg=dataclasses.asdict(cfg), args=vars(args), plateau=plat, **(extra or {})), tmp)
     os.replace(tmp, path)
+    ema = (extra or {}).get("ema")
+    if ema:
+        sd = trainable_state(model)
+        sd.update({k: v for k, v in ema.items() if k in sd})
+        e_path = path[:-3] + "_ema.pt"
+        torch.save(dict(model=sd, step=step, cfg=dataclasses.asdict(cfg), args=vars(args)), e_path + ".tmp")
+        os.replace(e_path + ".tmp", e_path)
 
 
-def init_weights(path: str, model) -> int:
-    """Model weights of another run (strict except the frozen DINO prefix), nothing else -> its step."""
+def init_weights(path: str, model, new_ok: bool = False) -> int:
+    """Model weights of another run (strict except the frozen DINO prefix), nothing else -> its step. new_ok: keys
+    under model.new_param_prefixes() (modules of newly enabled flags) may be missing and keep their fresh init."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
     sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing = [k for k in missing if not k.startswith(FROZEN_PREFIX)]
+    fresh = model.new_param_prefixes() if new_ok and hasattr(model, "new_param_prefixes") else ()
+    if fresh:
+        kept = [k for k in missing if k.startswith(fresh)]
+        missing = [k for k in missing if not k.startswith(fresh)]
+        print(f"--init-new-ok: {len(kept)} keys of new modules start fresh: {sorted({k.split('.')[0] + '.' + k.split('.')[1] for k in kept})}", flush=True)
     if missing or unexpected:
         raise RuntimeError(f"--init mismatch: missing={missing[:8]} unexpected={unexpected[:8]}")
     return int(ck.get("step", -1))
@@ -281,10 +358,11 @@ def load_ckpt(path: str, model, opt, sched, lr: Optional[float] = None, plat: Op
     opt.load_state_dict(ck["optim"])
     sched.load_state_dict(ck["sched"])
     if lr is not None:                          # --lr wins over the checkpoint's peak lr (schedule follows --steps)
-        sched.base_lrs = [lr] * len(opt.param_groups)
-        for g, f in zip(opt.param_groups, sched.lr_lambdas):
-            g["initial_lr"] = lr
-            g["lr"] = lr * f(sched.last_epoch)
+        sched.base_lrs = [lr * g.get("lr_scale", 1.0) for g in opt.param_groups]
+        for g, f, b in zip(opt.param_groups, sched.lr_lambdas, sched.base_lrs):
+            g["initial_lr"] = b
+            g["lr"] = b * f(sched.last_epoch)
+    load_ckpt.extra = {k: ck[k] for k in ("ema", "clip") if k in ck}
     return int(ck["step"])
 
 
@@ -552,13 +630,34 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
         resume = cand if os.path.exists(cand) else None
     elif args.resume and args.resume != "none":
         resume = args.resume
+    from mavt.muon import MedianClip
+    clip = MedianClip(args.clip_mult, args.clip_window, args.grad_clip if args.grad_clip > 0 else float("inf"))
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    ema = {n: p.detach().clone() for n, p in trainable} if args.ema > 0 else None
     if resume:
+        load_ckpt.extra = {}
         step = load_ckpt(resume, model, opt, sched, lr=args.lr, plat=plat)
         set_fused(opt, fused)
+        if ema is not None and "ema" in load_ckpt.extra:
+            ema = {k: v.to(dev) for k, v in load_ckpt.extra["ema"].items()}
+        if "clip" in load_ckpt.extra:
+            clip.load_state_dict(load_ckpt.extra["clip"])
         log(f"resumed from {resume} at step {step}")
     elif args.init:
-        step0 = init_weights(args.init, model)
+        step0 = init_weights(args.init, model, new_ok=args.init_new_ok)
         log(f"initialised from {args.init} (step {step0}); optimizer and schedule start fresh")
+        if ema is not None:
+            ema = {n: p.detach().clone() for n, p in trainable}
+    kind_of = {}                                               # --optimizer muon: grad norm per parameter kind
+    if args.optimizer == "muon":
+        kind_of = {n: g["kind"] for g, names in zip(opt.param_groups, opt.param_names) for n in names}
+        table = param_group_table([dict(g, names=names) for g, names in zip(opt.param_groups, opt.param_names)])
+        if rank == 0:
+            with open(os.path.join(args.out, "param_groups.txt"), "w") as f:
+                f.write(table)
+            log("parameter groups (full list in param_groups.txt):\n" +
+                "\n".join(l for l in table.splitlines() if l.startswith("##")))
+    extra = lambda: dict(**({"ema": ema} if ema is not None else {}), clip=clip.state_dict())
     use_amp = args.bf16 and dev.type == "cuda"
     mixed = args.mix_modalities
 
@@ -655,7 +754,7 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
             return next(its[m])
         except Exception:
             if stop["flag"] and rank == 0:                      # loader torn down by the signal
-                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
+                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat, extra())
                 print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
             raise
 
@@ -671,21 +770,39 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
                 inputs, n_clips = (x, modality, cam), x.shape[0]
             sync = micro == args.grad_accum - 1
             ctx = ddp.no_sync() if (is_dist() and not sync) else _null()
+            if hasattr(model, "set_step"):                      # grain_prior 1.2: loss ramps read the global step
+                model.set_step(step)
+            if hasattr(model, "set_diag"):                      # grain_prior 3.1: read diagnostics on log steps only
+                model.set_diag(log_due(step + 1, args.log_every, args.steps))
             with ctx:
                 with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=use_amp):
                     out = ddp(*inputs)
                 (out["loss"] / args.grad_accum).backward()
             clips_since += n_clips
-        gnorm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
-                                               args.grad_clip if args.grad_clip > 0 else float("inf"))
+        gn_kind = {}
+        if kind_of and (step + 1) % args.log_every == 0:          # before clipping, per optimizer kind
+            sq = {}
+            for n, p in trainable:
+                if p.grad is not None:
+                    k = kind_of[n]
+                    sq[k] = sq.get(k, 0.0) + p.grad.detach().float().pow(2).sum()
+            gn_kind = {f"gn_{k}": float(v.sqrt()) for k, v in sq.items()}
+        thr = clip.threshold() if args.clip_mode == "median" else (args.grad_clip if args.grad_clip > 0 else float("inf"))
+        gnorm = torch.nn.utils.clip_grad_norm_([p for _, p in trainable], thr)
         finite = bool(torch.isfinite(gnorm)) and not (getattr(args, "skip_gn", 0) > 0 and float(gnorm) > args.skip_gn)
+        if finite:
+            clip.update(float(gnorm))
         if finite:                                              # grads are all-reduced: same on all ranks
             opt.step()
+            if ema is not None:
+                with torch.no_grad():
+                    for n, p in trainable:
+                        ema[n].lerp_(p.detach(), 1 - args.ema)
         sched.step()
         step += 1
         steps_since += 1
 
-        if step % args.log_every == 0 or step == args.steps:
+        if log_due(step, args.log_every, args.steps):
             # one modality: loss_<k>, diag_<k>; mixed: keys already carry the modality (image/loss_rgb, ...)
             pl, pd = ("", "") if mixed else ("loss_", "diag_")
             named = ([(pl + k, out["parts"][k]) for k in sorted(out["parts"])]
@@ -693,7 +810,8 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
             vec = all_mean(torch.stack([out["loss"].detach().float()] + [v.float() for _, v in named])).tolist()
             dt = time.time() - t_last
             rec = dict(step=step, modality=modality, loss=vec[0], **{k: v for (k, _), v in zip(named, vec[1:])},
-                       grad_norm=float(gnorm), skipped=not finite, lr=sched.get_last_lr()[0],
+                       grad_norm=float(gnorm), skipped=not finite, lr=sched.get_last_lr()[0], **gn_kind,
+                       clip_threshold=float(thr), clip_frac=clip.frac(),
                        it_s=steps_since / dt, clips_s=clips_since * world / dt, time=time.time())
             if dev.type == "cuda":
                 rec["peak_mem_gb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 30
@@ -719,21 +837,21 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
                 plat["prev"], plat["acc"], plat["n"] = cur, 0.0, 0
             if plat["decay_start"] >= 0 and step >= plat["decay_start"] + args.decay_steps:
                 if rank == 0:
-                    save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
+                    save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat, extra())
                 log(f"step {step}: decay done, converged")
                 break
 
         if rank == 0 and (step % args.ckpt_every == 0 or step == args.steps):
-            save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
+            save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat, extra())
             if step % (args.ckpt_every * 5) == 0:
-                save_ckpt(os.path.join(args.out, f"step_{step:07d}.pt"), model, opt, sched, step, cfg, args, plat)
+                save_ckpt(os.path.join(args.out, f"step_{step:07d}.pt"), model, opt, sched, step, cfg, args, plat, extra())
 
         flag = torch.tensor([float(stop["flag"])], device=dev)
         if is_dist():
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item() > 0:
             if rank == 0:
-                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat)
+                save_ckpt(os.path.join(args.out, "last.pt"), model, opt, sched, step, cfg, args, plat, extra())
                 print(f"signal received: saved last.pt at step {step}, exiting", flush=True)
             break
 

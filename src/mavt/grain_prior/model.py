@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Optional
 
 import math
+import re
 import dataclasses
 
 import torch
@@ -27,14 +28,14 @@ from ..cd32.depth import cell_log_inv_depth
 from ..cd32.losses import psnr
 from . import geometry as g
 from . import schema as sc
-from .anchor import AnchorHeads, Stems, StreamC
+from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import feat_loss, huber_log_depth, pose_loss, sample_cells
+from .losses import PatchDisc, band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
-from .readout import Readout, RGBHead, pool_geom, projected_radius
+from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
 from .refinement import CorrRead, UpdateHead
 from .trunk import Bank, PInit, StreamD
 
@@ -82,9 +83,12 @@ class MAVTGrainPrior(nn.Module):
         self.appear = Appearance(cfg)
         # shared readouts own their reader (query_decoder); a second, unused Readout would stall DDP
         self.readout = Readout(cfg, Dt) if cfg.readout_version == "legacy" else None
-        self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt)
+        self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt, feat_dim=Dt)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
+        if cfg.sem_target:                                            # 2.5: head on c_0; the teacher is not a module
+            self.sem_head = SemanticHead(cfg)
+            self.set_sem_teacher(semantic_teacher(cfg.sem_target, cfg.sem_dim))
         if cfg.readout_version != "legacy":
             from .shared import SharedQueryDecoder
             self.query_decoder = SharedQueryDecoder(cfg, Dt)
@@ -93,12 +97,19 @@ class MAVTGrainPrior(nn.Module):
             from ..dino_v0.losses import LPIPSLoss, ignore_lpips_keys
             self.lpips = LPIPSLoss()
             self.register_load_state_dict_post_hook(ignore_lpips_keys)
+        if cfg.w_gan > 0:                                             # decoder fine-tuning for FID
+            self.disc = PatchDisc(cfg.disc_channels, cfg.disc_layers)
         for n, p in self.named_parameters():                          # T1 / T2: the prior waits; T3: only it
             if n.startswith("prior."):
                 p.requires_grad_(cfg.phase == "prior")
             elif cfg.phase == "prior":
                 p.requires_grad_(False)
+        if cfg.train_scope == "decoder":                              # frozen encoder: the decoder and D train
+            for n, p in self.named_parameters():
+                if not n.startswith(("readout.", "rgb.", "disc.")):
+                    p.requires_grad_(False)
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
+        self.global_step = 0                                          # 1.2: set by forward(step=) / set_step
         if cfg.query_grid:
             self.register_buffer("uq_rgb", g.cell_centres(cfg.query_grid), persistent=False)
 
@@ -202,9 +213,13 @@ class MAVTGrainPrior(nn.Module):
 
     def decode_obs(self, S: dict, der: dict, z: torch.Tensor, xi: torch.Tensor, kappa: torch.Tensor,
                    M: torch.Tensor, r: Optional[torch.Tensor] = None, L: Optional[torch.Tensor] = None,
-                   R_t: Optional[tuple] = None, rgb: bool = True) -> dict:
+                   R_t: Optional[tuple] = None, rgb: bool = True, grain_keep: Optional[torch.Tensor] = None,
+                   prev: Optional[dict] = None) -> dict:
         """Observation with record (xi, kappa, M[, r, L]) and memory z -> dict(base, F_hat, ...). With
-        cfg.query_grid (and rgb), a second read on that grid gives the RGB state H_hat (a_rgb, pe_rgb)."""
+        cfg.query_grid (and rgb), a second read on that grid gives the RGB state H_hat (a_rgb, pe_rgb).
+        grain_keep [B, G] bool (evaluation only): grains read as if invalid where False.
+        prev (1.5, read_prev_frame): dict(F, u, valid) of the previously decoded observation (`_prev_of`); its
+        read joins a (and a_rgb) before the innovation, F_base = W_out a; static views ignore it."""
         cfg = self.cfg
         R, t = g.se3_exp(xi) if R_t is None else R_t
         f_t = self.appear(S["f"].float(), S["u"], z, S["c0"]) if cfg.memory else S["f"].float()
@@ -214,29 +229,172 @@ class MAVTGrainPrior(nn.Module):
         if cfg.read_radius_scale:                 # radius on this observation's image (1 at the anchor)
             sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa, cfg.read_radius_clip)
         grains = (f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"], S["c0"], z, pg)
-        out = self.readout.base(*grains)
+        out = self.readout.base(*grains, grain_keep=grain_keep)
         out["tr"] = tr
+        use_prev = cfg.read_prev_frame and prev is not None
+        if use_prev:
+            out["a"] = self._add_prev(out["a"], self.uq.expand(f_t.shape[0], -1, -1), prev, tr, sigma, S)
+            out["F_base"] = self.readout.w_out(out["a"]).float()
         out["F_hat"], out["H_hat"] = out["F_base"], out["a"]
         if r is not None:
             out["dF"], dH = self.readout.innovation(out["a"], out["pe"], r, L, return_hidden=True)
             out["F_hat"], out["H_hat"] = out["F_base"] + out["dF"], out["a"] + dH
         if cfg.query_grid and rgb:
-            fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1))
+            fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
+                                     grain_keep=grain_keep)
             out["a_rgb"], out["pe_rgb"] = fine["a"], fine["pe"]
+            if use_prev:
+                out["a_rgb"] = self._add_prev(fine["a"], self.uq_rgb.expand(f_t.shape[0], -1, -1), prev, tr, sigma, S)
             out["H_hat"] = self._rgb_state(out, r, L)
         return out
 
-    def _rgb_state(self, out: dict, r: Optional[torch.Tensor], L: Optional[torch.Tensor]) -> torch.Tensor:
-        """Decoder state on the query_grid read, plus its innovation increment when r is given."""
+    def _add_prev(self, a, uq, prev, tr, sigma, S) -> torch.Tensor:
+        """1.5: a + PrevRead(sg[F^_{t-1}]) on video / world observations (0 on static views)."""
+        moving = (S["h"][:, sc.H_MODE] != M_STATIC).view(-1, 1, 1)
+        p = self.readout.prev_read(prev["F"], uq, tr["u"], prev["u"], tr["valid"], prev["valid"], sigma)
+        return a + p.to(a.dtype) * moving.to(a.dtype)
+
+    @staticmethod
+    def _prev_of(o: dict) -> dict:
+        """1.5: what the next observation reads of this decoded one (decoded feature, grain projections)."""
+        return dict(F=o["F_hat"], u=o["tr"]["u"], valid=o["tr"]["valid"])
+
+    def _rgb_state(self, out: dict, r: Optional[torch.Tensor], L: Optional[torch.Tensor], sg=None) -> torch.Tensor:
+        """Decoder state on the query_grid read, plus its innovation increment when r is given. sg (1.1): a
+        per-sample stop-gradient applied to the read state before the increment and as its query."""
         a = out["a_rgb"]
         if r is None:
             return a
+        if sg is not None:
+            a = sg(a)
         uq = self.uq_rgb.expand(a.shape[0], -1, -1)
         return a + self.readout.innovation(a, out["pe_rgb"], r, L, return_hidden=True, uq=uq)[1]
 
-    def rgb_of(self, F: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
-        """RGB in [0, 1] of one observation: from the DINO-space feature F or the decoder state H (cfg.rgb_from)."""
-        return self.rgb(H if self.cfg.rgb_from == "hidden" else F)
+    def _sg_where_L(self, L: torch.Tensor):
+        """1.1: stop-gradient on the prediction branch of the samples with L_b > 0 (identity at L_b = 0)."""
+        on = (L > 0).view(-1, 1, 1)
+        return lambda x: torch.where(on, x.detach(), x)
+
+    def rgb_of(self, F: torch.Tensor, H: torch.Tensor, a0: Optional[torch.Tensor] = None,
+               low: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """RGB in [0, 1] of one observation: from the DINO-space feature F or the decoder state H (cfg.rgb_from).
+        rgb_coarse_start (2.3): X^ = clamp(sg[X~0] + R) with X~0 = low (or low_image(a0)); rgb_in_feat (3.3): the
+        head also receives sg[F] upsampled to its grid."""
+        cfg = self.cfg
+        if cfg.rgb_coarse_start and low is None:
+            if a0 is None:
+                raise ValueError("rgb_coarse_start needs a0 or low")
+            low = self.rgb.low_image(a0)
+        return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None)
+
+    # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
+    _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
+                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx"}
+
+    def new_param_prefixes(self) -> tuple:
+        """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):
+        `--init-new-ok` lets them keep their fresh init when warm-starting from a checkpoint trained without them.
+        dino_multi_layer also widens anchor.src_type, which no warm start can fill (load_state_dict raises)."""
+        cfg = self.cfg
+        out = []
+        for k in self.state_dict():
+            seg = k.split(".")
+            new = bool(self._NEW_SEGMENTS & set(seg[:-1] + [seg[-1]]))
+            new |= cfg.rgb_coarse_start and k.startswith("rgb.low.")
+            new |= cfg.dino_multi_layer and (k.startswith("anchor.src.3.") or
+                                             (k.startswith("stream_c.blocks.") and ".ca.1." in k))
+            new |= (cfg.read_coarse_kv and cfg.coarse_sink and not cfg.read_sink and seg[0] == "readout"
+                    and seg[-1] == "sink")
+            if new:
+                out.append(k)
+        return tuple(out)
+
+    # Muon / AdamW split (--optimizer muon): hidden matrices of the blocks and the reads go to Muon; inputs, output
+    # heads, stems and the RGB convs to AdamW (io); 1-D and scalars to AdamW without decay, attention scalars at 0.1 lr
+    _MUON = re.compile(r"(^|\.)blocks\.\d+\.(ca\.\d+\.(q|kv|out)|sa\.(qkv|out)|mlp\.\d+)\.weight$"
+                       r"|^(stream_d\.read|appear\.ca|readout\.r_ca)\.(q|kv|out)\.weight$"
+                       r"|^corr\.w[qkvo]\.weight$"
+                       r"|^readout\.(layers\.\d+|last_x)\.(wq|wpe|wk|wv|wo|wk_c|wv_c|wv_rel|ref\.\d+)\.weight$"
+                       r"|^readout\.(f_q|mlp_a)\.\d+\.weight$|^readout\.prev_read\.mix\.weight$"
+                       r"|^rgb\.pw\.blocks\.\d+\.fc[12]\.weight$|^rgb\.ctx\.\d+\.fc[12]\.weight$")
+    _ATTN_SCALARS = ("temperature", "sink", "tau_c", "beta_c", "alpha_raw")
+
+    def optim_groups(self) -> list:
+        """One row per trainable parameter: dict(name, param, kind = muon | io | scalar | attn_scalar, splits,
+        lr_scale). splits: blocks of a fused weight that Muon orthogonalises separately (qkv 3, kv 2, wv_rel R)."""
+        rows = []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            leaf = n.rsplit(".", 1)[-1]
+            splits, lr_scale = 1, 1.0
+            if leaf in self._ATTN_SCALARS:
+                kind, lr_scale = "attn_scalar", 0.1
+            elif p.ndim < 2:
+                kind = "scalar"
+            elif self._MUON.search(n) and (p.ndim == 2 or p.shape[2:].numel() == 1):
+                kind = "muon"
+                splits = (3 if n.endswith("qkv.weight") else 2 if n.endswith(".kv.weight")
+                          else self.cfg.relpos_rank if n.endswith("wv_rel.weight") else 1)
+            else:
+                kind = "io"
+            rows.append(dict(name=n, param=p, kind=kind, splits=splits, lr_scale=lr_scale))
+        return rows
+
+    def set_sem_teacher(self, fn) -> None:
+        """2.5: frames [B, 3, H, W] in [-1, 1] -> [B, sem_dim], run under no_grad in training only. Stored outside
+        the module tree, so a teacher network stays out of state_dict, DDP and the optimizer."""
+        object.__setattr__(self, "sem_teacher", fn)
+
+    def _sem(self, S: dict, frames0: torch.Tensor, parts: dict) -> torch.Tensor:
+        """2.5: w_sem (1 - cos(SemHead(c_0), teacher(X_0))) on the anchor."""
+        cfg = self.cfg
+        teacher = getattr(self, "sem_teacher", None)
+        if teacher is None:
+            raise NotImplementedError(f"sem_target={cfg.sem_target!r} needs its weights: call "
+                                      "model.set_sem_teacher(fn), fn(frames in [-1, 1]) -> [B, sem_dim]")
+        with torch.no_grad():
+            tgt = teacher(frames0)
+        ls = sem_loss(self.sem_head(S["c0"]), tgt)
+        parts["sem"] = ls.detach()
+        return cfg.w_sem * ls
+
+    def set_step(self, step: int) -> None:
+        """1.2: the trainer's global step (loss ramps); 2.4: the entmax alpha anneal of every read layer."""
+        self.global_step = int(step)
+        for mod in self.modules():
+            if isinstance(mod, ReadLayer):
+                mod.step = int(step)
+
+    def set_diag(self, on: bool) -> None:
+        """3.1: compute the read diagnostics (shares, effective support, error bands) only when on; the trainer
+        turns them on for the steps it logs. Losses and the other diagnostics do not depend on it."""
+        self.diag_read = bool(on)
+        for mod in self.modules():
+            if isinstance(mod, Readout):
+                mod.diag_on = self.diag_read
+
+    def w_geom_eff(self) -> float:
+        """1.2: w_geom x min(1, step / w_geom_ramp_steps) (w_geom when the ramp is off)."""
+        cfg = self.cfg
+        if cfg.w_geom_ramp_steps > 0:
+            return cfg.w_geom * min(1.0, self.global_step / cfg.w_geom_ramp_steps)
+        return cfg.w_geom
+
+    def _state_noise(self, S: dict) -> dict:
+        """3.5 (training only): f and c_0 + U(-D/2, D/2) with D = (max - min over the batch, per channel) / 2^bits;
+        u + N(0, (geom_noise_px / image_size)^2), clamped to [0, 1]. The ledger is unchanged."""
+        cfg = self.cfg
+        if cfg.state_noise_bits > 0:
+            for k in ("f", "c0"):
+                x = S[k].float()
+                with torch.no_grad():
+                    D = (x.amax(dim=(0, 1), keepdim=True) - x.amin(dim=(0, 1), keepdim=True)) / 2 ** cfg.state_noise_bits
+                S[k] = x + (torch.rand_like(x) - 0.5) * D
+            S["zb"] = S["c0"]
+        if cfg.geom_noise_px > 0:
+            S["u"] = (S["u"] + torch.randn_like(S["u"]) * (cfg.geom_noise_px / cfg.image_size)).clamp(0, 1)
+        return S
 
     def decode_anchor(self, S: dict, der: dict) -> dict:
         B = S["c0"].shape[0]
@@ -253,19 +411,23 @@ class MAVTGrainPrior(nn.Module):
         der = self.derived(S)
         outs = [self.decode_anchor(S, der)]
         for rec, z in zip(S["recs"], self.replay(S)):
-            outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"]))
+            # 1.5: the previous decoded observation in the queue (the anchor for the first record: the encoder
+            # read the same one as long as no record was folded into z_b)
+            prev = self._prev_of(outs[-1]) if self.cfg.read_prev_frame else None
+            outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"], prev=prev))
         Fh = torch.stack([o["F_hat"] for o in outs], 1)
         Hh = torch.stack([o["H_hat"] for o in outs], 1)
-        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1)).view(Fh.shape[0], Fh.shape[1], 3, self.cfg.image_size,
-                                                                   self.cfg.image_size)
+        A0 = torch.stack([o["a0"] for o in outs], 1)
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), A0.flatten(0, 1)).view(
+            Fh.shape[0], Fh.shape[1], 3, self.cfg.image_size, self.cfg.image_size)
         return dict(F=Fh, rgb=rgb * 2 - 1, depth=torch.stack([o["depth_dense"] for o in outs], 1))
 
     # ============================================================================== encoder
     def encode_anchor(self, st: dict, mode: torch.Tensor, known: torch.Tensor, metric: torch.Tensor,
                       kappa_cam: Optional[torch.Tensor]) -> tuple:
         cfg = self.cfg
-        Hc = self.stream_c(st["Y"], st["g"])
-        A = self.anchor(Hc, st["F"], st["P"])
+        Hc = self.stream_c(st["Y"], st["g"], st.get("F_mid"))
+        A = self.anchor(Hc, st["F"], st["P"], st.get("F_mid"))
         B = Hc.shape[0]
         kappa0 = g.kappa_from_logits(A["kappa_logits"], cfg)
         if cfg.image_fov_fixed:
@@ -281,9 +443,11 @@ class MAVTGrainPrior(nn.Module):
         return S, A
 
     def encode_target(self, S: dict, der: dict, st: dict, Xi: torch.Tensor, t_i: torch.Tensor, z_prev: torch.Tensor,
-                      static: torch.Tensor, known: torch.Tensor, cam_i: Optional[tuple], L: torch.Tensor) -> dict:
+                      static: torch.Tensor, known: torch.Tensor, cam_i: Optional[tuple], L: torch.Tensor,
+                      prev_obs: Optional[dict] = None) -> dict:
         """Posterior coding of observation i from S_{i-1}. st: stems of observation i (F, P, Y, g); Xi in [0, 1];
-        cam_i (xi, kappa) given cameras (used where known); static [B] bool; L [B] prefix length."""
+        cam_i (xi, kappa) given cameras (used where known); static [B] bool; L [B] prefix length; prev_obs (1.5) the
+        decoded observation i - 1 (`_prev_of`)."""
         cfg = self.cfg
         B = Xi.shape[0]
         dev = Xi.device
@@ -359,15 +523,20 @@ class MAVTGrainPrior(nn.Module):
             xi = torch.where(known.view(B, 1), cam_i[0].float(), xi)
         kappa = kappa_of(zeta)
         z_i = mem(b)
-        base = self.decode_obs(S, der, z_i, xi, kappa, M)
-        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"])
+        base = self.decode_obs(S, der, z_i, xi, kappa, M, prev=prev_obs)
+        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"])
         eF = st["F"] - base["F_base"].detach()
         eX = Xi - X_base.detach()
         r = self.innov(eF, eX, z_i, xi, kappa, M)
         keep = (torch.arange(cfg.n_slots, device=dev).view(1, -1) < L.view(-1, 1)).float().unsqueeze(-1)
         r = r * keep
-        dF, dH = self.readout.innovation(base["a"], base["pe"], r, L, return_hidden=True)
-        F_hat, H_hat = base["F_base"] + dF, (self._rgb_state(base, r, L) if cfg.query_grid else base["a"] + dH)
+        # 1.1: F^ = sg[F_base] + dF, H^ = sg[a] + dH on the samples with L_b > 0 (the innovation query reads sg[a]
+        # too, so L_rec reaches the prediction branch only through L_base / L_init there); identity at L_b = 0
+        sg = self._sg_where_L(L) if cfg.innov_stopgrad_base else (lambda x: x)
+        a_in, F_b = sg(base["a"]), sg(base["F_base"])
+        dF, dH = self.readout.innovation(a_in, base["pe"], r, L, return_hidden=True)
+        F_hat = F_b + dF
+        H_hat = self._rgb_state(base, r, L, sg if cfg.innov_stopgrad_base else None) if cfg.query_grid else a_in + dH
         rec = dict(xi=xi, M=M, kappa=kappa, b=b, r=r, L=L)
         return dict(rec=rec, z=z_i, base=base, X_base=X_base, F_hat=F_hat, H_hat=H_hat, passes=passes,
                     est0=(xi0, est["M"]))
@@ -407,6 +576,8 @@ class MAVTGrainPrior(nn.Module):
             Tr = g.relative_pose(cam["c2w"])                                                # [B, n, 4, 4]
             xi_cam = g.se3_log(Tr[..., :3, :3], Tr[..., :3, 3])
         S, A = self.encode_anchor(st[0], mode, known, metric, None if kappa_cam is None else kappa_cam[:, 0])
+        if self.training and (cfg.state_noise_bits > 0 or cfg.geom_noise_px > 0):
+            S = self._state_noise(S)                                  # 3.5
         der = self.derived(S)
         # ---- gauge of the labels: metric where known, else the anchor's median GT depth
         lid = lmask = None
@@ -426,11 +597,14 @@ class MAVTGrainPrior(nn.Module):
         Hh = [out0["H_hat"]]
         z_cur = S["c0"].float()
         tg = []
+        prev = self._prev_of(out0) if cfg.read_prev_frame else None
         for i in range(1, n):
             t_i = torch.full((B,), 0.0 if kind == "static" else i * cfg.frame_seconds, device=dev)
             L = L_given[:, i - 1].to(dev).long() if L_given is not None else self.sample_L(B, dev)
             cam_i = None if cam is None else (xi_cam[:, i], kappa_cam[:, i])
-            o = self.encode_target(S, der, st[i], X01[:, i], t_i, z_cur, static, known, cam_i, L)
+            o = self.encode_target(S, der, st[i], X01[:, i], t_i, z_cur, static, known, cam_i, L, prev)
+            if cfg.read_prev_frame:
+                prev = dict(F=o["F_hat"], u=o["base"]["tr"]["u"], valid=o["base"]["tr"]["valid"])
             o["rec"]["view"] = torch.full((B,), float(i), device=dev)
             self.append_and_fold(S, o["rec"], t_i)
             z_cur = torch.where(static.view(B, 1, 1), z_cur, o["z"])
@@ -442,10 +616,21 @@ class MAVTGrainPrior(nn.Module):
             outs.append(o["base"])
             tg.append(o)
         Fh, Hh = torch.stack(Fh, 1), torch.stack(Hh, 1)
-        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1)).view(B, n, 3, S_img, S_img)
+        low = None
+        if cfg.rgb_coarse_start:                                      # 2.3: X~0 of every observation, own loss
+            low = self.rgb.low_image(torch.stack([o["a0"] for o in outs], 1).flatten(0, 1))
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), low=low).view(B, n, 3, S_img, S_img)
         Ft = torch.stack([s["F"] for s in st], 1)
         # ---- L_rec on every observation (full), base and initializer on the targets, init also on the anchor
         loss = self._rec(rgb, X01, Fh, Ft, parts, diag, "rec")
+        if cfg.rgb_coarse_start:
+            tgt = pyramid_target(X01.flatten(0, 1), self.rgb.n_pyr)
+            l_low = (low.float() - tgt).abs().mean()
+            parts["rgb_coarse"] = l_low.detach()
+            loss = loss + cfg.w_rgb_coarse * l_low
+            with torch.no_grad():
+                diag["psnr_coarse_rgb"] = psnr(low.float() * 2 - 1, frames.flatten(0, 1))
+                diag["psnr_coarse_vs_blur"] = psnr(low.float() * 2 - 1, tgt * 2 - 1)
         lf_init = feat_loss(torch.stack(Fi, 1), Ft, cfg.w_logn)
         parts["init_feat"] = lf_init.detach()
         loss = loss + cfg.w_init * lf_init
@@ -453,6 +638,10 @@ class MAVTGrainPrior(nn.Module):
             Xb = torch.stack(Xb_list, 1)
             lb = self._rec(Xb, X01[:, 1:], torch.stack(Fb, 1), Ft[:, 1:], parts, diag, "base", lpips=False)
             loss = loss + cfg.w_base * lb
+            if cfg.w_pred_frame > 0:                                  # 1.5: L_pred on the prediction branch
+                lpred = feat_loss(torch.stack(Fb, 1), Ft[:, 1:], cfg.w_logn)
+                parts["pred_feat"] = lpred.detach()
+                loss = loss + cfg.w_pred_frame * lpred
             Ms = torch.stack([o["rec"]["M"] for o in tg], 1)
             lm = (Ms ** 2).sum(-1).mean()
             parts["motion"] = lm.detach()
@@ -463,12 +652,14 @@ class MAVTGrainPrior(nn.Module):
         lc = torch.stack(code).mean()
         parts["code"] = lc.detach()
         loss = loss + cfg.w_code * lc
+        if self.training and cfg.w_sem > 0:                            # 2.5
+            loss = loss + self._sem(S, frames[:, 0], parts)
         # ---- geometry labels
         if lid is not None:
             loss = loss + self._geom(S, der, outs, lid, lmask, s_scene, parts, diag)
         if cam is not None and n > 1 and kind == "world":
             loss = loss + self._pose(tg, xi_cam, known, s_scene, parts, diag)
-        self._diag(S, der, A, tg, rgb, frames, X01, Ft, Xb_list, diag, kind)
+        self._diag(S, der, A, tg, rgb, frames, X01, Ft, Xb_list, diag, kind, outs)
         return loss, dict(S=S, rgb=rgb * 2 - 1, F_hat=Fh, F=Ft)
 
     def _rec(self, rgb, X01, Fh, Ft, parts, diag, name, lpips=True) -> torch.Tensor:
@@ -486,31 +677,69 @@ class MAVTGrainPrior(nn.Module):
             lp = self.lpips(a * 2 - 1, b * 2 - 1)
             parts["lpips"] = lp.detach()
             loss = loss + cfg.w_lpips * lp
+        if lpips and cfg.w_gan > 0 and self.training:
+            loss = loss + self._gan(rgb, X01, parts)
         return loss
 
+    def _gan_terms(self, fake: torch.Tensor, real: torch.Tensor) -> tuple:
+        """Hinge GAN terms on images in [-1, 1]: g = -mean D(fake) through D with detached parameters (gradient to
+        the decoder only); d = (relu(1 - D(real)) + relu(1 + D(sg[fake]))) / 2 (gradient to D only). Both enter one
+        backward."""
+        frozen = {k: v.detach() for k, v in self.disc.named_parameters()}
+        g = -torch.func.functional_call(self.disc, frozen, (fake,)).float().mean()
+        d = 0.5 * (F.relu(1 - self.disc(real).float()).mean() + F.relu(1 + self.disc(fake.detach()).float()).mean())
+        return g, d
+
+    def gan_weight(self) -> float:
+        cfg = self.cfg
+        return cfg.w_gan if self.global_step >= cfg.gan_start else 0.0
+
+    def _gan(self, rgb: torch.Tensor, X01: torch.Tensor, parts: dict) -> torch.Tensor:
+        """Adversarial loss on the decoded frames (a random subset of lpips_max_frames, as LPIPS)."""
+        a, b = rgb.flatten(0, 1) * 2 - 1, X01.flatten(0, 1) * 2 - 1
+        k = self.cfg.lpips_max_frames
+        if 0 < k < a.shape[0]:
+            sel = torch.randperm(a.shape[0], device=a.device)[:k]
+            a, b = a[sel], b[sel]
+        g, d = self._gan_terms(a, b.to(a.dtype))
+        w = self.gan_weight()
+        parts["gan_g"], parts["gan_d"] = g.detach(), d.detach()
+        parts["gan_w"] = torch.tensor(float(w), device=a.device)
+        return w * g + d
+
     def _geom(self, S, der, outs, lid, lmask, s_scene, parts, diag) -> torch.Tensor:
-        """Huber log-depth of the anchor grains and of the grain / dense depth readouts on every observation."""
+        """Huber log-depth of the anchor grains and of the grain / dense depth readouts on every observation.
+        1.2: L_geom = (anchor + sum_j grain_j + w_geom_dense sum_j dense_j) / (1 + n + w_geom_dense n), weighted by
+        w_geom_eff() (ramp); w_geom_dense = 1 is the original plain mean."""
         cfg = self.cfg
         B = lid.shape[0]
         gt = torch.exp(-lid) / s_scene.view(B, 1, 1)                                   # [B, n, N] in the gauge
         gk = sample_cells(lid[:, 0], S["u"], cfg.grid)
         mk = sample_cells(lmask[:, 0].float(), S["u"], cfg.grid) > 0.99
-        terms = [huber_log_depth(der["d"], torch.exp(-gk) / s_scene.view(B, 1), mk, cfg.depth_delta)]
-        grain_v1, grain_v2 = [], []
+        anchor = huber_log_depth(der["d"], torch.exp(-gk) / s_scene.view(B, 1), mk, cfg.depth_delta)
+        grain_v1, grain_v2, grain, dense = [], [], [], []
         for j, o in enumerate(outs):
             grain_v1.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j] & o.get("support_v1", o["support"]), cfg.depth_delta))
             grain_v2.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j], cfg.depth_delta))
-            terms.append((grain_v1 if cfg.measurement_version == 1 else grain_v2)[-1])
-            terms.append(huber_log_depth(o["depth_dense"], gt[:, j], lmask[:, j], cfg.depth_delta))
-        lg = torch.stack(terms).mean()
+            grain.append((grain_v1 if cfg.measurement_version == 1 else grain_v2)[-1])
+            dense.append(huber_log_depth(o["depth_dense"], gt[:, j], lmask[:, j], cfg.depth_delta))
+        wd = cfg.w_geom_dense
+        if wd == 1.0:
+            terms = [anchor] + [t for pair in zip(grain, dense) for t in pair]
+            lg = torch.stack(terms).mean()
+        else:
+            n = len(outs)
+            lg = (anchor + torch.stack(grain).sum() + wd * torch.stack(dense).sum()) / (1 + n + wd * n)
         parts["geom"] = lg.detach()
+        w = self.w_geom_eff()
         with torch.no_grad():
             diag["rho_gt_corr"] = _pearson(S["rho"].float(), gk, mk).mean()
-            diag["depth_grain_err"] = torch.stack(terms[1::2]).mean()
+            diag["depth_grain_err"] = torch.stack(grain).mean()
             diag["depth_grain_err_v1"] = torch.stack(grain_v1).mean()
             diag["depth_grain_err_v2"] = torch.stack(grain_v2).mean()
-            diag["depth_dense_err"] = torch.stack(terms[2::2]).mean()
-        return cfg.w_geom * lg
+            diag["depth_dense_err"] = torch.stack(dense).mean()
+            diag["w_geom_eff"] = torch.tensor(float(w))
+        return w * lg
 
     def _pose(self, tg, xi_cam, known, s_scene, parts, diag) -> torch.Tensor:
         """Estimated cameras of world clips against the given ones (the decoder never sees the latter)."""
@@ -532,7 +761,33 @@ class MAVTGrainPrior(nn.Module):
         return cfg.w_pose * lp
 
     @torch.no_grad()
-    def _diag(self, S, der, A, tg, rgb, frames, X01, Ft, Xb_list, diag, kind) -> None:
+    def _diag_read(self, outs, rgb, X01, Ft, diag) -> None:
+        """3.1: effective support 1 / sum a^2 (mean over queries), coarse / fine / sink shares, cos(F_init) over
+        every observation, error energy by frequency band (low < 1/32, mid, high >= 1/8 cycles / px) and the
+        Pearson correlation between the per-cell fine share and the local high-frequency energy of the image."""
+        cfg = self.cfg
+        ds = [o["diag"] for o in outs if o.get("diag") is not None]
+        if ds:
+            for k, name in (("eff_support_q", "eff_support"), ("fine_share_q", "fine_share"),
+                            ("coarse_share_q", "coarse_share"), ("sink_share_q", "sink_share")):
+                diag[name] = torch.stack([d[k].mean() for d in ds]).mean()
+        Fi = torch.stack([o["F_init"] for o in outs], 1)
+        diag["init_cos_all"] = F.cosine_similarity(Fi.float(), Ft.float(), -1).mean()
+        err = (rgb.float() - X01.float()).flatten(0, 1)                # [B n, 3, S, S]
+        diag["err_low_frac"], diag["err_mid_frac"], diag["err_high_frac"] = band_fractions(err)
+        if ds and "fine_share_q" in ds[0]:
+            X = X01.float().flatten(0, 1)
+            hf = (X - pyr_up(pyr_down(X, 1), 1)).pow(2).mean(1, keepdim=True)              # [B n, 1, S, S]
+            cell = F.adaptive_avg_pool2d(hf, cfg.grid).flatten(1)                           # [B n, Q]
+            fs = torch.stack([d["fine_share_q"] for d in ds], 1).flatten(0, 1) if len(ds) == rgb.shape[1] else None
+            if fs is not None and fs.shape == cell.shape:                                   # [B n, Q], b-major
+                m = torch.ones_like(cell, dtype=torch.bool)
+                diag["fine_share_hf_corr"] = _pearson(fs, cell, m).mean()
+                mass = torch.stack([d["grain_mass"] for d in ds], 1)                        # [B, n, G]
+                diag["grain_mass_min_frac"] = (mass.amin(-1) / mass.sum(-1).clamp_min(1e-12)).mean()
+
+    @torch.no_grad()
+    def _diag(self, S, der, A, tg, rgb, frames, X01, Ft, Xb_list, diag, kind, outs=()) -> None:
         cfg = self.cfg
         to11 = lambda x: x * 2 - 1
         diag["psnr"] = psnr(to11(rgb).flatten(0, 1), frames.flatten(0, 1))
@@ -542,6 +797,8 @@ class MAVTGrainPrior(nn.Module):
         diag["sigma_mean"] = S["sigma"].mean()
         if kind != "image":
             diag["rho_std"] = S["rho"].std(-1).mean()
+        if getattr(self, "diag_read", True):
+            self._diag_read(outs, rgb, X01, Ft, diag)                 # 3.1
         if not tg:
             return
         n = rgb.shape[1]
@@ -623,8 +880,11 @@ class MAVTGrainPrior(nn.Module):
 
     # ============================================================================== forward
     def forward(self, x: torch.Tensor, modality: str, cam: Optional[dict] = None,
-                L: Optional[torch.Tensor] = None, return_outputs: bool = False) -> dict:
-        """x in [-1, 1]; L (eval) innovation lengths [B, n - 1] or None."""
+                L: Optional[torch.Tensor] = None, return_outputs: bool = False,
+                step: Optional[int] = None) -> dict:
+        """x in [-1, 1]; L (eval) innovation lengths [B, n - 1] or None; step: trainer global step (1.2 ramps)."""
+        if step is not None:
+            self.set_step(step)
         if self.cfg.readout_version != "legacy":
             raise ValueError('shared query training uses pilot_step; legacy posterior/prior training is gated')
         if modality not in MODALITIES:

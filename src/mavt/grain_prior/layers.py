@@ -56,6 +56,51 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, bias: 
     return out.transpose(1, 2).reshape(B, nq, d)
 
 
+class _EntmaxBisect(torch.autograd.Function):
+    """alpha-entmax over the last axis by bisection on tau (Peters et al. 2019, entmax_bisect):
+    p = [(alpha - 1) x - tau]_+^(1 / (alpha - 1)), sum p = 1. Closed-form backward for x and alpha; -inf entries
+    get 0; alpha (> 1) broadcasts against x."""
+
+    @staticmethod
+    def forward(ctx, x, alpha, n_iter):
+        am1 = alpha - 1
+        X = x * am1
+        mx = X.max(-1, keepdim=True).values
+        tau_lo, tau_hi = mx - 1, mx - (1.0 / x.shape[-1]) ** am1
+        p = lambda tau: (X - tau).clamp_min(0) ** (1 / am1)
+        f_lo = p(tau_lo).sum(-1, keepdim=True) - 1
+        dm = tau_hi - tau_lo
+        for _ in range(n_iter):
+            dm = dm / 2
+            tau_m = tau_lo + dm
+            Y = p(tau_m)
+            tau_lo = torch.where((Y.sum(-1, keepdim=True) - 1) * f_lo >= 0, tau_m, tau_lo)
+        Y = Y / Y.sum(-1, keepdim=True)
+        ctx.save_for_backward(Y, alpha)
+        return Y
+
+    @staticmethod
+    def backward(ctx, dY):
+        Y, alpha = ctx.saved_tensors
+        pos = Y > 0
+        gppr = torch.where(pos, Y.clamp_min(1e-30) ** (2 - alpha), torch.zeros_like(Y))
+        dX = dY * gppr
+        dX = dX - gppr * dX.sum(-1, keepdim=True) / gppr.sum(-1, keepdim=True)
+        d_alpha = None
+        if ctx.needs_input_grad[1]:
+            S = torch.where(pos, Y * Y.clamp_min(1e-30).log(), torch.zeros_like(Y))
+            Ys = gppr / gppr.sum(-1, keepdim=True)
+            am1 = alpha - 1
+            d_alpha = (dY * (Y - Ys) / am1 ** 2 - dY * (S - Ys * S.sum(-1, keepdim=True)) / am1).sum(-1, keepdim=True)
+            d_alpha = d_alpha.sum_to_size(alpha.shape)
+        return dX, d_alpha, None
+
+
+def entmax_bisect(x: torch.Tensor, alpha: torch.Tensor, n_iter: int = 30) -> torch.Tensor:
+    """alpha-entmax over the last axis (alpha > 1, broadcastable to x[..., :1]); 2 = sparsemax, -> 1 softmax."""
+    return _EntmaxBisect.apply(x, alpha.to(x.dtype), n_iter)
+
+
 class CrossAttn(nn.Module):
     def __init__(self, dim: int, heads: int, d_kv: Optional[int] = None):
         super().__init__()

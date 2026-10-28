@@ -8,6 +8,18 @@ query type, with the same weights in encoder synthesis and in public decoding.
     B^geom  = log nu,  nu_qk ∝ exp(-|16 (u_q - u^_k)|^2 / (2 sigma_k^2)) exp(-d_k / tau_d) over grains in front
     dF      = 1[L > 0] f_out(CA(f_q[a^(2), PE(q)], Embed(r_i); B^r)),  B^r = -|16 (u_q - u_ij)|^2 / (2 sigma_ij^2)
     RGB     = sigmoid(conv(up x2 conv ... (W F)))  on the 16 x 16 x D_t feature grid
+
+2026-10 flags (config.py, all default off; see README "Flags 2026-10"):
+    read_coarse_kv   K = [K_fine ; K_coarse (16 slots of [c_0; z_i] + PE_slot, own LN / W_K / W_V) ; sink],
+                     logit_coarse = exp(tau_c) q.k_c / sqrt(d_h) + beta_c - proximity(u_q): the slots attract
+                     only where no grain covers the query (proximity ~ 0 under a grain, << 0 elsewhere).
+    read_relpos_value v_j(q) = W f_j + sum_{r<=R} phi_r(D_qj) taper(|D_qj|) W_r f_j, D_qj = grid (u_q - u^_j) / sigma_j,
+                     phi: R/2 Fourier directions x (sin, cos) at |omega| = pi/2, taper = Wendland C2 to 0 at 3 sigma.
+                     Low rank: R attention-weighted sums with weights a_qj phi_r(D_qj); nothing of size [B, Q, G, d].
+    rgb_coarse_start X~0 = pyr_up(sigmoid(RGBLow(a0))) from the cell grid; X^ = clamp(sg[X~0] + R(H)), R zero-init.
+    rgb_head=pointwise  1x1 MLP blocks (per-point LayerNorm) on the query grid, PixelShuffle x2 + conv3x3 stages,
+                     receptive field <= 16 px at the image (see PointwiseRGB).
+    read_split_layer2 the last ReadLayer exists twice: a_F (feature grid) and a_X (RGB grid, `branch="X"`).
 """
 from __future__ import annotations
 
@@ -18,10 +30,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from . import geometry as g
 from .config import GrainPriorConfig
-from .layers import CrossAttn, attend, mlp2
+from .layers import BIAS_FLOOR, CrossAttn, attend, entmax_bisect, mlp2
 
 N_POOLGEOM = 18
 
@@ -74,6 +87,57 @@ def geom_bias(u_q: torch.Tensor, u_hat: torch.Tensor, sigma: torch.Tensor, depth
                            torch.zeros_like(ln))
 
 
+def relpos_basis(u_q: torch.Tensor, u_hat: torch.Tensor, sigma: torch.Tensor, valid: torch.Tensor, grid: int,
+                 R: int) -> torch.Tensor:
+    """2.2: phi [B, Q, G, R] in fp32. D = grid (u_q - u^_j) / sigma_j (patches over radii); for k < R / 2 the
+    direction omega_k = (pi / 2) (cos pi k / (R/2), sin pi k / (R/2)); phi_k = sin(omega_k . D), phi_{R/2 + k} =
+    cos(omega_k . D); every basis is multiplied by the Wendland C2 taper (1 - rho / 3)^4 (1 + 4 rho / 3), rho = |D|,
+    which is 0 beyond 3 sigma. Invalid grains give phi = 0."""
+    with g.fp32(u_q.device):
+        d = grid * (u_q.float().unsqueeze(2) - u_hat.float().unsqueeze(1)) / sigma.float().unsqueeze(1).unsqueeze(-1)
+        d = torch.where(valid.unsqueeze(1).unsqueeze(-1), d, torch.zeros_like(d))
+        d = torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+        rho = (d.norm(dim=-1) / 3.0).clamp_max(1.0)
+        taper = (1 - rho) ** 4 * (1 + 4 * rho) * valid.unsqueeze(1).float()
+        k = torch.arange(R // 2, device=u_q.device, dtype=torch.float32) * math.pi / (R // 2)
+        omega = (math.pi / 2) * torch.stack([k.cos(), k.sin()], -1)                        # [R/2, 2]
+        proj = d @ omega.t()                                                               # [B, Q, G, R/2]
+        return torch.cat([proj.sin(), proj.cos()], -1) * taper.unsqueeze(-1)
+
+
+def pyr_down(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Gaussian pyramid: n times (binomial 5-tap [1 4 6 4 1] / 16, reflect padding, stride 2)."""
+    k1 = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], device=x.device, dtype=torch.float32) / 16
+    k = (k1[:, None] * k1[None, :]).view(1, 1, 5, 5).expand(x.shape[1], 1, 5, 5)
+    x = x.float()
+    for _ in range(n):
+        x = F.conv2d(F.pad(x, (2, 2, 2, 2), mode="reflect"), k, stride=2, groups=x.shape[1])
+    return x
+
+
+def pyr_up(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Gaussian pyramid expand with the same kernel: n times (zero insertion x2, conv 4 [1 4 6 4 1] / 16 x same)."""
+    k1 = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], device=x.device, dtype=torch.float32) / 16
+    k = 4 * (k1[:, None] * k1[None, :]).view(1, 1, 5, 5).expand(x.shape[1], 1, 5, 5)
+    x = x.float()
+    for _ in range(n):
+        B, C, H, W = x.shape
+        z = x.new_zeros(B, C, 2 * H, 2 * W)
+        z[:, :, ::2, ::2] = x
+        x = F.conv2d(F.pad(z, (2, 2, 2, 2), mode="reflect"), k, groups=C)
+    return x
+
+
+def pyramid_target(X: torch.Tensor, n: int) -> torch.Tensor:
+    """2.3 target of X~0: pyr_up(pyr_down(X, n), n), the same up operator as X~0 itself."""
+    return pyr_up(pyr_down(X, n), n)
+
+
+def _v3(valid: torch.Tensor) -> torch.Tensor:
+    """valid [B, ne] (shared by the queries) or [B, nq, ne] -> broadcastable [B, 1 or nq, ne]."""
+    return valid.unsqueeze(1) if valid.dim() == 2 else valid
+
+
 class ReadLayer(nn.Module):
     def __init__(self, cfg: GrainPriorConfig, d_pe: int):
         super().__init__()
@@ -85,41 +149,196 @@ class ReadLayer(nn.Module):
         self.wk, self.wv, self.wo = nn.Linear(d, d), nn.Linear(d, d), nn.Linear(d, d)
         self.ref = mlp2(3 * d, d, cfg.mlp_hidden)
         self.strict = cfg.readout_version != "legacy" or cfg.read_strict
+        sink_on = cfg.read_sink or (cfg.read_coarse_kv and cfg.coarse_sink)
         if self.strict:
             self.temperature = nn.Parameter(torch.zeros(()))
-            if cfg.read_sink:                     # zero key and value, logit learned: starts at a few % of the read
-                self.sink = nn.Parameter(torch.tensor(-4.0))
         elif cfg.read_qk_norm:
             self.qn, self.kn = nn.LayerNorm(d // cfg.heads), nn.LayerNorm(d // cfg.heads)
+        if sink_on:                               # zero key and value, logit learned: starts at a few % of the read
+            self.sink = nn.Parameter(torch.tensor(-4.0))
+        self.coarse_kv = cfg.read_coarse_kv
+        if self.coarse_kv:                        # 2.1: own projections, learned temperature and offset of the slots
+            self.nk_c, self.nv_c = nn.LayerNorm(d), nn.LayerNorm(d)
+            self.wk_c, self.wv_c = nn.Linear(d, d), nn.Linear(d, d)
+            self.tau_c = nn.Parameter(torch.zeros(()))
+            self.beta_c = nn.Parameter(torch.tensor(-4.0))
+        self.relpos = cfg.read_relpos_value
+        if self.relpos:                           # 2.2: R value projections W_r, zero at init (= the plain read)
+            self.R = cfg.relpos_rank
+            self.wv_rel = nn.Linear(d, self.R * d, bias=False)
+            nn.init.zeros_(self.wv_rel.weight)
+        self.normalizer, self.topk = cfg.read_normalizer, cfg.read_topk
+        self.alpha_init, self.alpha_steps = cfg.entmax_alpha_init, cfg.alpha_anneal_steps
+        if self.normalizer == "entmax15" and not self.alpha_steps:   # 2.4: learned alpha per head in (1, 2)
+            a0 = min(max(cfg.entmax_alpha_init, 1.05), 1.95) - 1
+            self.alpha_raw = nn.Parameter(torch.full((cfg.heads,), math.log(a0 / (1 - a0))))
+        self.step = 0                             # 2.4 anneal: set by MAVTGrainPrior.set_step
+        self.chunk = cfg.query_chunk              # query block of the explicit reads and the diagnostics
+        self.act_ckpt = cfg.read_act_ckpt         # False: keep every chunk's activations (faster, more memory)
+        self.collect_diag = False                 # set by Readout on the last layer: shares / effective support
+        self.last_diag = None
+
+    def alpha(self) -> torch.Tensor:
+        """2.4: entmax alpha [1, H, 1, 1]: learned 1 + sigmoid(raw), or init -> 1.5 over alpha_anneal_steps."""
+        if hasattr(self, "alpha_raw"):
+            return (1 + torch.sigmoid(self.alpha_raw.float())).view(1, -1, 1, 1)
+        t = min(1.0, self.step / self.alpha_steps)
+        return torch.full((1, self.heads, 1, 1), self.alpha_init + (1.5 - self.alpha_init) * t,
+                          device=self.wq.weight.device)
+
+    def _normalize(self, logit: torch.Tensor) -> torch.Tensor:
+        if self.normalizer != "entmax15":
+            return logit.softmax(-1)
+        alpha = self.alpha()
+        if not hasattr(self, "alpha_raw") and float(alpha.flatten()[0]) < 1.001:
+            return logit.softmax(-1)                                  # anneal start: alpha = 1 is softmax
+        return entmax_bisect(logit.float(), alpha)
+
+    def _topk_valid(self, bias, valid):
+        """2.4 topk: per query keep the read_topk valid grains of largest geometry bias -> valid [B, Q, G]."""
+        if bias is None:
+            raise ValueError("read_normalizer=topk needs the geometry bias")
+        if self.topk >= valid.shape[-1]:
+            return valid
+        score = bias[:, 0].float().masked_fill(~_v3(valid), float("-inf"))
+        keep = torch.zeros_like(score, dtype=torch.bool).scatter_(-1, score.topk(self.topk, -1).indices, True)
+        return keep & _v3(valid)
 
     def _head_norm(self, x, ln):
         return ln(x.unflatten(-1, (self.heads, -1))).flatten(-2) if hasattr(self, "qn") else x
 
-    def forward(self, a, pe, ktok, vtok, bias, valid):
+    def forward(self, a, pe, ktok, vtok, bias, valid, ctok=None, cbias=None, relpos=None):
+        """a, pe [B, Q, d]; grain tokens ktok / vtok [B, G, d]; bias [B, 1, Q, G] or None; valid [B, G];
+        ctok [B, n_c, d] + cbias [B, Q, n_c] (2.1); relpos (u_q, u^, sigma, valid, grid) (2.2: the basis is
+        built per query chunk). With read_normalizer=topk valid
+        becomes per query [B, Q, G] before the coarse slots and the sink are appended."""
         Q = self._head_norm(self.wq(self.norm(a)) + self.wpe(pe), getattr(self, "qn", None))
         K = self._head_norm(self.wk(self.nk(ktok)), getattr(self, "kn", None))
         V = self.wv(self.nv(vtok))
+        n_fine = K.shape[1]
+        if self.normalizer == "topk":
+            valid = self._topk_valid(bias, valid)
         if self.strict:
             norm = lambda x: F.normalize(x.unflatten(-1, (self.heads, -1)), dim=-1).flatten(-2)
             Q = norm(Q) * (8 * self.temperature.sigmoid()) * (Q.shape[-1] // self.heads) ** .5
             K = norm(K)
-        if hasattr(self, "sink"):
+        Vr = self.wv_rel(self.nv(vtok)) if self.relpos else None
+        n_coarse = 0
+        if self.coarse_kv:
+            if ctok is None or bias is None:
+                raise ValueError("read_coarse_kv needs the coarse tokens and the geometry bias")
+            Kc = self.wk_c(self.nk_c(ctok))
+            Kc = (F.normalize(Kc.unflatten(-1, (self.heads, -1)), dim=-1).flatten(-2) if self.strict else Kc)
+            Kc = Kc * torch.exp(self.tau_c).to(Kc.dtype)
+            Vc = self.wv_c(self.nv_c(ctok))
+            n_coarse = Kc.shape[1]
+            K, V = torch.cat([K, Kc.to(K.dtype)], 1), torch.cat([V, Vc.to(V.dtype)], 1)
+            cb = (cbias.float() + self.beta_c).unsqueeze(1).expand(-1, bias.shape[1], -1, -1)
+            bias = torch.cat([bias.float(), cb], -1)
+            valid = torch.cat([valid, valid.new_ones(*valid.shape[:-1], n_coarse)], -1)
+        has_sink = hasattr(self, "sink")
+        if has_sink:
             K, V, bias, valid = self._with_sink(K, V, bias, valid)
             if getattr(self, "track_sink", False):
                 self.last_sink_share = self._sink_share(Q, K, bias, valid)
-            e = self.wo(attend(Q, K, V, self.heads, bias, valid, strict=True))
+        strict = self.strict or has_sink or self.coarse_kv
+        if self.relpos or self.normalizer == "entmax15":
+            e = self._attend_explicit(Q, K, V, bias, valid, strict, relpos, Vr, n_fine)
         else:
-            e = self.wo(attend(Q, K, V, self.heads, bias, valid, strict=self.strict))
-            if self.strict:
-                e = e * valid.any(-1)[:, None, None].to(e.dtype)
+            e = attend(Q, K, V, self.heads, bias, valid, strict=strict)
+        e = self.wo(e)
+        if strict and not (has_sink or self.coarse_kv):
+            e = e * _v3(valid).any(-1, keepdim=True).to(e.dtype)
+        if self.collect_diag:
+            self.last_diag = self._diag(Q, K, bias, valid, strict, n_fine, n_coarse, has_sink)
         return a + self.ref(torch.cat([a, e, pe], -1))
+
+    def _logits(self, Q, K, bias, valid, strict):
+        """Explicit logits [B, H, nq, ne] in fp32 with the semantics of layers.attend (mask, floor, has)."""
+        B, nq, d = Q.shape
+        dh = d // self.heads
+        sh = lambda t: t.float().unflatten(-1, (self.heads, dh)).transpose(1, 2)
+        logit = sh(Q) @ sh(K).transpose(-1, -2) / math.sqrt(dh)
+        ok = _v3(valid).unsqueeze(1)
+        has = ok.any(-1, keepdim=True)
+        ok = ok | ~has
+        if bias is not None:
+            b = bias.float() if strict else bias.float().clamp_min(BIAS_FLOOR)
+            if strict:
+                b = torch.where(has, b, torch.zeros_like(b))
+            logit = logit + b
+        return logit.masked_fill(~ok, float("-inf")), has
+
+    def _chunks(self, nq: int):
+        """Query slices of query_chunk (2.2 / 2.4 explicit reads, 3.1 diagnostics)."""
+        return [slice(i, min(i + self.chunk, nq)) for i in range(0, nq, self.chunk)]
+
+    @staticmethod
+    def _rows(sl, bias, valid, relpos):
+        """The query rows sl of bias [B, 1, Q, ne], valid ([B, ne] or [B, Q, ne]) and relpos (u_q [B, Q, 2], ...)."""
+        b = bias[:, :, sl] if bias is not None else None
+        v = valid[:, sl] if valid.dim() == 3 else valid
+        r = (relpos[0][:, sl],) + tuple(relpos[1:]) if relpos is not None else None
+        return b, v, r
+
+    def _explicit_block(self, Q, K, V, bias, valid, strict, relpos, Vr, n_fine):
+        """One query block: a = normalize(logits) [B, H, q, ne]; e = a V + sum_r (a[..., :G] phi_r) V_r, phi of
+        the block only [B, q, G, R]; R weighted sums, each temporary [B, H, q, G]."""
+        B, nq, d = Q.shape
+        dh = d // self.heads
+        logit, has = self._logits(Q, K, bias, valid, strict)
+        p = self._normalize(logit)
+        sh = lambda t: t.float().unflatten(-1, (self.heads, dh)).transpose(1, 2)
+        out = p @ sh(V)
+        if Vr is not None and relpos is not None:
+            phi = relpos_basis(*relpos, self.R)
+            pf = p[..., :n_fine]
+            for r in range(self.R):
+                out = out + (pf * phi[..., r].unsqueeze(1)) @ sh(Vr[..., r * d:(r + 1) * d])
+        out = out * has
+        return out.transpose(1, 2).reshape(B, nq, d)
+
+    def _attend_explicit(self, Q, K, V, bias, valid, strict, relpos, Vr, n_fine):
+        """Explicit read (2.2 position-dependent values, 2.4 entmax) in blocks of query_chunk queries; each block is
+        recomputed in backward (activation checkpoint) when gradients flow, so the peak holds one block of
+        [B, H, q, ne] probabilities and basis, not all Q. No tensor of size [B, Q, G, d] exists."""
+        outs = []
+        ckpt = self.act_ckpt and torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (Q, K, V, Vr))
+        for sl in self._chunks(Q.shape[1]):
+            b, v, r = self._rows(sl, bias, valid, relpos)
+            args = (Q[:, sl], K, V, b, v, strict, r, Vr, n_fine)
+            outs.append(checkpoint(self._explicit_block, *args, use_reentrant=False) if ckpt
+                        else self._explicit_block(*args))
+        return torch.cat(outs, 1).to(V.dtype)
+
+    @torch.no_grad()
+    def _diag(self, Q, K, bias, valid, strict, n_fine, n_coarse, has_sink) -> dict:
+        """3.1: per-query effective support 1 / sum_j a_j^2 and the fine / coarse / sink shares (mean over heads),
+        per-grain attention mass (sum over queries), from the probabilities of the read (its normalizer), computed
+        in query blocks without gradient."""
+        n_c = n_fine + n_coarse
+        acc = dict(eff_support_q=[], fine_share_q=[], coarse_share_q=[], sink_share_q=[])
+        mass = 0
+        for sl in self._chunks(Q.shape[1]):
+            b, v, _ = self._rows(sl, bias, valid, None)
+            logit, has = self._logits(Q[:, sl], K, b, v, strict)
+            p = self._normalize(logit).float()
+            if strict and not (has_sink or n_coarse):                 # rows without a valid grain read nothing
+                p = p * has.float()
+            p2 = p.pow(2).sum(-1)
+            acc["eff_support_q"].append(((p2 > 0).float() / p2.clamp_min(1e-12)).mean(1))
+            acc["fine_share_q"].append(p[..., :n_fine].sum(-1).mean(1))
+            acc["coarse_share_q"].append(p[..., n_fine:n_c].sum(-1).mean(1))
+            acc["sink_share_q"].append(p[..., n_c:].sum(-1).mean(1) if has_sink else torch.zeros_like(p[:, 0, :, 0]))
+            mass = mass + p[..., :n_fine].mean(1).sum(1)
+        return dict({k: torch.cat(v, 1) for k, v in acc.items()}, grain_mass=mass)
 
     def _with_sink(self, K, V, bias, valid):
         """Append the sink: zero key (content logit 0 after the q/k normalisation) and zero value, logit = sink."""
         B, Q = K.shape[0], (bias.shape[-2] if bias is not None else None)
         z = K.new_zeros(B, 1, K.shape[-1])
         K, V = torch.cat([K, z], 1), torch.cat([V, z.to(V.dtype)], 1)
-        valid = torch.cat([valid, valid.new_ones(B, 1)], -1)
+        valid = torch.cat([valid, valid.new_ones(*valid.shape[:-1], 1)], -1)
         if bias is None:
             raise ValueError("read_sink needs the geometry bias")
         bias = torch.cat([bias, self.sink.to(bias.dtype).expand(*bias.shape[:-1], 1)], -1)
@@ -130,37 +349,195 @@ class ReadLayer(nn.Module):
         """Mean attention weight on the sink (diagnostic; explicit softmax, so only on small batches)."""
         sh = lambda t: t.float().unflatten(-1, (self.heads, -1)).transpose(1, 2)
         logit = sh(Q) @ sh(K).transpose(-1, -2) / math.sqrt(Q.shape[-1] // self.heads) + bias.float()
-        logit = logit.masked_fill(~valid[:, None, None, :], float("-inf"))
+        logit = logit.masked_fill(~_v3(valid).unsqueeze(1), float("-inf"))
         return logit.softmax(-1)[..., -1].mean().item()
+
+
+class PrevRead(nn.Module):
+    """1.5: read of the previous decoded feature grid (no state numbers: the decoder has decoded it already).
+
+    du_q = sum_j w_qj (u^_j(t) - u^_j(t-1)), w_qj = softmax_j(-|grid (u_q - u^_j(t))|^2 / 2 sigma_j^2) over the
+    grains projected in both observations; nine bilinear taps of W_p sg[F^_{t-1}] at u_q - du_q + {-1, 0, 1}^2 /
+    grid -> Mix (zero-init) -> [B, Q, dim]."""
+
+    def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
+        super().__init__()
+        self.grid = cfg.grid
+        self.proj = nn.Linear(teacher_dim, cfg.dim)
+        self.mix = nn.Linear(9 * cfg.dim, cfg.dim)
+        nn.init.zeros_(self.mix.weight)
+        nn.init.zeros_(self.mix.bias)
+        r = torch.tensor([-1.0, 0.0, 1.0]) / cfg.grid
+        oy, ox = torch.meshgrid(r, r, indexing="ij")
+        self.register_buffer("offsets", torch.stack([ox, oy], -1).reshape(9, 2), persistent=False)
+
+    def centres(self, u_q, u_now, u_prev, valid_now, valid_prev, sigma) -> torch.Tensor:
+        """u_q - du_q [B, Q, 2] (u_q where no grain is projected in both observations)."""
+        with g.fp32(u_q.device):
+            both = valid_now & valid_prev & torch.isfinite(u_now).all(-1) & torch.isfinite(u_prev).all(-1)
+            un = torch.nan_to_num(u_now.float())
+            du = torch.where(both.unsqueeze(-1), un - torch.nan_to_num(u_prev.float()), torch.zeros_like(un))
+            d2 = ((self.grid * (u_q.float().unsqueeze(2) - un.unsqueeze(1))) ** 2).sum(-1)
+            ln = (-d2 / (2 * sigma.float().unsqueeze(1) ** 2)).masked_fill(~both.unsqueeze(1), float("-inf"))
+            has = both.any(-1).view(-1, 1, 1)
+            w = torch.where(has, ln.softmax(-1), torch.zeros_like(ln)).nan_to_num(0.0)
+            return u_q.float() - w @ du
+
+    def forward(self, F_prev, u_q, u_now, u_prev, valid_now, valid_prev, sigma) -> torch.Tensor:
+        B, N, _ = F_prev.shape
+        c = self.centres(u_q, u_now, u_prev, valid_now, valid_prev, sigma)
+        img = self.proj(F_prev.detach().to(self.proj.weight.dtype)).transpose(1, 2).reshape(B, -1, self.grid, self.grid)
+        pts = (c.unsqueeze(2) + self.offsets) * 2 - 1                                # [B, Q, 9, 2]
+        taps = F.grid_sample(img.float(), pts, mode="bilinear", padding_mode="border", align_corners=False)
+        return self.mix(taps.permute(0, 2, 3, 1).flatten(2).to(self.mix.weight.dtype))
+
+
+class PointLN(nn.Module):
+    """LayerNorm over the channel axis of an NCHW map at every point (no spatial statistics)."""
+
+    def __init__(self, c: int):
+        super().__init__()
+        self.ln = nn.LayerNorm(c)
+
+    def forward(self, x):
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+class PointMLP(nn.Module):
+    """x + W_2 GELU(W_1 LN(x)) with 1 x 1 convolutions."""
+
+    def __init__(self, c: int, ratio: float):
+        super().__init__()
+        h = int(c * ratio)
+        self.norm, self.fc1, self.fc2 = PointLN(c), nn.Conv2d(c, h, 1), nn.Conv2d(h, c, 1)
+
+    def forward(self, x):
+        return x + self.fc2(F.gelu(self.fc1(self.norm(x))))
+
+
+class ConvNeXtBlock(nn.Module):
+    """x + W_2 GELU(W_1 LN(DW7x7(x))) on an NCHW map, W_2 zero-init (identity at init): spatial context for the RGB
+    head (rgb_ctx_blocks; each block widens the receptive field by 6 query cells)."""
+
+    def __init__(self, c: int, ratio: float):
+        super().__init__()
+        h = int(c * ratio)
+        self.dw = nn.Conv2d(c, c, 7, padding=3, groups=c)
+        self.norm, self.fc1, self.fc2 = PointLN(c), nn.Conv2d(c, h, 1), nn.Conv2d(h, c, 1)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        return x + self.fc2(F.gelu(self.fc1(self.norm(self.dw(x)))))
+
+
+class PointwiseRGB(nn.Module):
+    """3.3: query-grid state [B, dim, s, s] -> residual image [B, 3, S, S] (no sigmoid; the caller composes).
+
+    dim-channel map at the query grid -> 4 x PointMLP (1 x 1, per-point LN) -> for each x2 stage k (n_up stages):
+    PixelShuffle(2) (channels / 4, pointwise) -> conv3x3 (k = 0: one; k >= 1: two) -> conv1x1 -> 3 (zero-init).
+    Reference (dim 512, grid 64, image 256): 512 @64 -> 128 @128 (1 conv3x3) -> 32 @256 (2 conv3x3) -> 3.
+    Receptive field at the output: the 1x1 blocks and PixelShuffle mix nothing spatially; conv3x3 @128 spans
+    +-1 px @128 = +-2 px @256; two conv3x3 @256 span +-2 px: total +-4 px, a 9 px window <= 16 px.
+    Capacity sits in the 1x1 MLPs (ratio 4: 4 x 2 x 512 x 2048 = 8.4 M of the ~8.8 M parameters).
+    """
+
+    def __init__(self, dim: int, n_up: int, ratio: float):
+        super().__init__()
+        self.blocks = nn.Sequential(*[PointMLP(dim, ratio) for _ in range(4)])
+        stages, c = [], dim
+        for k in range(n_up):
+            c = c // 4
+            convs = [nn.PixelShuffle(2), nn.Conv2d(c, c, 3, padding=1), nn.GELU()]
+            if k >= 1:
+                convs += [nn.Conv2d(c, c, 3, padding=1), nn.GELU()]
+            stages.append(nn.Sequential(*convs))
+        self.stages = nn.Sequential(*stages)
+        self.final = nn.Conv2d(c, 3, 1)
+        nn.init.zeros_(self.final.weight)
+        nn.init.zeros_(self.final.bias)
+
+    def forward(self, x):
+        return self.final(self.stages(self.blocks(x)))
 
 
 class RGBHead(nn.Module):
     """Feature grid [B, G*G, D_t] -> image [B, 3, 16 G, 16 G] in [0, 1]; on cfg.query_grid Gq: one stride-2
-    upsampling per factor of 2 up to the image (the first rgb_channels)."""
+    upsampling per factor of 2 up to the image (the first rgb_channels).
 
-    def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
+    rgb_coarse_start (2.3): forward(Fh, low=low_image(a0)) returns clamp(sg[X~0] + R(Fh), 0, 1) where R is the
+    head's last layer output (zero at init, no sigmoid). rgb_head=pointwise (3.3) swaps the conv trunk for
+    PointwiseRGB. rgb_in_feat (3.3): the head input is H + W up_bilinear(sg[F^]) (F^ on the feature grid)."""
+
+    def __init__(self, cfg: GrainPriorConfig, teacher_dim: int, feat_dim: Optional[int] = None):
+        """teacher_dim: width of the head input (dim for rgb_from=hidden, else D_t); feat_dim: D_t (rgb_in_feat)."""
         super().__init__()
         self.cfg = cfg
         self.side = cfg.query_grid or cfg.grid
         n_up = (cfg.image_size // self.side).bit_length() - 1
         self.proj = nn.Linear(teacher_dim, cfg.dim)
-        ch = [cfg.dim] + list(cfg.rgb_channels)[:n_up]
-        self.convs = nn.ModuleList([nn.Conv2d(ch[i], ch[i + 1], 3, padding=1) for i in range(n_up)])
-        self.final = nn.Conv2d(ch[-1], 3, 3, padding=1)
+        self.pointwise = cfg.rgb_head == "pointwise"
+        if self.pointwise:
+            self.pw = PointwiseRGB(cfg.dim, n_up, cfg.rgb_pw_mlp_ratio)
+        else:
+            ch = [cfg.dim] + list(cfg.rgb_channels)[:n_up]
+            self.convs = nn.ModuleList([nn.Conv2d(ch[i], ch[i + 1], 3, padding=1) for i in range(n_up)])
+            self.final = nn.Conv2d(ch[-1], 3, 3, padding=1)
+        if cfg.rgb_ctx_blocks:
+            self.ctx = nn.ModuleList([ConvNeXtBlock(cfg.dim, cfg.rgb_pw_mlp_ratio) for _ in range(cfg.rgb_ctx_blocks)])
+        self.coarse = cfg.rgb_coarse_start
+        if self.coarse:
+            self.low = mlp2(cfg.dim, 3, cfg.mlp_hidden)                 # RGBLow on a^(0) of the cell grid
+            self.n_pyr = (cfg.image_size // cfg.grid).bit_length() - 1
+            last = self.final if not self.pointwise else None
+            if last is not None:                                         # pointwise: zero-init already
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+        if cfg.rgb_in_feat:
+            self.in_feat = nn.Linear(feat_dim or teacher_dim, cfg.dim)
+            nn.init.zeros_(self.in_feat.weight)
+            nn.init.zeros_(self.in_feat.bias)
 
-    def forward(self, Fh: torch.Tensor) -> torch.Tensor:
+    def low_image(self, a0: torch.Tensor) -> torch.Tensor:
+        """2.3: X~0 [B, 3, S, S] in (0, 1) = pyr_up(sigmoid(RGBLow(a0)) on the cell grid)."""
+        B = a0.shape[0]
+        G = self.cfg.grid
+        x = torch.sigmoid(self.low(a0.float()).float()).transpose(1, 2).reshape(B, 3, G, G)
+        return pyr_up(x, self.n_pyr).clamp(0, 1)
+
+    def residual(self, Fh: torch.Tensor, feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Pre-activation output R [B, 3, S, S] of the trunk (legacy: before the sigmoid)."""
         B, N, _ = Fh.shape
         G = self.side
-        x = self.proj(Fh).transpose(1, 2).reshape(B, -1, G, G)
+        x = self.proj(Fh)
+        if feat is not None and hasattr(self, "in_feat"):
+            Gf = int(round(math.sqrt(feat.shape[1])))
+            f = self.in_feat(feat.detach().to(Fh.dtype)).transpose(1, 2).reshape(B, -1, Gf, Gf)
+            f = F.interpolate(f, size=(G, G), mode="bilinear", align_corners=False)
+            x = x + f.flatten(2).transpose(1, 2)
+        x = x.transpose(1, 2).reshape(B, -1, G, G)
+        for blk in getattr(self, "ctx", ()):
+            x = blk(x)
+        if self.pointwise:
+            return self.pw(x).float()
         for conv in self.convs:
             x = F.gelu(conv(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)))
-        return torch.sigmoid(self.final(x).float())
+        return self.final(x).float()
+
+    def forward(self, Fh: torch.Tensor, low: Optional[torch.Tensor] = None, feat: Optional[torch.Tensor] = None):
+        r = self.residual(Fh, feat)
+        if self.coarse:
+            if low is None:
+                raise ValueError("rgb_coarse_start needs low = low_image(a0)")
+            return (low.detach().float() + r).clamp(0, 1)
+        return torch.sigmoid(r)
 
 
 class Readout(nn.Module):
     def __init__(self, cfg: GrainPriorConfig, teacher_dim: int):
         super().__init__()
         self.cfg = cfg
+        self.diag_on = True                       # 3.1: MAVTGrainPrior.set_diag (off between log steps)
         d, pf, dc = cfg.dim, cfg.pe_freq, cfg.d_coarse
         pe2, pe3 = g.pe_dim(2, pf), g.pe_dim(3, pf)
         self.q_pe = nn.Linear(pe2, d)
@@ -181,6 +558,13 @@ class Readout(nn.Module):
         self.ktok = nn.Linear(cfg.d_f + pe3 + pe2, d)
         self.vtok = nn.Linear(cfg.d_f, d)
         self.layers = nn.ModuleList([ReadLayer(cfg, d) for _ in range(cfg.read_layers)])
+        if cfg.read_split_layer2:                 # 3.4: second copy of the last layer for the RGB-grid read
+            self.last_x = ReadLayer(cfg, d)
+        if cfg.read_coarse_kv:                    # 2.1: coarse slot tokens [c_0; z_i] + slot PE, shared by the layers
+            self.coarse_kv_tok = nn.Linear(2 * dc, d)
+            self.coarse_kv_pe = nn.Linear(pe2, d)
+        if cfg.read_prev_frame:                   # 1.5
+            self.prev_read = PrevRead(cfg, teacher_dim)
         self.w_out = nn.Linear(d, teacher_dim)
         self.depth = mlp2(d, 1, cfg.mlp_hidden)
         # ---- innovation read
@@ -213,12 +597,17 @@ class Readout(nn.Module):
         ca = self.init_ca(pe, tok.to(pe.dtype))
         return self.mlp_a(torch.cat([pe, ca, pg_q], -1))
 
-    def base(self, f_t, P_can, u_k, u_hat, z_cam, sigma, valid, scale, c0, z, pg, uq=None) -> dict:
+    def base(self, f_t, P_can, u_k, u_hat, z_cam, sigma, valid, scale, c0, z, pg, uq=None, branch="F",
+             grain_keep=None) -> dict:
         """Grains at observation i (f~ [B, G, d_f], P^can, anchor u_k, projection u^ / z / valid, sigma), depth
         scale of the gauge [B], c_0, z_i, PoolGeom -> dict(a0, a, F_base, F_init, depth_grain, depth_dense,
-        support [B, Q])."""
+        support [B, Q], diag (3.1: eff_support_q, fine/coarse/sink_share_q [B, Q], grain_mass [B, G])).
+        branch "X" with read_split_layer2 runs the RGB copy of the last layer; grain_keep [B, G] bool (evaluation:
+        drop grains) is intersected with valid."""
         cfg = self.cfg
         B = f_t.shape[0]
+        if grain_keep is not None:
+            valid = valid & grain_keep
         pe = self.query_pe(B, uq)
         a0 = self.init(pe, c0, z, pg, uq)
         sc = scale.float().view(B, 1, 1)
@@ -228,14 +617,31 @@ class Readout(nn.Module):
         u_q = self.uq.expand(B, -1, -1) if uq is None else uq
         dd = z_cam.float() / sc.view(B, 1) if cfg.tau_d_mode == "median" else z_cam.float()
         lnu = geom_bias(u_q, u_hat, sigma, dd, valid, cfg.grid, cfg.tau_d)              # [B, Q, G]
-        if cfg.read_sink:                         # the sink competes with the grain mass at the query
-            lnu = lnu + proximity(u_q, u_hat, sigma, valid, cfg.grid).unsqueeze(-1)
+        sink_on = cfg.read_sink or (cfg.read_coarse_kv and cfg.coarse_sink)
+        prox = proximity(u_q, u_hat, sigma, valid, cfg.grid) if (sink_on or cfg.read_coarse_kv) else None
+        lnu_depth = lnu                           # 2.1: nu stays normalised; read_sink keeps its trained coupling
+        if sink_on:                               # the sink competes with the grain mass at the query
+            lnu = lnu + prox.unsqueeze(-1)
+        if not cfg.read_coarse_kv:
+            lnu_depth = lnu
         bias = lnu.unsqueeze(1) if cfg.geom_bias else None
+        ctok = cbias = relpos = None
+        if cfg.read_coarse_kv:                    # 2.1: logit_c = beta_c - proximity(u_q) (+ content), 16 slots
+            ctok = (self.coarse_kv_tok(torch.cat([c0.float(), z.float()], -1))
+                    + self.coarse_kv_pe(g.fourier(self.ucoarse, cfg.pe_freq)).unsqueeze(0)).to(a0.dtype)
+            cbias = (-prox).clamp(max=50.0).unsqueeze(-1).expand(-1, -1, cfg.n_coarse)
+        if cfg.read_relpos_value:                 # 2.2
+            relpos = (u_q, u_hat, sigma, valid, cfg.grid)
+        layers = list(self.layers)
+        if branch == "X" and cfg.read_split_layer2:
+            layers[-1] = self.last_x
         a = a0
-        for layer in self.layers:
-            a = layer(a, pe, kt, vt, bias, valid)
+        for i, layer in enumerate(layers):
+            layer.collect_diag = self.diag_on and i == len(layers) - 1 and uq is None   # 3.1: feature-grid read
+            a = layer(a, pe, kt, vt, bias, valid, ctok=ctok, cbias=cbias, relpos=relpos)
+        diag = layers[-1].last_diag
         with g.fp32(a.device):
-            nu = lnu.exp() * valid.unsqueeze(1)
+            nu = lnu_depth.exp() * valid.unsqueeze(1)
             support = valid.any(-1, keepdim=True).expand(-1, lnu.shape[1])
             far = z_cam.float().masked_fill(~valid, 0).amax(-1, keepdim=True).clamp_min(1.0)
             d_grain = torch.where(support, (nu * z_cam.float().unsqueeze(1)).sum(-1), far.expand_as(support).float())
@@ -244,7 +650,7 @@ class Readout(nn.Module):
         return dict(a0=a0, a=a, pe=pe, F_base=self.w_out(a).float(), F_init=self.w_out(a0).float(),
                     depth_grain=d_grain, depth_dense=d_dense,
                     support=support if cfg.measurement_version == 1 else support_v2,
-                    support_v1=support, support_v2=support_v2)
+                    support_v1=support, support_v2=support_v2, diag=diag)
 
     def innovation(self, a: torch.Tensor, pe: torch.Tensor, r: torch.Tensor, L: torch.Tensor,
                    return_hidden: bool = False, uq=None):
