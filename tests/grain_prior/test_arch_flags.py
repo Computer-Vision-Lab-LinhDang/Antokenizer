@@ -205,12 +205,12 @@ def test_relpos_value_is_the_plain_read_at_init_and_moves_with_W_r():
     on.load_state_dict(off.state_dict(), strict=False)
     x, uq, uh, s, valid = _read_inputs(cfg_on, far=False)
     x = {k: v for k, v in x.items() if k not in ("ctok", "cbias")}
-    phi = relpos_basis(uq, uh, s, valid, cfg_on.grid, cfg_on.relpos_rank)
+    rel = (uq, uh, s, valid, cfg_on.grid)
     with torch.no_grad():
-        assert torch.allclose(off(**x), on(**x, phi=phi), atol=1e-5)
+        assert torch.allclose(off(**x), on(**x, relpos=rel), atol=1e-5)
         on.wv_rel.weight.normal_(0, 0.1)
-        assert not torch.allclose(off(**x), on(**x, phi=phi), atol=1e-3)
-    on(**x, phi=phi).sum().backward()
+        assert not torch.allclose(off(**x), on(**x, relpos=rel), atol=1e-3)
+    on(**x, relpos=rel).sum().backward()
     assert on.wv_rel.weight.grad.abs().sum() > 0
 
 
@@ -638,3 +638,28 @@ def test_init_new_ok_allows_only_the_new_flag_modules(tmp_path):
     torch.save(dict(model=sd, step=800), p)
     with pytest.raises(RuntimeError):
         tr.init_weights(str(p), _model(read_prev_frame=True, **QG), new_ok=True)
+
+
+# ------------------------------------------------------------------------------------------------ query chunks
+@pytest.mark.parametrize("kw", [dict(read_relpos_value=True), dict(read_normalizer="entmax15", entmax_alpha_init=1.5),
+                                dict(read_relpos_value=True, read_coarse_kv=True)])
+def test_explicit_read_in_query_chunks_matches_the_full_read(kw):
+    """relpos / entmax reads in blocks of query_chunk queries (checkpointed in training): same output, same grads."""
+    outs = []
+    for chunk in (1000, 2):
+        cfg = tiny_config(query_chunk=chunk, **kw, **LEGACY_CRSR)
+        torch.manual_seed(0)
+        layer = ReadLayer(cfg, cfg.dim).train()
+        if hasattr(layer, "wv_rel"):
+            torch.nn.init.normal_(layer.wv_rel.weight, 0, 0.1)
+        layer.collect_diag = True
+        x, uq, uh, s, valid = _read_inputs(cfg, far=False)
+        if not cfg.read_coarse_kv:
+            x = {k: v for k, v in x.items() if k not in ("ctok", "cbias")}
+        a = x["a"].clone().requires_grad_()
+        rel = (uq, uh, s, valid, cfg.grid) if cfg.read_relpos_value else None
+        y = layer(**dict(x, a=a), relpos=rel)
+        y.square().sum().backward()
+        outs.append((y.detach(), a.grad, layer.wk.weight.grad, layer.last_diag["fine_share_q"]))
+    for u, v in zip(*outs):
+        assert torch.allclose(u, v, atol=1e-5)

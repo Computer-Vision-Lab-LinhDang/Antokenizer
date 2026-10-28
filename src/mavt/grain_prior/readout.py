@@ -30,6 +30,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from . import geometry as g
 from .config import GrainPriorConfig
@@ -172,6 +173,7 @@ class ReadLayer(nn.Module):
             a0 = min(max(cfg.entmax_alpha_init, 1.05), 1.95) - 1
             self.alpha_raw = nn.Parameter(torch.full((cfg.heads,), math.log(a0 / (1 - a0))))
         self.step = 0                             # 2.4 anneal: set by MAVTGrainPrior.set_step
+        self.chunk = cfg.query_chunk              # query block of the explicit reads and the diagnostics
         self.collect_diag = False                 # set by Readout on the last layer: shares / effective support
         self.last_diag = None
 
@@ -204,9 +206,10 @@ class ReadLayer(nn.Module):
     def _head_norm(self, x, ln):
         return ln(x.unflatten(-1, (self.heads, -1))).flatten(-2) if hasattr(self, "qn") else x
 
-    def forward(self, a, pe, ktok, vtok, bias, valid, ctok=None, cbias=None, phi=None):
+    def forward(self, a, pe, ktok, vtok, bias, valid, ctok=None, cbias=None, relpos=None):
         """a, pe [B, Q, d]; grain tokens ktok / vtok [B, G, d]; bias [B, 1, Q, G] or None; valid [B, G];
-        ctok [B, n_c, d] + cbias [B, Q, n_c] (2.1); phi [B, Q, G, R] (2.2). With read_normalizer=topk valid
+        ctok [B, n_c, d] + cbias [B, Q, n_c] (2.1); relpos (u_q, u^, sigma, valid, grid) (2.2: the basis is
+        built per query chunk). With read_normalizer=topk valid
         becomes per query [B, Q, G] before the coarse slots and the sink are appended."""
         Q = self._head_norm(self.wq(self.norm(a)) + self.wpe(pe), getattr(self, "qn", None))
         K = self._head_norm(self.wk(self.nk(ktok)), getattr(self, "kn", None))
@@ -239,15 +242,14 @@ class ReadLayer(nn.Module):
                 self.last_sink_share = self._sink_share(Q, K, bias, valid)
         strict = self.strict or has_sink or self.coarse_kv
         if self.relpos or self.normalizer == "entmax15":
-            e, p = self._attend_explicit(Q, K, V, bias, valid, strict, phi, Vr, n_fine)
+            e = self._attend_explicit(Q, K, V, bias, valid, strict, relpos, Vr, n_fine)
         else:
             e = attend(Q, K, V, self.heads, bias, valid, strict=strict)
-            p = None
         e = self.wo(e)
         if strict and not (has_sink or self.coarse_kv):
             e = e * _v3(valid).any(-1, keepdim=True).to(e.dtype)
         if self.collect_diag:
-            self.last_diag = self._diag(Q, K, bias, valid, strict, p, n_fine, n_coarse, has_sink)
+            self.last_diag = self._diag(Q, K, bias, valid, strict, n_fine, n_coarse, has_sink)
         return a + self.ref(torch.cat([a, e, pe], -1))
 
     def _logits(self, Q, K, bias, valid, strict):
@@ -266,41 +268,69 @@ class ReadLayer(nn.Module):
             logit = logit + b
         return logit.masked_fill(~ok, float("-inf")), has
 
-    def _attend_explicit(self, Q, K, V, bias, valid, strict, phi, Vr, n_fine):
-        """Explicit read (2.2 position-dependent values, 2.4 entmax). a = normalize(logits) [B, H, nq, ne];
-        e = a V + sum_r (a[:, :, :, :G] * phi_r) V_r with V_r = W_r f (heads split): R weighted sums, each
-        temporary of size [B, H, nq, G]; no tensor of size [B, nq, G, d] exists."""
+    def _chunks(self, nq: int):
+        """Query slices of query_chunk (2.2 / 2.4 explicit reads, 3.1 diagnostics)."""
+        return [slice(i, min(i + self.chunk, nq)) for i in range(0, nq, self.chunk)]
+
+    @staticmethod
+    def _rows(sl, bias, valid, relpos):
+        """The query rows sl of bias [B, 1, Q, ne], valid ([B, ne] or [B, Q, ne]) and relpos (u_q [B, Q, 2], ...)."""
+        b = bias[:, :, sl] if bias is not None else None
+        v = valid[:, sl] if valid.dim() == 3 else valid
+        r = (relpos[0][:, sl],) + tuple(relpos[1:]) if relpos is not None else None
+        return b, v, r
+
+    def _explicit_block(self, Q, K, V, bias, valid, strict, relpos, Vr, n_fine):
+        """One query block: a = normalize(logits) [B, H, q, ne]; e = a V + sum_r (a[..., :G] phi_r) V_r, phi of
+        the block only [B, q, G, R]; R weighted sums, each temporary [B, H, q, G]."""
         B, nq, d = Q.shape
         dh = d // self.heads
         logit, has = self._logits(Q, K, bias, valid, strict)
         p = self._normalize(logit)
         sh = lambda t: t.float().unflatten(-1, (self.heads, dh)).transpose(1, 2)
         out = p @ sh(V)
-        if Vr is not None and phi is not None:
+        if Vr is not None and relpos is not None:
+            phi = relpos_basis(*relpos, self.R)
             pf = p[..., :n_fine]
             for r in range(self.R):
-                vr = sh(Vr[..., r * d:(r + 1) * d])
-                out = out + (pf * phi[..., r].unsqueeze(1)) @ vr
+                out = out + (pf * phi[..., r].unsqueeze(1)) @ sh(Vr[..., r * d:(r + 1) * d])
         out = out * has
-        return out.transpose(1, 2).reshape(B, nq, d).to(V.dtype), p
+        return out.transpose(1, 2).reshape(B, nq, d)
+
+    def _attend_explicit(self, Q, K, V, bias, valid, strict, relpos, Vr, n_fine):
+        """Explicit read (2.2 position-dependent values, 2.4 entmax) in blocks of query_chunk queries; each block is
+        recomputed in backward (activation checkpoint) when gradients flow, so the peak holds one block of
+        [B, H, q, ne] probabilities and basis, not all Q. No tensor of size [B, Q, G, d] exists."""
+        outs = []
+        ckpt = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (Q, K, V, Vr))
+        for sl in self._chunks(Q.shape[1]):
+            b, v, r = self._rows(sl, bias, valid, relpos)
+            args = (Q[:, sl], K, V, b, v, strict, r, Vr, n_fine)
+            outs.append(checkpoint(self._explicit_block, *args, use_reentrant=False) if ckpt
+                        else self._explicit_block(*args))
+        return torch.cat(outs, 1).to(V.dtype)
 
     @torch.no_grad()
-    def _diag(self, Q, K, bias, valid, strict, p, n_fine, n_coarse, has_sink) -> dict:
+    def _diag(self, Q, K, bias, valid, strict, n_fine, n_coarse, has_sink) -> dict:
         """3.1: per-query effective support 1 / sum_j a_j^2 and the fine / coarse / sink shares (mean over heads),
-        per-grain attention mass (sum over queries); fp32 probabilities [B, H, Q, ne] without gradient."""
-        logit, has = self._logits(Q, K, bias, valid, strict)
-        if p is None:
-            p = logit.softmax(-1)
-        p = p.float()
-        if strict and not (has_sink or n_coarse):                     # rows without a valid grain read nothing
-            p = p * has.float()
+        per-grain attention mass (sum over queries), from the probabilities of the read (its normalizer), computed
+        in query blocks without gradient."""
         n_c = n_fine + n_coarse
-        p2 = p.pow(2).sum(-1)
-        return dict(eff_support_q=((p2 > 0).float() / p2.clamp_min(1e-12)).mean(1),
-                    fine_share_q=p[..., :n_fine].sum(-1).mean(1),
-                    coarse_share_q=p[..., n_fine:n_c].sum(-1).mean(1),
-                    sink_share_q=(p[..., n_c:].sum(-1).mean(1) if has_sink else torch.zeros_like(p[:, 0, :, 0])),
-                    grain_mass=p[..., :n_fine].mean(1).sum(1))
+        acc = dict(eff_support_q=[], fine_share_q=[], coarse_share_q=[], sink_share_q=[])
+        mass = 0
+        for sl in self._chunks(Q.shape[1]):
+            b, v, _ = self._rows(sl, bias, valid, None)
+            logit, has = self._logits(Q[:, sl], K, b, v, strict)
+            p = self._normalize(logit).float()
+            if strict and not (has_sink or n_coarse):                 # rows without a valid grain read nothing
+                p = p * has.float()
+            p2 = p.pow(2).sum(-1)
+            acc["eff_support_q"].append(((p2 > 0).float() / p2.clamp_min(1e-12)).mean(1))
+            acc["fine_share_q"].append(p[..., :n_fine].sum(-1).mean(1))
+            acc["coarse_share_q"].append(p[..., n_fine:n_c].sum(-1).mean(1))
+            acc["sink_share_q"].append(p[..., n_c:].sum(-1).mean(1) if has_sink else torch.zeros_like(p[:, 0, :, 0]))
+            mass = mass + p[..., :n_fine].mean(1).sum(1)
+        return dict({k: torch.cat(v, 1) for k, v in acc.items()}, grain_mass=mass)
 
     def _with_sink(self, K, V, bias, valid):
         """Append the sink: zero key (content logit 0 after the q/k normalisation) and zero value, logit = sink."""
@@ -573,20 +603,20 @@ class Readout(nn.Module):
         if not cfg.read_coarse_kv:
             lnu_depth = lnu
         bias = lnu.unsqueeze(1) if cfg.geom_bias else None
-        ctok = cbias = phi = None
+        ctok = cbias = relpos = None
         if cfg.read_coarse_kv:                    # 2.1: logit_c = beta_c - proximity(u_q) (+ content), 16 slots
             ctok = (self.coarse_kv_tok(torch.cat([c0.float(), z.float()], -1))
                     + self.coarse_kv_pe(g.fourier(self.ucoarse, cfg.pe_freq)).unsqueeze(0)).to(a0.dtype)
             cbias = (-prox).clamp(max=50.0).unsqueeze(-1).expand(-1, -1, cfg.n_coarse)
         if cfg.read_relpos_value:                 # 2.2
-            phi = relpos_basis(u_q, u_hat, sigma, valid, cfg.grid, cfg.relpos_rank)
+            relpos = (u_q, u_hat, sigma, valid, cfg.grid)
         layers = list(self.layers)
         if branch == "X" and cfg.read_split_layer2:
             layers[-1] = self.last_x
         a = a0
         for i, layer in enumerate(layers):
             layer.collect_diag = i == len(layers) - 1 and uq is None      # 3.1: the feature-grid read only
-            a = layer(a, pe, kt, vt, bias, valid, ctok=ctok, cbias=cbias, phi=phi)
+            a = layer(a, pe, kt, vt, bias, valid, ctok=ctok, cbias=cbias, relpos=relpos)
         diag = layers[-1].last_diag
         with g.fp32(a.device):
             nu = lnu_depth.exp() * valid.unsqueeze(1)
