@@ -248,7 +248,7 @@ class MAVTGrainPrior(nn.Module):
                 pe = self.readout.query_pe(f_t.shape[0], uq)
                 keep = tr["valid"] if grain_keep is None else tr["valid"] & grain_keep
                 a = self.readout.init(pe, S["c0"], z, pg, uq)
-                sp = self.splat(f_t, tr["u"], tr["z"], sigma, keep, der["scale"], S["c0"], z, uq)
+                sp, out["pix"] = self.splat(f_t, tr["u"], tr["z"], sigma, keep, der["scale"], S["c0"], z, uq)
                 fine = dict(a=a + sp.to(a.dtype), pe=pe)
             else:
                 fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
@@ -287,21 +287,28 @@ class MAVTGrainPrior(nn.Module):
         return lambda x: torch.where(on, x.detach(), x)
 
     def rgb_of(self, F: torch.Tensor, H: torch.Tensor, a0: Optional[torch.Tensor] = None,
-               low: Optional[torch.Tensor] = None) -> torch.Tensor:
+               low: Optional[torch.Tensor] = None, pix: Optional[torch.Tensor] = None) -> torch.Tensor:
         """RGB in [0, 1] of one observation: from the DINO-space feature F or the decoder state H (cfg.rgb_from).
         rgb_coarse_start (2.3): X^ = clamp(sg[X~0] + R) with X~0 = low (or low_image(a0)); rgb_in_feat (3.3): the
-        head also receives sg[F] upsampled to its grid."""
+        head also receives sg[F] upsampled to its grid; pix (3.7): the splat's pixel atom map."""
         cfg = self.cfg
         if cfg.rgb_coarse_start and low is None:
             if a0 is None:
                 raise ValueError("rgb_coarse_start needs a0 or low")
             low = self.rgb.low_image(a0)
-        return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None)
+        return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None, pix=pix)
+
+    @staticmethod
+    def _pix_of(outs: list) -> Optional[torch.Tensor]:
+        """3.7: the pixel atom maps of decoded observations stacked as rgb_of's batch (None without them)."""
+        if not outs or outs[0].get("pix") is None:
+            return None
+        return torch.stack([o["pix"] for o in outs], 1).flatten(0, 1)
 
     # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
     _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
                      "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx",
-                     "splat"}
+                     "splat", "amp_pix", "freq_pix", "pix_in", "pix_blocks"}
 
     def new_param_prefixes(self) -> tuple:
         """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):
@@ -430,7 +437,7 @@ class MAVTGrainPrior(nn.Module):
         Fh = torch.stack([o["F_hat"] for o in outs], 1)
         Hh = torch.stack([o["H_hat"] for o in outs], 1)
         A0 = torch.stack([o["a0"] for o in outs], 1)
-        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), A0.flatten(0, 1)).view(
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), A0.flatten(0, 1), pix=self._pix_of(outs)).view(
             Fh.shape[0], Fh.shape[1], 3, self.cfg.image_size, self.cfg.image_size)
         return dict(F=Fh, rgb=rgb * 2 - 1, depth=torch.stack([o["depth_dense"] for o in outs], 1))
 
@@ -536,7 +543,8 @@ class MAVTGrainPrior(nn.Module):
         kappa = kappa_of(zeta)
         z_i = mem(b)
         base = self.decode_obs(S, der, z_i, xi, kappa, M, prev=prev_obs)
-        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"])
+        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"],
+                             pix=base.get("pix"))
         eF = st["F"] - base["F_base"].detach()
         eX = Xi - X_base.detach()
         r = self.innov(eF, eX, z_i, xi, kappa, M)
@@ -631,7 +639,7 @@ class MAVTGrainPrior(nn.Module):
         low = None
         if cfg.rgb_coarse_start:                                      # 2.3: X~0 of every observation, own loss
             low = self.rgb.low_image(torch.stack([o["a0"] for o in outs], 1).flatten(0, 1))
-        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), low=low).view(B, n, 3, S_img, S_img)
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), low=low, pix=self._pix_of(outs)).view(B, n, 3, S_img, S_img)
         Ft = torch.stack([s["F"] for s in st], 1)
         # ---- L_rec on every observation (full), base and initializer on the targets, init also on the anchor
         loss = self._rec(rgb, X01, Fh, Ft, parts, diag, "rec")

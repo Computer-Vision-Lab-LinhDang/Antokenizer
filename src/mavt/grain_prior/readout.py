@@ -431,6 +431,20 @@ class ConvNeXtBlock(nn.Module):
         return x + self.fc2(F.gelu(self.fc1(self.norm(self.dw(x)))))
 
 
+class ResBlock(nn.Module):
+    """x + W_2 GELU(W_1 x) with 3 x 3 convolutions, hidden width h, W_2 zero-init (identity at init): spatial
+    refinement at the pixel stages of the pointwise head (3.7, rgb_pix_blocks)."""
+
+    def __init__(self, c: int, h: int):
+        super().__init__()
+        self.c1, self.c2 = nn.Conv2d(c, h, 3, padding=1), nn.Conv2d(h, c, 3, padding=1)
+        nn.init.zeros_(self.c2.weight)
+        nn.init.zeros_(self.c2.bias)
+
+    def forward(self, x):
+        return x + self.c2(F.gelu(self.c1(x)))
+
+
 class PointwiseRGB(nn.Module):
     """3.3: query-grid state [B, dim, s, s] -> residual image [B, 3, S, S] (no sigmoid; the caller composes).
 
@@ -440,9 +454,13 @@ class PointwiseRGB(nn.Module):
     Receptive field at the output: the 1x1 blocks and PixelShuffle mix nothing spatially; conv3x3 @128 spans
     +-1 px @128 = +-2 px @256; two conv3x3 @256 span +-2 px: total +-4 px, a 9 px window <= 16 px.
     Capacity sits in the 1x1 MLPs (ratio 4: 4 x 2 x 512 x 2048 = 8.4 M of the ~8.8 M parameters).
+    3.7: pix_blocks ResBlocks (hidden max(c, pix_width)) after every stage widen the receptive field by 4 px per
+    block at the image; pix_feat > 0: a pixel map [B, pix_feat, S, S] (the splat's pixel atoms) joins the last
+    stage's output through a 1 x 1 projection (no bias) before its blocks.
     """
 
-    def __init__(self, dim: int, n_up: int, ratio: float):
+    def __init__(self, dim: int, n_up: int, ratio: float, pix_blocks: int = 0, pix_width: int = 128,
+                 pix_feat: int = 0):
         super().__init__()
         self.blocks = nn.Sequential(*[PointMLP(dim, ratio) for _ in range(4)])
         stages, c = [], dim
@@ -452,13 +470,27 @@ class PointwiseRGB(nn.Module):
             if k >= 1:
                 convs += [nn.Conv2d(c, c, 3, padding=1), nn.GELU()]
             stages.append(nn.Sequential(*convs))
-        self.stages = nn.Sequential(*stages)
+        self.stages = nn.ModuleList(stages)
+        if pix_blocks:
+            widths = [dim // 4 ** (k + 1) for k in range(n_up)]
+            self.pix_blocks = nn.ModuleList([nn.Sequential(*[ResBlock(w, max(w, pix_width)) for _ in range(pix_blocks)])
+                                             for w in widths])
+        if pix_feat:
+            self.pix_in = nn.Conv2d(pix_feat, c, 1, bias=False)
         self.final = nn.Conv2d(c, 3, 1)
         nn.init.zeros_(self.final.weight)
         nn.init.zeros_(self.final.bias)
 
-    def forward(self, x):
-        return self.final(self.stages(self.blocks(x)))
+    def forward(self, x, pix=None):
+        x = self.blocks(x)
+        last = len(self.stages) - 1
+        for k, stage in enumerate(self.stages):
+            x = stage(x)
+            if k == last and pix is not None:
+                x = x + self.pix_in(pix.to(x.dtype))
+            if hasattr(self, "pix_blocks"):
+                x = self.pix_blocks[k](x)
+        return self.final(x)
 
 
 class RGBHead(nn.Module):
@@ -478,7 +510,8 @@ class RGBHead(nn.Module):
         self.proj = nn.Linear(teacher_dim, cfg.dim)
         self.pointwise = cfg.rgb_head == "pointwise"
         if self.pointwise:
-            self.pw = PointwiseRGB(cfg.dim, n_up, cfg.rgb_pw_mlp_ratio)
+            self.pw = PointwiseRGB(cfg.dim, n_up, cfg.rgb_pw_mlp_ratio, cfg.rgb_pix_blocks, cfg.rgb_pix_width,
+                                   cfg.splat_pix_feat)
         else:
             ch = [cfg.dim] + list(cfg.rgb_channels)[:n_up]
             self.convs = nn.ModuleList([nn.Conv2d(ch[i], ch[i + 1], 3, padding=1) for i in range(n_up)])
@@ -505,8 +538,10 @@ class RGBHead(nn.Module):
         x = torch.sigmoid(self.low(a0.float()).float()).transpose(1, 2).reshape(B, 3, G, G)
         return pyr_up(x, self.n_pyr).clamp(0, 1)
 
-    def residual(self, Fh: torch.Tensor, feat: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Pre-activation output R [B, 3, S, S] of the trunk (legacy: before the sigmoid)."""
+    def residual(self, Fh: torch.Tensor, feat: Optional[torch.Tensor] = None,
+                 pix: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Pre-activation output R [B, 3, S, S] of the trunk (legacy: before the sigmoid); pix (3.7): the splat's
+        pixel atom map for the pointwise head."""
         B, N, _ = Fh.shape
         G = self.side
         x = self.proj(Fh)
@@ -519,13 +554,14 @@ class RGBHead(nn.Module):
         for blk in getattr(self, "ctx", ()):
             x = blk(x)
         if self.pointwise:
-            return self.pw(x).float()
+            return self.pw(x, pix).float()
         for conv in self.convs:
             x = F.gelu(conv(F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)))
         return self.final(x).float()
 
-    def forward(self, Fh: torch.Tensor, low: Optional[torch.Tensor] = None, feat: Optional[torch.Tensor] = None):
-        r = self.residual(Fh, feat)
+    def forward(self, Fh: torch.Tensor, low: Optional[torch.Tensor] = None, feat: Optional[torch.Tensor] = None,
+                pix: Optional[torch.Tensor] = None):
+        r = self.residual(Fh, feat, pix)
         if self.coarse:
             if low is None:
                 raise ValueError("rgb_coarse_start needs low = low_image(a0)")

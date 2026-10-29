@@ -68,3 +68,53 @@ def test_gradients_reach_the_grains_and_the_splat_decoder(modality):
     assert any(g is not None and g.abs().sum() > 0 for g in gs("anchor.w_f"))
     assert any(g is not None and g.abs().sum() > 0 for g in gs("splat.blocks"))
     assert any(g is not None and g.abs().sum() > 0 for g in gs("splat.amp"))       # atoms learn from step 0
+
+
+# ---------------------------------------------------------------- 3.7 pixel atoms (splat_pix_feat) and pixel ResBlocks
+PIX = dict(SPLAT, splat_pix_feat=4, splat_pix_atoms=2, rgb_pix_blocks=2, rgb_pix_width=8)
+
+
+def _load_from(src, dst):
+    missing, unexpected = dst.load_state_dict(src.state_dict(), strict=False)
+    assert not unexpected
+    return missing
+
+
+def _rgb(m, x):
+    o = m(x, "image", return_outputs=True)["outputs"]
+    return o["rgb"]
+
+
+def test_pixel_atoms_and_pixel_blocks_are_off_by_default():
+    m = _model()
+    assert not any(n.startswith(("splat.amp_pix", "splat.freq_pix", "rgb.pw.pix_in", "rgb.pw.pix_blocks"))
+                   for n, _ in m.named_parameters())
+
+
+def test_pixel_atoms_and_pixel_blocks_preserve_the_function_at_init():
+    """Zero-init pixel amplitudes (so the pixel map is 0) and zero-init ResBlock outputs: loading a checkpoint
+    trained without them reproduces its images exactly."""
+    base, m = _model(), _model(**PIX)
+    missing = _load_from(base, m)
+    assert missing and all(k.startswith(("splat.amp_pix", "splat.freq_pix", "rgb.pw.pix_in", "rgb.pw.pix_blocks"))
+                           for k in missing)
+    x, _ = _inputs("image", B=2)
+    with torch.no_grad():
+        assert torch.allclose(_rgb(base, x), _rgb(m, x), atol=1e-6)
+
+
+def test_pixel_atoms_map_has_the_image_resolution_and_learns():
+    m = _wake(_model(**PIX))
+    S = m(*_inputs("image", B=2)[:1], "image", return_outputs=True)["outputs"]["S"]
+    o = m.decode_anchor(S, m.derived(S))
+    assert o["pix"].shape == (2, 4, m.cfg.image_size, m.cfg.image_size)
+    x, cam = _inputs("image", B=2)
+    m(x, "image", cam)["loss"].backward()
+    gs = lambda pre: [p.grad for n, p in m.named_parameters() if n.startswith(pre)]
+    assert any(g is not None and g.abs().sum() > 0 for g in gs("splat.amp_pix"))
+    assert any(g is not None and g.abs().sum() > 0 for g in gs("rgb.pw.pix_blocks"))
+
+
+def test_pixel_atoms_need_the_pointwise_head():
+    with pytest.raises(ValueError):
+        tiny_config(**{**PIX, "rgb_head": "legacy", "rgb_decoder": "read"}).check()

@@ -12,6 +12,10 @@
 The output W_out X_q joins the read's initial state a0; the existing RGB head is the local refiner. The window is
 indexed by the anchor stratum of each grain: exact on images and static anchors; transported grains (video) that
 leave their stratum's neighbourhood are read only inside it.
+4. splat_pix_feat > 0 (3.7): a second set of atoms (splat_pix_atoms, splat_pix_wmax, amplitudes zero-init) is
+   evaluated at the image pixels with the same window weights, giving a map [B, splat_pix_feat, S, S] that the
+   pointwise RGB head adds after its last x2 stage. On the query grid (4 queries per cell) atoms above 2 cycles per
+   cell alias; at the pixels the Nyquist limit is patch / 2 = 8 cycles per cell.
 """
 from __future__ import annotations
 
@@ -71,13 +75,28 @@ class GrainSplat(nn.Module):
         widx, wok = window_index(n, cfg.splat_window)
         self.register_buffer("widx", widx, persistent=False)
         self.register_buffer("wok", wok, persistent=False)
-        qg = cfg.query_grid
+        perm, inv = self._grouping(cfg.query_grid, n)
+        self.register_buffer("perm", perm, persistent=False)
+        self.register_buffer("inv", inv, persistent=False)
+        if cfg.splat_pix_feat:
+            Kp, Cp = cfg.splat_pix_atoms, cfg.splat_pix_feat
+            self.amp_pix = nn.Linear(d, Kp * 2 * Cp)
+            nn.init.zeros_(self.amp_pix.weight)
+            nn.init.zeros_(self.amp_pix.bias)
+            self.freq_pix = nn.Linear(d, Kp * 2)
+            perm_p, inv_p = self._grouping(cfg.image_size, n)
+            self.register_buffer("uq_pix", g.cell_centres(cfg.image_size), persistent=False)
+            self.register_buffer("perm_pix", perm_p, persistent=False)
+            self.register_buffer("inv_pix", inv_p, persistent=False)
+
+    @staticmethod
+    def _grouping(qg: int, n: int) -> tuple:
+        """Row-major query ids of a qg x qg grid grouped by stratum (perm) and the inverse permutation."""
         m = qg // n
         qy, qx = torch.arange(qg).repeat_interleave(qg), torch.arange(qg).repeat(qg)
         stratum = (qy // m) * n + qx // m
         perm = torch.argsort(stratum * qg * qg + torch.arange(qg * qg))
-        self.register_buffer("perm", perm, persistent=False)
-        self.register_buffer("inv", torch.argsort(perm), persistent=False)
+        return perm, torch.argsort(perm)
 
     def _depth(self, z_cam, scale):
         return z_cam.float() / scale.float().view(-1, 1) if self.cfg.tau_d_mode == "median" else z_cam.float()
@@ -104,9 +123,20 @@ class GrainSplat(nn.Module):
         w, _ = self._logits(uq.unsqueeze(-2), take(u_hat), take(sigma), take(depth.float()), ok)
         return w.squeeze(-2), idx, ok
 
-    def forward(self, f_t, u_hat, z_cam, sigma, valid, scale, c0, z, uq) -> torch.Tensor:
+    @staticmethod
+    def _atoms(w, delta, om, A):
+        """Window weights w [B, S, m, W], offsets delta [.., 2], frequencies om [B, S, W, K, 2], amplitudes
+        A [B, S, W, K, 2, C] -> sum_j w_qj sum_k (a_cos cos + a_sin sin)(2 pi <omega_jk, delta_qj>) [B, S, m, C]."""
+        ph = 2 * math.pi * torch.einsum("bsmwx,bswkx->bsmwk", delta, om)
+        dt = A.dtype
+        cw = (w.unsqueeze(-1) * torch.cos(ph)).flatten(-2).to(dt)                           # [B, S, m, W K]
+        sw = (w.unsqueeze(-1) * torch.sin(ph)).flatten(-2).to(dt)
+        return cw @ A[..., 0, :].flatten(2, 3) + sw @ A[..., 1, :].flatten(2, 3)
+
+    def forward(self, f_t, u_hat, z_cam, sigma, valid, scale, c0, z, uq) -> tuple:
         """Grains at the observation (f~ [B, G, d_f], u^ [B, G, 2], z_cam, sigma, valid [B, G]), depth scale [B],
-        c_0 / z_i [B, n_c, d_c], the RGB query grid uq [B, Q, 2] (cell centres of query_grid) -> [B, Q, dim]."""
+        c_0 / z_i [B, n_c, d_c], the RGB query grid uq [B, Q, 2] (cell centres of query_grid) -> ([B, Q, dim],
+        pixel atom map [B, splat_pix_feat, S, S] or None)."""
         cfg = self.cfg
         B, G = f_t.shape[:2]
         dd = self._depth(z_cam, scale)
@@ -135,10 +165,16 @@ class GrainSplat(nn.Module):
         w, delta = self._logits(uq_g, pick(u_hat), pick(sigma), pick(dd), ok)              # [B, S, m, W], [.., 2]
         X = w.to(e.dtype) @ pick(e)                                                      # [B, S, m, C]
         if K:
-            ph = 2 * math.pi * torch.einsum("bsmwx,bswkx->bsmwk", delta, pick(om))
-            Aw = pick(A)                                                                 # [B, S, W, K, 2, C]
-            cw = (w.unsqueeze(-1) * torch.cos(ph)).flatten(-2).to(e.dtype)               # [B, S, m, W K]
-            sw = (w.unsqueeze(-1) * torch.sin(ph)).flatten(-2).to(e.dtype)
-            X = X + cw @ Aw[..., 0, :].flatten(2, 3) + sw @ Aw[..., 1, :].flatten(2, 3)
+            X = X + self._atoms(w, delta, pick(om), pick(A))
         X = X.flatten(1, 2)[:, self.inv]                                                 # [B, Q, C] row-major
-        return self.out(X)
+        pix = None
+        if cfg.splat_pix_feat:
+            Kp, Cp, S = cfg.splat_pix_atoms, cfg.splat_pix_feat, cfg.image_size
+            Ap = self.amp_pix(hg).view(B, G, Kp, 2, Cp)
+            omp = cfg.splat_pix_wmax * torch.tanh(self.freq_pix(hg).float()).view(B, G, Kp, 2)
+            up = self.uq_pix.unsqueeze(0).expand(B, -1, -1)[:, self.perm_pix].view(B, n2, -1, 2)
+            # ponytail: one shot over all pixels ([B, S^2, W, Kp] phases); chunk over strata if memory bites
+            wp, dp = self._logits(up, pick(u_hat), pick(sigma), pick(dd), ok)
+            P = self._atoms(wp, dp, pick(omp), pick(Ap)).flatten(1, 2)[:, self.inv_pix]   # [B, S^2, Cp]
+            pix = P.transpose(1, 2).reshape(B, Cp, S, S)
+        return self.out(X), pix

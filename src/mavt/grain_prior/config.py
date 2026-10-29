@@ -127,6 +127,11 @@ class GrainPriorConfig(CD32Config):
     splat_atoms: int = 6                  # splat: LTE-style frequency atoms per grain (0: none)
     splat_window: int = 2                 # splat: a query reads the grains of the (2 w + 1)^2 strata around its own
     splat_wmax: float = 8.0               # splat: largest atom frequency, cycles per cell
+    splat_pix_feat: int = 0               # 3.7 (> 0): atoms also evaluated at the image pixels (no aliasing above the
+    splat_pix_atoms: int = 6              #   query-grid Nyquist), width of that map; their count and
+    splat_pix_wmax: float = 8.0           #   largest frequency (cycles per cell; pixel Nyquist = patch / 2)
+    rgb_pix_blocks: int = 0               # 3.7: ResBlocks (3x3, GELU, 3x3 zero-init) after each x2 stage of the pointwise head
+    rgb_pix_width: int = 128              # 3.7: hidden width of those blocks (at least the stage width)
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
     read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
     entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
@@ -284,6 +289,12 @@ class GrainPriorConfig(CD32Config):
                                             or self.query_grid % self.n_strata or self.splat_atoms < 0
                                             or self.splat_layers < 0 or self.splat_window < 0):
             raise ValueError("rgb_decoder=splat: legacy readout, query_grid divisible by n_strata, sizes >= 0")
+        if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:
+            raise ValueError("splat_pix_feat, splat_pix_atoms, rgb_pix_blocks >= 0; rgb_pix_width >= 1")
+        if (self.splat_pix_feat or self.rgb_pix_blocks) and self.rgb_head != "pointwise":
+            raise ValueError("splat_pix_feat / rgb_pix_blocks need rgb_head=pointwise")
+        if self.splat_pix_feat and (self.rgb_decoder != "splat" or self.image_size % self.n_strata):
+            raise ValueError("splat_pix_feat needs rgb_decoder=splat and image_size divisible by n_strata")
         if self.train_scope not in ("all", "decoder") or (self.train_scope == "decoder" and self.phase != "codec"):
             raise ValueError("train_scope: all | decoder (decoder: phase codec only)")
         if self.w_pred_frame < 0:
