@@ -81,6 +81,7 @@ section per item), `tests/grain_prior/test_evaluate_mechanism.py` (3.2).
 | 3.3 | `rgb_head=pointwise`, `rgb_pw_mlp_ratio`, `rgb_in_feat` | 4 x 1 x 1 MLP blocks with per-point LayerNorm, PixelShuffle x2 + conv3x3 stages, 1 x 1 -> 3 zero-init (receptive field 9 px <= 16; needs image / side <= 4, i.e. `query_grid` >= image / 4); `rgb_in_feat`: H + W up(sg[F^]) with W from the DINO width. |
 | 3.4 | `read_split_layer2` | the last ReadLayer exists twice: feature grid (F_base, depth) and RGB grid (needs `query_grid`). |
 | 3.5 | `state_noise_bits`, `geom_noise_px` | training only: f, c_0 + U(-D/2, D/2), D = batch range / 2^bits; u + N(0, (px / image_size)^2). |
+| 3.6 | `rgb_decoder=splat`, `splat_layers`, `splat_feat`, `splat_atoms`, `splat_window`, `splat_wmax` | RGB grid only (needs `query_grid` % n_strata = 0 and the legacy readout; use `rgb_head=pointwise`): a context transformer over the grains and the [c_0; z] slots (attention biased by the per-head scaled `geom_bias`), K frequency atoms per grain (amplitudes zero-init, omega = wmax tanh(.) cycles per cell), splatted over a (2w+1)^2 window of strata with depth-aware Gaussian weights; added to `readout.init` a^(0), then the RGB head. Replaces the read layers on the RGB grid (`splat.py`, `test_splat_decoder.py`). |
 
 3.2 (no training): `python -m mavt.grain_prior.evaluate_mechanism --ckpt <run>/last.pt --openvid <manifest> --out
 <dir>` writes `mechanism.json` / `.md`: CD1 (D off), CD3 (C -> + xi -> + M -> + r(L)), CD5 (c_0 swapped: change by
