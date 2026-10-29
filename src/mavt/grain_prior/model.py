@@ -35,6 +35,7 @@ from .layers import mlp2
 from .losses import PatchDisc, band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
+from .splat import GrainSplat
 from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
 from .refinement import CorrRead, UpdateHead
 from .trunk import Bank, PInit, StreamD
@@ -84,6 +85,8 @@ class MAVTGrainPrior(nn.Module):
         # shared readouts own their reader (query_decoder); a second, unused Readout would stall DDP
         self.readout = Readout(cfg, Dt) if cfg.readout_version == "legacy" else None
         self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt, feat_dim=Dt)
+        if cfg.rgb_decoder == "splat":                                # RGB state by context + atoms + splat
+            self.splat = GrainSplat(cfg)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
         if cfg.sem_target:                                            # 2.5: head on c_0; the teacher is not a module
@@ -106,7 +109,7 @@ class MAVTGrainPrior(nn.Module):
                 p.requires_grad_(False)
         if cfg.train_scope == "decoder":                              # frozen encoder: the decoder and D train
             for n, p in self.named_parameters():
-                if not n.startswith(("readout.", "rgb.", "disc.")):
+                if not n.startswith(("readout.", "rgb.", "disc.", "splat.")):
                     p.requires_grad_(False)
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
         self.global_step = 0                                          # 1.2: set by forward(step=) / set_step
@@ -240,8 +243,16 @@ class MAVTGrainPrior(nn.Module):
             out["dF"], dH = self.readout.innovation(out["a"], out["pe"], r, L, return_hidden=True)
             out["F_hat"], out["H_hat"] = out["F_base"] + out["dF"], out["a"] + dH
         if cfg.query_grid and rgb:
-            fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
-                                     grain_keep=grain_keep)
+            if cfg.rgb_decoder == "splat":
+                uq = self.uq_rgb.expand(f_t.shape[0], -1, -1)
+                pe = self.readout.query_pe(f_t.shape[0], uq)
+                keep = tr["valid"] if grain_keep is None else tr["valid"] & grain_keep
+                a = self.readout.init(pe, S["c0"], z, pg, uq)
+                sp = self.splat(f_t, tr["u"], tr["z"], sigma, keep, der["scale"], S["c0"], z, uq)
+                fine = dict(a=a + sp.to(a.dtype), pe=pe)
+            else:
+                fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
+                                         grain_keep=grain_keep)
             out["a_rgb"], out["pe_rgb"] = fine["a"], fine["pe"]
             if use_prev:
                 out["a_rgb"] = self._add_prev(fine["a"], self.uq_rgb.expand(f_t.shape[0], -1, -1), prev, tr, sigma, S)
@@ -289,7 +300,8 @@ class MAVTGrainPrior(nn.Module):
 
     # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
     _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
-                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx"}
+                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx",
+                     "splat"}
 
     def new_param_prefixes(self) -> tuple:
         """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):

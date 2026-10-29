@@ -121,6 +121,12 @@ class GrainPriorConfig(CD32Config):
     train_scope: str = "all"              # all | decoder: only readout.*, rgb.* (and disc.*) are trained; meant for
                                           # images: on clips appear / recur / beta (memory, motion) stay frozen too
     rgb_ctx_blocks: int = 0               # ConvNeXt blocks (7 x 7 depthwise, zero-init) before the RGB head
+    rgb_decoder: str = "read"             # read: RGB state = grain read on query_grid | splat: splat.GrainSplat
+    splat_layers: int = 4                 # splat: context blocks over grains + [c_0; z] slots (geometry-biased)
+    splat_feat: int = 64                  # splat: decoded feature width per grain
+    splat_atoms: int = 6                  # splat: LTE-style frequency atoms per grain (0: none)
+    splat_window: int = 2                 # splat: a query reads the grains of the (2 w + 1)^2 strata around its own
+    splat_wmax: float = 8.0               # splat: largest atom frequency, cycles per cell
     read_normalizer: str = "softmax"      # 2.4: softmax (SDPA) | entmax15 (explicit, alpha per head) | topk (SDPA)
     read_topk: int = 0                    # 2.4 topk: grains kept per query by the geometry bias (coarse / sink kept)
     entmax_alpha_init: float = 1.0        # 2.4 entmax15: alpha at step 0 (learned: clamped to [1.05, 1.95])
@@ -272,6 +278,12 @@ class GrainPriorConfig(CD32Config):
             raise ValueError("sem_target: '' | stub | dinov3txt | siglip2; w_sem >= 0 and needs a sem_target")
         if self.w_gan < 0 or self.gan_start < 0 or self.rgb_ctx_blocks < 0 or self.disc_layers < 1:
             raise ValueError("w_gan, gan_start, rgb_ctx_blocks >= 0; disc_layers >= 1")
+        if self.rgb_decoder not in ("read", "splat"):
+            raise ValueError("rgb_decoder: read | splat")
+        if self.rgb_decoder == "splat" and (not self.query_grid or self.readout_version != "legacy"
+                                            or self.query_grid % self.n_strata or self.splat_atoms < 0
+                                            or self.splat_layers < 0 or self.splat_window < 0):
+            raise ValueError("rgb_decoder=splat: legacy readout, query_grid divisible by n_strata, sizes >= 0")
         if self.train_scope not in ("all", "decoder") or (self.train_scope == "decoder" and self.phase != "codec"):
             raise ValueError("train_scope: all | decoder (decoder: phase codec only)")
         if self.w_pred_frame < 0:
