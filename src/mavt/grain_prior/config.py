@@ -172,7 +172,8 @@ class GrainPriorConfig(CD32Config):
     w_init: float = 0.25
     w_geom: float = 1.0
     w_pose: float = 0.1
-    w_motion: float = 1e-3
+    w_motion: float = 1e-3                # |M|^2 penalty; it fights any learned motion: set 0 with w_warp (3.10)
+    w_warp: float = 0.0                   # 3.10: self-supervised photometric warp of the transported grains (losses.warp_loss)
     w_code: float = 1e-4
     depth_delta: float = 0.1              # Huber delta of the log-depth loss
     lpips_max_frames: int = 64
@@ -297,8 +298,8 @@ class GrainPriorConfig(CD32Config):
             raise ValueError("rgb_decoder=splat: legacy readout, query_grid divisible by n_strata, sizes >= 0")
         if self.splat_index not in ("anchor", "projected") or self.splat_cap < 1:
             raise ValueError("splat_index: anchor | projected; splat_cap >= 1")
-        if self.w_edge < 0:
-            raise ValueError("w_edge >= 0")
+        if self.w_edge < 0 or self.w_warp < 0:
+            raise ValueError("w_edge, w_warp >= 0")
         if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:
             raise ValueError("splat_pix_feat, splat_pix_atoms, rgb_pix_blocks >= 0; rgb_pix_width >= 1")
         if (self.splat_pix_feat or self.rgb_pix_blocks) and self.rgb_head != "pointwise":

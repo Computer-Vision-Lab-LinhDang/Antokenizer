@@ -33,7 +33,7 @@ from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
 from .losses import (PatchDisc, band_fractions, edge_loss, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss,
-                     semantic_teacher)
+                     semantic_teacher, warp_loss)
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .splat import GrainSplat
@@ -669,6 +669,11 @@ class MAVTGrainPrior(nn.Module):
             lm = (Ms ** 2).sum(-1).mean()
             parts["motion"] = lm.detach()
             loss = loss + cfg.w_motion * lm
+            if cfg.w_warp > 0:                                        # 3.10: the anchor feature of each grain must be
+                lw = torch.stack([warp_loss(Ft[:, 0], Ft[:, j + 1], S["u"], o["base"]["tr"]["u"],   # found where it
+                                            o["base"]["tr"]["valid"]) for j, o in enumerate(tg)]).mean()   # projects
+                parts["warp"] = diag["warp_err"] = lw.detach()
+                loss = loss + cfg.w_warp * lw
         code = [S["f"].pow(2).mean(), S["c0"].pow(2).mean()]
         for o in tg:
             code += [o["rec"]["b"].pow(2).mean(), o["rec"]["r"][..., 4:].pow(2).mean()]

@@ -39,6 +39,20 @@ def huber_log_depth(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor, de
     return F.huber_loss(d[m], torch.zeros_like(d[m]), delta=delta)
 
 
+def warp_loss(F0: torch.Tensor, F_t: torch.Tensor, u0: torch.Tensor, u_t: torch.Tensor,
+              valid: torch.Tensor) -> torch.Tensor:
+    """3.10 self-supervised photometric warp on the transported grains: the (frozen) feature of each grain on the
+    anchor grid F0 [B, N, D] at u0 [B, G, 2] (detached, so only the transport moves) against the target grid F_t
+    at the projected position u_t [B, G, 2]; mean 1 - cos over the grains that are valid and inside the image.
+    Differentiable in u_t through the bilinear weights: the gradient reaches xi, M, kappa and, through the
+    parallax, rho. 0 (with a graph) when no grain qualifies."""
+    grid = int(round(F0.shape[1] ** 0.5))
+    m = valid & ((u_t >= 0) & (u_t <= 1)).all(-1)
+    a = g.read_coarse(F0.float(), u0.detach(), grid).detach()
+    b = g.read_coarse(F_t.float(), u_t, grid)
+    return feat_loss(b, a, 0.0, m)
+
+
 def pose_loss(R: torch.Tensor, t: torch.Tensor, R_gt: torch.Tensor, t_gt: torch.Tensor, s_scene: torch.Tensor):
     """[B, 3, 3], [B, 3] each; s_scene [B] -> scalar."""
     w = g.se3_log(R_gt.transpose(-1, -2) @ R, torch.zeros_like(t))[..., 3:]
