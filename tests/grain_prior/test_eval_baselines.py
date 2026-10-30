@@ -72,3 +72,16 @@ def test_eval_dry_run_reports_copy_last_novel_view_and_the_per_record_curve(tmp_
         assert len(v["target_by_record"]) == tiny_config().queue
     md = (out / "eval.md").read_text()
     assert "copy last" in md and "novel view" in md
+
+
+def test_eval_reports_the_two_learning_gates(tmp_path):
+    """Gate 1 (video): L = 0 minus copy-last, in dB. Gate 2 (posed views): novel view minus copy-anchor, in dB."""
+    out = tmp_path / "ev"
+    assert _script("eval_grain_prior").main(["--dry-run", "--L-list", "0,max", "--out", str(out)]) == 0
+    res = json.loads((out / "eval.json").read_text())
+    v, t = res["clips"]["video"], res["clips"]["threed"]
+    L0 = next(c for c in v["curve"] if c["L"] == 0)
+    assert abs(v["gates"]["L0_minus_copy_last_db"] - (L0["psnr"] - v["copy_last"]["psnr"])) < 1e-6
+    assert abs(t["gates"]["nvs_minus_copy_db"] - (t["nvs"]["psnr"] - t["copy"]["psnr"])) < 1e-6
+    md = (out / "eval.md").read_text()
+    assert "gates:" in md and "L0 - copy-last" in md and "novel view - copy" in md

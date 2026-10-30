@@ -15,6 +15,8 @@ the anchor, and the targets of the closed state after a serialize / deserialize 
   copy last  the previous frame as the target (no model)
   novel view grains + c_0 + the record's camera / motion only: no memory update, no innovation (eval_baselines)
   by record  the full-state score of each record of the queue (distance from the anchor)
+  gates      the two learning gates, in dB: L0_minus_copy_last_db (video: does the prediction branch beat carrying the
+             last frame forward?) and nvs_minus_copy_db (posed views: does the geometry alone beat copying the anchor?)
 plus the payload counted by serializing the state, and the model diagnostics (base cosine per refinement
 pass, initializer cosine, support, depth, cameras). World clips are scored twice: with the given cameras
 copied (calibrated video) and with estimated cameras (--world-camera).
@@ -123,9 +125,13 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
     res = acc.result()
     curve = [dict(L=L, numbers=res[f"L={L}/numbers"]["n"], **res[f"L={L}"]) for L in L_list]
     q = len([k for k in res if k.startswith("rec")])
+    L0 = res.get("L=0")
+    gates = dict(L0_minus_copy_last_db=(L0["psnr"] - res["copy_last"]["psnr"]) if L0 else None,
+                 nvs_minus_copy_db=res["nvs"]["psnr"] - res["copy"]["psnr"])
     return dict(n_clips=seen, n_frames=T, anchor=res["anchor"], target=res["target"], copy=res["copy"],
                 copy_last=res["copy_last"], nvs=res["nvs"], target_by_record=[res[f"rec{j}"] for j in range(q)],
-                curve=curve, payload=pay.mean, diag={k: m.mean for k, m in dg.items()}, seconds=time.time() - t0)
+                gates=gates, curve=curve, payload=pay.mean, diag={k: m.mean for k, m in dg.items()},
+                seconds=time.time() - t0)
 
 
 def _f(v, nd=2) -> str:
@@ -165,6 +171,11 @@ def to_markdown(res: dict) -> str:
         if v.get("target_by_record"):
             lines.append("")
             lines.append("target by record (full state), PSNR: " + " / ".join(_f(r.get("psnr")) for r in v["target_by_record"]))
+        if v.get("gates"):
+            g_ = v["gates"]
+            lines.append("")
+            lines.append(f"gates: L0 - copy-last = {_f(g_.get('L0_minus_copy_last_db'))} dB; "
+                         f"novel view - copy anchor = {_f(g_.get('nvs_minus_copy_db'))} dB")
         d = v["diag"]
         lines += ["", " ".join(f"{k}={_f(d[k], 3)}" for k in DIAG if k in d), ""]
     return "\n".join(lines)
