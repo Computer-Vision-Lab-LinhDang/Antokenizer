@@ -40,14 +40,30 @@ def cell_centres(grid: int, device=None) -> torch.Tensor:
     return torch.stack([x, y], -1).reshape(-1, 2)
 
 
+def bilinear_weights(u: torch.Tensor, side: int) -> torch.Tensor:
+    """Bilinear interpolation weights [B, M, side^2] (fp32) of positions u [B, M, 2] on a side x side grid with
+    cell centres at (j + 0.5) / side and border padding: the same taps and weights as F.grid_sample(mode=bilinear,
+    padding_mode=border, align_corners=False). Differentiable in u through the fractional parts."""
+    B, M = u.shape[:2]
+    x = (u[..., 0].float() * side - 0.5).clamp(0, side - 1)
+    y = (u[..., 1].float() * side - 0.5).clamp(0, side - 1)
+    x0, y0 = x.floor(), y.floor()
+    fx, fy = x - x0, y - y0
+    x0, y0 = x0.long(), y0.long()
+    x1, y1 = (x0 + 1).clamp(max=side - 1), (y0 + 1).clamp(max=side - 1)
+    idx = torch.stack([y0 * side + x0, y0 * side + x1, y1 * side + x0, y1 * side + x1], -1)     # [B, M, 4]
+    w = torch.stack([(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy], -1)
+    return u.new_zeros(B, M, side * side, dtype=torch.float32).scatter_add(-1, idx, w)
+
+
 def read_coarse(tokens: torch.Tensor, u: torch.Tensor, side: int) -> torch.Tensor:
     """Bilinear read of a side x side token grid [B, side^2, C] at normalised positions u [B, M, 2] -> [B, M, C]
-    (token centres at (j + 0.5) / side; outside the grid the border value)."""
-    B, _, C = tokens.shape
-    img = tokens.transpose(1, 2).reshape(B, C, side, side)
-    g = (u.to(img.dtype) * 2 - 1).unsqueeze(1)                                       # [B, 1, M, 2]
-    out = F.grid_sample(img, g, mode="bilinear", padding_mode="border", align_corners=False)
-    return out.squeeze(2).transpose(1, 2)
+    (token centres at (j + 0.5) / side; outside the grid the border value). Computed as bilinear_weights(u) @ tokens
+    in fp32: identical to grid_sample, with a bmm backward instead of grid_sampler_2d_backward (atomic adds into a
+    tiny map: the slowest GPU op of a training step on ROCm)."""
+    with torch.autocast(u.device.type, enabled=False):
+        out = torch.bmm(bilinear_weights(u, side), tokens.float())
+    return out.to(tokens.dtype)
 
 
 # ---------------------------------------------------------------------------------- intrinsics

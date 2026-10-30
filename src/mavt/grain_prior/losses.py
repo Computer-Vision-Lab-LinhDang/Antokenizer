@@ -47,11 +47,7 @@ def pose_loss(R: torch.Tensor, t: torch.Tensor, R_gt: torch.Tensor, t_gt: torch.
 
 def sample_cells(x: torch.Tensor, u: torch.Tensor, grid: int) -> torch.Tensor:
     """Bilinear read of a per-cell map x [B, G*G] at normalised positions u [B, M, 2] -> [B, M]."""
-    B = x.shape[0]
-    img = x.float().view(B, 1, grid, grid)
-    out = F.grid_sample(img, (u.float() * 2 - 1).unsqueeze(1), mode="bilinear", padding_mode="border",
-                        align_corners=False)
-    return out.view(B, -1)
+    return g.read_coarse(x.float().unsqueeze(-1), u, grid).squeeze(-1)
 
 
 class PatchDisc(nn.Module):
