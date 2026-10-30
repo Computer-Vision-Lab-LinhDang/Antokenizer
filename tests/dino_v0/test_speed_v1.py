@@ -317,3 +317,19 @@ def test_profile_script_cpu_smoke(tmp_path, capsys):
                       "--batch-video", "1", "--batch-3d", "1", "--n-frames", "2", "--n-views", "2", "--steps", "1"]) == 0
     out = capsys.readouterr().out
     assert "image 2 + video 1 + threed 1" in out and "ms/step" in out
+
+
+def test_apply_compile_regions_argument_restricts_the_classes():
+    """apply_compile(regions=...) compiles only the named block classes (the trainer's --compile-regions)."""
+    tr = _script("train_dino_v0")
+    cfg = tiny_config()
+    torch.manual_seed(0)
+    model = MAVTDinoV0(cfg).eval()
+    saved = (torch._dynamo.config.suppress_errors, torch._dynamo.config.cache_size_limit)
+    try:
+        done = tr.apply_compile(model, "eager", log=lambda s: None, regions=("TrunkLayer",), conv_head=False)
+        names = [n for n, m in model.named_modules() if type(m).__name__ == "TrunkLayer"]
+        assert done == names and len(done) == cfg.trunk_layers
+        assert not any(n in done for n, m in model.named_modules() if type(m).__name__ == "CBlock")
+    finally:
+        torch._dynamo.config.suppress_errors, torch._dynamo.config.cache_size_limit = saved
