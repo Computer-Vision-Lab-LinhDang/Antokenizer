@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..cd32.depth import ordinal, silog
 from . import geometry as g
 
 EPS = 1e-6
@@ -51,6 +52,31 @@ def warp_loss(F0: torch.Tensor, F_t: torch.Tensor, u0: torch.Tensor, u_t: torch.
     a = g.read_coarse(F0.float(), u0.detach(), grid).detach()
     b = g.read_coarse(F_t.float(), u_t, grid)
     return feat_loss(b, a, 0.0, m)
+
+
+DEPTH_LOSSES = ("huber", "silog", "ordinal")
+
+
+def depth_loss(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor, kind: str, delta: float) -> torch.Tensor:
+    """3.11: depth pred / gt [B, N] (> 0 where mask) -> huber: the absolute Huber log-depth above; silog: per-sample
+    zero-mean (scale-invariant) RMS of the log difference; ordinal: pairwise depth order (cd32.depth). The relative
+    kinds see the structure of a flat prediction that the absolute Huber (delta 0.1) lets through on an object at
+    distance 2 with a thickness of +-0.25. Cells without a label contribute nothing in every kind."""
+    if kind == "huber":
+        return huber_log_depth(pred, gt, mask, delta)
+    m = mask & (gt > 0) & torch.isfinite(gt)
+    if m.sum() < 2:
+        return pred.sum() * 0
+    lp, lg = torch.log(pred.float().clamp_min(EPS)), torch.log(gt.float().clamp_min(EPS))
+    lg = torch.where(m, lg, torch.zeros_like(lg))
+    return silog(lp, lg, m, lam=1.0) if kind == "silog" else ordinal(lp, lg, m)
+
+
+def bg_pin_loss(d: torch.Tensor, labelled: torch.Tensor, far: float, delta: float) -> torch.Tensor:
+    """3.11: Huber of log d - log far over the grains WITHOUT a depth label (background): they are pinned to the far
+    plane instead of drifting freely and projecting off the other views. 0 when every grain is labelled."""
+    gt = torch.full_like(d.float(), far)
+    return huber_log_depth(d, gt, ~labelled, delta)
 
 
 def pose_loss(R: torch.Tensor, t: torch.Tensor, R_gt: torch.Tensor, t_gt: torch.Tensor, s_scene: torch.Tensor):

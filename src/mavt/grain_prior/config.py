@@ -176,6 +176,8 @@ class GrainPriorConfig(CD32Config):
     w_warp: float = 0.0                   # 3.10: self-supervised photometric warp of the transported grains (losses.warp_loss)
     w_code: float = 1e-4
     depth_delta: float = 0.1              # Huber delta of the log-depth loss
+    depth_loss: str = "huber"             # 3.11: huber (absolute) | silog (per-sample zero-mean log depth) | ordinal (depth order)
+    depth_bg_far: float = 0.0             # 3.11: > 0: anchor grains without a depth label are pinned (Huber log) to this depth
     lpips_max_frames: int = 64
 
     def __post_init__(self):
@@ -300,6 +302,8 @@ class GrainPriorConfig(CD32Config):
             raise ValueError("splat_index: anchor | projected; splat_cap >= 1")
         if self.w_edge < 0 or self.w_warp < 0:
             raise ValueError("w_edge, w_warp >= 0")
+        if self.depth_loss not in ("huber", "silog", "ordinal") or self.depth_bg_far < 0:
+            raise ValueError("depth_loss: huber | silog | ordinal; depth_bg_far >= 0")
         if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:
             raise ValueError("splat_pix_feat, splat_pix_atoms, rgb_pix_blocks >= 0; rgb_pix_width >= 1")
         if (self.splat_pix_feat or self.rgb_pix_blocks) and self.rgb_head != "pointwise":

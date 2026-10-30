@@ -32,8 +32,8 @@ from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import (PatchDisc, band_fractions, edge_loss, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss,
-                     semantic_teacher, warp_loss)
+from .losses import (PatchDisc, band_fractions, bg_pin_loss, depth_loss, edge_loss, feat_loss, huber_log_depth, pose_loss,
+                     sample_cells, sem_loss, semantic_teacher, warp_loss)
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .splat import GrainSplat
@@ -740,21 +740,23 @@ class MAVTGrainPrior(nn.Module):
         return w * g + d
 
     def _geom(self, S, der, outs, lid, lmask, s_scene, parts, diag) -> torch.Tensor:
-        """Huber log-depth of the anchor grains and of the grain / dense depth readouts on every observation.
-        1.2: L_geom = (anchor + sum_j grain_j + w_geom_dense sum_j dense_j) / (1 + n + w_geom_dense n), weighted by
-        w_geom_eff() (ramp); w_geom_dense = 1 is the original plain mean."""
+        """Log-depth loss (cfg.depth_loss: absolute Huber, or 3.11 silog / ordinal) of the anchor grains and of the
+        grain / dense depth readouts on every observation; grains without a label are excluded and, with
+        cfg.depth_bg_far > 0, pinned to that depth. 1.2: L_geom = (anchor + sum_j grain_j + w_geom_dense sum_j dense_j)
+        / (1 + n + w_geom_dense n), weighted by w_geom_eff() (ramp); w_geom_dense = 1 is the original plain mean."""
         cfg = self.cfg
         B = lid.shape[0]
+        dl = lambda pred, gt_, m: depth_loss(pred, gt_, m, cfg.depth_loss, cfg.depth_delta)
         gt = torch.exp(-lid) / s_scene.view(B, 1, 1)                                   # [B, n, N] in the gauge
         gk = sample_cells(lid[:, 0], S["u"], cfg.grid)
         mk = sample_cells(lmask[:, 0].float(), S["u"], cfg.grid) > 0.99
-        anchor = huber_log_depth(der["d"], torch.exp(-gk) / s_scene.view(B, 1), mk, cfg.depth_delta)
+        anchor = dl(der["d"], torch.exp(-gk) / s_scene.view(B, 1), mk)
         grain_v1, grain_v2, grain, dense = [], [], [], []
         for j, o in enumerate(outs):
-            grain_v1.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j] & o.get("support_v1", o["support"]), cfg.depth_delta))
-            grain_v2.append(huber_log_depth(o["depth_grain"], gt[:, j], lmask[:, j], cfg.depth_delta))
+            grain_v1.append(dl(o["depth_grain"], gt[:, j], lmask[:, j] & o.get("support_v1", o["support"])))
+            grain_v2.append(dl(o["depth_grain"], gt[:, j], lmask[:, j]))
             grain.append((grain_v1 if cfg.measurement_version == 1 else grain_v2)[-1])
-            dense.append(huber_log_depth(o["depth_dense"], gt[:, j], lmask[:, j], cfg.depth_delta))
+            dense.append(dl(o["depth_dense"], gt[:, j], lmask[:, j]))
         wd = cfg.w_geom_dense
         if wd == 1.0:
             terms = [anchor] + [t for pair in zip(grain, dense) for t in pair]
@@ -762,6 +764,10 @@ class MAVTGrainPrior(nn.Module):
         else:
             n = len(outs)
             lg = (anchor + torch.stack(grain).sum() + wd * torch.stack(dense).sum()) / (1 + n + wd * n)
+        if cfg.depth_bg_far > 0:                                     # 3.11: unlabelled grains -> far plane (gauge units)
+            lbg = bg_pin_loss(der["d"], mk, cfg.depth_bg_far, cfg.depth_delta)
+            parts["bg_pin"] = lbg.detach()
+            lg = lg + lbg
         parts["geom"] = lg.detach()
         w = self.w_geom_eff()
         with torch.no_grad():
