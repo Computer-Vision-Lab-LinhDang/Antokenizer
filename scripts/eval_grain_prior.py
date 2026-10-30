@@ -12,6 +12,9 @@ the anchor, and the targets of the closed state after a serialize / deserialize 
   full       the state as encoded (L = n_slots)
   L curve    the state with every record cut to L innovation slots (0 = base only: grains + memory + camera)
   copy       the anchor frame as the target (no model)
+  copy last  the previous frame as the target (no model)
+  novel view grains + c_0 + the record's camera / motion only: no memory update, no innovation (eval_baselines)
+  by record  the full-state score of each record of the queue (distance from the anchor)
 plus the payload counted by serializing the state, and the model diagnostics (base cosine per refinement
 pass, initializer cosine, support, depth, cameras). World clips are scored twice: with the given cameras
 copied (calibrated video) and with estimated cameras (--world-camera).
@@ -31,10 +34,11 @@ import torch  # noqa: E402
 
 import eval_cdv as ev  # noqa: E402
 from mavt.dino_v0 import evaluate as E  # noqa: E402
+from mavt.grain_prior.eval_baselines import copy_last, no_memory, strip_target_posterior  # noqa: E402
 
 DIAG = ("init_cos", "base_cos_pass0", "base_cos_pass1", "base_cos_final", "feat_cos", "support_frac", "psnr_base",
         "xi_rot_deg", "xi_trans", "fov_deg", "rho_std", "rho_gt_corr", "depth_grain_err", "depth_dense_err",
-        "cam_rot_err_deg", "cam_trans_err", "mem_delta", "sigma_mean")
+        "cam_rot_err_deg", "cam_trans_err", "mem_delta", "sigma_mean", "psnr_copy_last", "splat_dropped_frac")
 
 
 def build_parser():
@@ -89,6 +93,12 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
         acc.add("anchor", _scores(d["rgb"][:, :1], frames[:, :1], lp))
         acc.add("target", _scores(d["rgb"][:, 1:], tgt, lp))
         acc.add("copy", _scores(frames[:, :1].expand_as(tgt), tgt, lp))
+        acc.add("copy_last", _scores(copy_last(frames, q), tgt, lp))
+        for j in range(q):
+            acc.add(f"rec{j}", _scores(d["rgb"][:, 1 + j:2 + j], tgt[:, j:j + 1], lp))
+        with ev._autocast(dev, amp), no_memory(model):
+            dn = model.decode(strip_target_posterior(cfg, S))
+        acc.add("nvs", _scores(dn["rgb"][:, 1:], tgt, lp))
         for L in L_list:
             recs = []
             for rec in S["recs"]:
@@ -112,12 +122,22 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
             break
     res = acc.result()
     curve = [dict(L=L, numbers=res[f"L={L}/numbers"]["n"], **res[f"L={L}"]) for L in L_list]
+    q = len([k for k in res if k.startswith("rec")])
     return dict(n_clips=seen, n_frames=T, anchor=res["anchor"], target=res["target"], copy=res["copy"],
+                copy_last=res["copy_last"], nvs=res["nvs"], target_by_record=[res[f"rec{j}"] for j in range(q)],
                 curve=curve, payload=pay.mean, diag={k: m.mean for k, m in dg.items()}, seconds=time.time() - t0)
 
 
 def _f(v, nd=2) -> str:
     return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
+
+
+def _nvs_numbers(v: dict):
+    """Payload of the novel-view decode: the L = 0 entry of the curve when present."""
+    for r in v.get("curve", []):
+        if r["L"] == 0:
+            return r["numbers"]
+    return None
 
 
 def to_markdown(res: dict) -> str:
@@ -134,10 +154,17 @@ def to_markdown(res: dict) -> str:
                   "| decode | PSNR | SSIM | LPIPS | numbers |", "|---|---|---|---|---|"]
         rows = [("anchor", v["anchor"], None), ("target, full state", v["target"], v["payload"])]
         rows += [(f"target, L = {r['L']}", r, r["numbers"]) for r in v["curve"]]
+        if "nvs" in v:
+            rows.append(("novel view: grains + camera only (z = c_0, L = 0)", v["nvs"], _nvs_numbers(v)))
         rows.append(("copy anchor (no model)", v["copy"], None))
+        if "copy_last" in v:
+            rows.append(("copy last frame (no model)", v["copy_last"], None))
         for label, r, num in rows:
             lines.append(f"| {label} | {_f(r.get('psnr'))} | {_f(r.get('ssim'), 3)} | {_f(r.get('lpips'), 3)} "
                          f"| {_f(num, 0)} |")
+        if v.get("target_by_record"):
+            lines.append("")
+            lines.append("target by record (full state), PSNR: " + " / ".join(_f(r.get("psnr")) for r in v["target_by_record"]))
         d = v["diag"]
         lines += ["", " ".join(f"{k}={_f(d[k], 3)}" for k in DIAG if k in d), ""]
     return "\n".join(lines)

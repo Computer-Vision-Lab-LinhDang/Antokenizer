@@ -834,6 +834,7 @@ class MAVTGrainPrior(nn.Module):
         diag["psnr_target"] = psnr(to11(rgb[:, 1:]).flatten(0, 1), frames[:, 1:].flatten(0, 1))
         diag["psnr_base"] = psnr(to11(torch.stack(Xb_list, 1)).flatten(0, 1), frames[:, 1:].flatten(0, 1))
         diag["psnr_copy"] = psnr(frames[:, :1].expand(-1, n - 1, -1, -1, -1).flatten(0, 1), frames[:, 1:].flatten(0, 1))
+        diag["psnr_copy_last"] = psnr(frames[:, :-1].flatten(0, 1), frames[:, 1:].flatten(0, 1))   # previous frame
         cos = lambda a, b: F.cosine_similarity(a.float(), b.float(), -1).mean()
         for ell in range(cfg.refine_passes):
             diag[f"base_cos_pass{ell}"] = torch.stack([cos(o["passes"][ell]["F_base"], Ft[:, j + 1])
