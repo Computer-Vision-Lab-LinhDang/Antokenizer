@@ -54,6 +54,34 @@ def warp_loss(F0: torch.Tensor, F_t: torch.Tensor, u0: torch.Tensor, u_t: torch.
     return feat_loss(b, a, 0.0, m)
 
 
+@torch.no_grad()
+def warp_match(F0: torch.Tensor, F_t: torch.Tensor, u0: torch.Tensor, radius: int, tau: float) -> tuple:
+    """3.12: correspondence of every anchor grain on the target feature grid. The anchor feature at u0 [B, G, 2]
+    (bilinear on F0 [B, N, D]) is compared (cosine) with every target cell centre within `radius` cells (Chebyshev) of
+    u0; soft-argmax at temperature tau -> (u_star [B, G, 2], conf [B, G] = the largest match probability). Detached."""
+    grid = int(round(F0.shape[1] ** 0.5))
+    a = F.normalize(g.read_coarse(F0.float(), u0.float(), grid), dim=-1)                    # [B, G, D]
+    b = F.normalize(F_t.float(), dim=-1)                                                   # [B, N, D]
+    sim = a @ b.transpose(1, 2)                                                            # [B, G, N]
+    c = g.cell_centres(grid, u0.device).float()                                            # [N, 2]
+    near = ((u0.float().unsqueeze(2) - c.view(1, 1, -1, 2)).abs() * grid).amax(-1) <= radius + 0.5
+    p = (sim / tau).masked_fill(~near, float("-inf")).softmax(-1)
+    return p @ c, p.amax(-1)
+
+
+def warp_flow_loss(F0: torch.Tensor, F_t: torch.Tensor, u0: torch.Tensor, u_t: torch.Tensor, valid: torch.Tensor,
+                   radius: int, tau: float, delta: float = 1.0) -> torch.Tensor:
+    """3.12: Huber (delta in cells) between the transported position u_t [B, G, 2] and the detached DINO match of the
+    grain (warp_match), weighted by the match confidence; mean over the grains that are valid and inside the image.
+    The pull has a constant size beyond delta and a capture range of `radius` cells, unlike the bilinear warp."""
+    grid = int(round(F0.shape[1] ** 0.5))
+    u_star, conf = warp_match(F0, F_t, u0, radius, tau)
+    m = (valid & ((u_t >= 0) & (u_t <= 1)).all(-1)).float() * conf
+    d = (u_t.float() - u_star) * grid
+    h = F.huber_loss(d, torch.zeros_like(d), reduction="none", delta=delta).sum(-1)
+    return (h * m).sum() / m.sum().clamp_min(1e-6)
+
+
 DEPTH_LOSSES = ("huber", "silog", "ordinal")
 
 

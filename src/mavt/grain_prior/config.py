@@ -174,6 +174,9 @@ class GrainPriorConfig(CD32Config):
     w_pose: float = 0.1
     w_motion: float = 1e-3                # |M|^2 penalty; it fights any learned motion: set 0 with w_warp (3.10)
     w_warp: float = 0.0                   # 3.10: self-supervised photometric warp of the transported grains (losses.warp_loss)
+    w_warp_flow: float = 0.0              # 3.12: pull of the transported grains to their DINO match (losses.warp_flow_loss)
+    warp_radius: int = 3                  # 3.12: match search window, cells (Chebyshev) around the anchor position
+    warp_tau: float = 0.05                # 3.12: soft-argmax temperature of the match (cosine units)
     w_code: float = 1e-4
     depth_delta: float = 0.1              # Huber delta of the log-depth loss
     depth_loss: str = "huber"             # 3.11: huber (absolute) | silog (per-sample zero-mean log depth) | ordinal (depth order)
@@ -302,6 +305,8 @@ class GrainPriorConfig(CD32Config):
             raise ValueError("splat_index: anchor | projected; splat_cap >= 1")
         if self.w_edge < 0 or self.w_warp < 0:
             raise ValueError("w_edge, w_warp >= 0")
+        if self.w_warp_flow < 0 or self.warp_radius < 1 or self.warp_tau <= 0:
+            raise ValueError("w_warp_flow >= 0, warp_radius >= 1, warp_tau > 0")
         if self.depth_loss not in ("huber", "silog", "ordinal") or self.depth_bg_far < 0:
             raise ValueError("depth_loss: huber | silog | ordinal; depth_bg_far >= 0")
         if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:

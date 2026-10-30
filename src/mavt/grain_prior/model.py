@@ -33,7 +33,8 @@ from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
 from .losses import (PatchDisc, band_fractions, bg_pin_loss, depth_loss, edge_loss, feat_loss, huber_log_depth, pose_loss,
-                     sample_cells, sem_loss, semantic_teacher, warp_loss)
+                     sample_cells, sem_loss, semantic_teacher, warp_flow_loss, warp_loss,
+                     warp_match)
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .splat import GrainSplat
@@ -674,6 +675,21 @@ class MAVTGrainPrior(nn.Module):
                                             o["base"]["tr"]["valid"]) for j, o in enumerate(tg)]).mean()   # projects
                 parts["warp"] = diag["warp_err"] = lw.detach()
                 loss = loss + cfg.w_warp * lw
+            if cfg.w_warp_flow > 0:                                   # 3.12: pull each grain to its DINO match
+                lf_ = torch.stack([warp_flow_loss(Ft[:, 0], Ft[:, j + 1], S["u"], o["base"]["tr"]["u"],
+                                                  o["base"]["tr"]["valid"], cfg.warp_radius, cfg.warp_tau)
+                                   for j, o in enumerate(tg)]).mean()
+                parts["warp_flow"] = diag["warp_flow_err"] = lf_.detach()
+                loss = loss + cfg.w_warp_flow * lf_
+                with torch.no_grad():
+                    sh, ms = [], []
+                    for j, o in enumerate(tg):
+                        v = o["base"]["tr"]["valid"]
+                        sh.append(((o["base"]["tr"]["u"] - S["u"]).norm(dim=-1) * cfg.grid)[v].mean())
+                        us, cf = warp_match(Ft[:, 0], Ft[:, j + 1], S["u"], cfg.warp_radius, cfg.warp_tau)
+                        ms.append(((us - S["u"].float()).norm(dim=-1) * cfg.grid * cf).sum() / cf.sum().clamp_min(1e-6))
+                    diag["grain_shift_cells"] = torch.stack(sh).mean()
+                    diag["match_shift_cells"] = torch.stack(ms).mean()
         code = [S["f"].pow(2).mean(), S["c0"].pow(2).mean()]
         for o in tg:
             code += [o["rec"]["b"].pow(2).mean(), o["rec"]["r"][..., 4:].pow(2).mean()]
