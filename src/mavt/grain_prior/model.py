@@ -32,7 +32,8 @@ from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import PatchDisc, band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
+from .losses import (PatchDisc, band_fractions, edge_loss, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss,
+                     semantic_teacher)
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
 from .splat import GrainSplat
@@ -232,7 +233,9 @@ class MAVTGrainPrior(nn.Module):
         if cfg.read_radius_scale:                 # radius on this observation's image (1 at the anchor)
             sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa, cfg.read_radius_clip)
         grains = (f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"], S["c0"], z, pg)
-        out = self.readout.base(*grains, grain_keep=grain_keep)
+        # 3.8 feat_sg_f: the feature-grid read sees sg[f]; the RGB read below keeps the live f
+        fgrains = (f_t.detach(),) + grains[1:] if cfg.feat_sg_f else grains
+        out = self.readout.base(*fgrains, grain_keep=grain_keep)
         out["tr"] = tr
         use_prev = cfg.read_prev_frame and prev is not None
         if use_prev:
@@ -688,6 +691,10 @@ class MAVTGrainPrior(nn.Module):
         lx = (rgb.float() - X01).abs().mean()
         parts[f"{name}_feat"], parts[f"{name}_l1"] = lf.detach(), lx.detach()
         loss = lf + lx
+        if lpips and cfg.w_edge > 0:                                   # 3.8
+            le = edge_loss(rgb.flatten(0, 1), X01.flatten(0, 1))
+            parts["edge"] = le.detach()
+            loss = loss + cfg.w_edge * le
         if lpips and self.lpips is not None:
             a, b = rgb.flatten(0, 1), X01.flatten(0, 1)
             k = cfg.lpips_max_frames

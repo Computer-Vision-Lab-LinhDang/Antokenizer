@@ -161,6 +161,8 @@ class GrainPriorConfig(CD32Config):
     phase: str = "codec"                  # codec (T1 / T2) | prior (T3: tokenizer frozen)
     world_given_p: float = 0.5            # world clips: share coded with given cameras (rest: L_pose label)
     w_lpips: float = 0.1
+    w_edge: float = 0.0                   # 3.8: Sobel gradient L1 on the decoded frames (with L1 and LPIPS)
+    feat_sg_f: bool = False               # 3.8: the feature-grid read sees sg[f]: L_F no longer trains the grain features
     w_logn: float = 0.01
     w_base: float = 0.5
     w_init: float = 0.25
@@ -289,6 +291,8 @@ class GrainPriorConfig(CD32Config):
                                             or self.query_grid % self.n_strata or self.splat_atoms < 0
                                             or self.splat_layers < 0 or self.splat_window < 0):
             raise ValueError("rgb_decoder=splat: legacy readout, query_grid divisible by n_strata, sizes >= 0")
+        if self.w_edge < 0:
+            raise ValueError("w_edge >= 0")
         if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:
             raise ValueError("splat_pix_feat, splat_pix_atoms, rgb_pix_blocks >= 0; rgb_pix_width >= 1")
         if (self.splat_pix_feat or self.rgb_pix_blocks) and self.rgb_head != "pointwise":

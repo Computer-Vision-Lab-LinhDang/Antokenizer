@@ -112,3 +112,21 @@ def band_fractions(err: torch.Tensor) -> tuple:
     fr = (fx ** 2 + fy ** 2).sqrt()
     tot = E.sum().clamp_min(1e-12)
     return E[..., fr < 1 / 32].sum() / tot, E[..., (fr >= 1 / 32) & (fr < 1 / 8)].sum() / tot, E[..., fr >= 1 / 8].sum() / tot
+
+
+_SOBEL_X = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]) / 8.0
+
+
+def edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """3.8: mean |Sobel(pred) - Sobel(target)| over both directions, channels and pixels (reflect padding).
+    pred / target [N, C, H, W] in any common range; the /8 normalisation makes a unit step edge give |dx| = 1 on
+    the two columns beside it."""
+    p, t = pred.float(), target.float()
+    C = p.shape[1]
+    kx = _SOBEL_X.to(p.device, p.dtype).view(1, 1, 3, 3).expand(C, 1, 3, 3)
+    ky = kx.transpose(-1, -2)
+    d = p - t
+    d = F.pad(d, (1, 1, 1, 1), mode="reflect")
+    gx = F.conv2d(d, kx, groups=C)
+    gy = F.conv2d(d, ky, groups=C)
+    return (gx.abs().mean() + gy.abs().mean())
