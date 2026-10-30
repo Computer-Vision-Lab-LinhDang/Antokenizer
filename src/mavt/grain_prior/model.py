@@ -32,9 +32,11 @@ from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
 from .layers import mlp2
-from .losses import PatchDisc, band_fractions, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss, semantic_teacher
+from .losses import (PatchDisc, band_fractions, edge_loss, feat_loss, huber_log_depth, pose_loss, sample_cells, sem_loss,
+                     semantic_teacher)
 from .memory import Appearance, Recurrence
 from .prior import CausalPrior
+from .splat import GrainSplat
 from .readout import ReadLayer, Readout, RGBHead, pool_geom, projected_radius, pyr_down, pyr_up, pyramid_target
 from .refinement import CorrRead, UpdateHead
 from .trunk import Bank, PInit, StreamD
@@ -84,6 +86,8 @@ class MAVTGrainPrior(nn.Module):
         # shared readouts own their reader (query_decoder); a second, unused Readout would stall DDP
         self.readout = Readout(cfg, Dt) if cfg.readout_version == "legacy" else None
         self.rgb = RGBHead(cfg, cfg.dim if cfg.rgb_from == "hidden" else Dt, feat_dim=Dt)
+        if cfg.rgb_decoder == "splat":                                # RGB state by context + atoms + splat
+            self.splat = GrainSplat(cfg)
         self.innov = InnovationEncoder(cfg, Dt)
         self.prior = CausalPrior(cfg)
         if cfg.sem_target:                                            # 2.5: head on c_0; the teacher is not a module
@@ -106,7 +110,7 @@ class MAVTGrainPrior(nn.Module):
                 p.requires_grad_(False)
         if cfg.train_scope == "decoder":                              # frozen encoder: the decoder and D train
             for n, p in self.named_parameters():
-                if not n.startswith(("readout.", "rgb.", "disc.")):
+                if not n.startswith(("readout.", "rgb.", "disc.", "splat.")):
                     p.requires_grad_(False)
         self.register_buffer("uq", g.cell_centres(cfg.grid), persistent=False)
         self.global_step = 0                                          # 1.2: set by forward(step=) / set_step
@@ -229,7 +233,9 @@ class MAVTGrainPrior(nn.Module):
         if cfg.read_radius_scale:                 # radius on this observation's image (1 at the anchor)
             sigma = projected_radius(S["sigma"], tr["P_can"][..., 2], tr["z"], S["kappa0"], kappa, cfg.read_radius_clip)
         grains = (f_t, tr["P_can"], S["u"], tr["u"], tr["z"], sigma, tr["valid"], der["scale"], S["c0"], z, pg)
-        out = self.readout.base(*grains, grain_keep=grain_keep)
+        # 3.8 feat_sg_f: the feature-grid read sees sg[f]; the RGB read below keeps the live f
+        fgrains = (f_t.detach(),) + grains[1:] if cfg.feat_sg_f else grains
+        out = self.readout.base(*fgrains, grain_keep=grain_keep)
         out["tr"] = tr
         use_prev = cfg.read_prev_frame and prev is not None
         if use_prev:
@@ -240,8 +246,16 @@ class MAVTGrainPrior(nn.Module):
             out["dF"], dH = self.readout.innovation(out["a"], out["pe"], r, L, return_hidden=True)
             out["F_hat"], out["H_hat"] = out["F_base"] + out["dF"], out["a"] + dH
         if cfg.query_grid and rgb:
-            fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
-                                     grain_keep=grain_keep)
+            if cfg.rgb_decoder == "splat":
+                uq = self.uq_rgb.expand(f_t.shape[0], -1, -1)
+                pe = self.readout.query_pe(f_t.shape[0], uq)
+                keep = tr["valid"] if grain_keep is None else tr["valid"] & grain_keep
+                a = self.readout.init(pe, S["c0"], z, pg, uq)
+                sp, out["pix"] = self.splat(f_t, tr["u"], tr["z"], sigma, keep, der["scale"], S["c0"], z, uq)
+                fine = dict(a=a + sp.to(a.dtype), pe=pe)
+            else:
+                fine = self.readout.base(*grains, uq=self.uq_rgb.expand(f_t.shape[0], -1, -1), branch="X",
+                                         grain_keep=grain_keep)
             out["a_rgb"], out["pe_rgb"] = fine["a"], fine["pe"]
             if use_prev:
                 out["a_rgb"] = self._add_prev(fine["a"], self.uq_rgb.expand(f_t.shape[0], -1, -1), prev, tr, sigma, S)
@@ -276,20 +290,28 @@ class MAVTGrainPrior(nn.Module):
         return lambda x: torch.where(on, x.detach(), x)
 
     def rgb_of(self, F: torch.Tensor, H: torch.Tensor, a0: Optional[torch.Tensor] = None,
-               low: Optional[torch.Tensor] = None) -> torch.Tensor:
+               low: Optional[torch.Tensor] = None, pix: Optional[torch.Tensor] = None) -> torch.Tensor:
         """RGB in [0, 1] of one observation: from the DINO-space feature F or the decoder state H (cfg.rgb_from).
         rgb_coarse_start (2.3): X^ = clamp(sg[X~0] + R) with X~0 = low (or low_image(a0)); rgb_in_feat (3.3): the
-        head also receives sg[F] upsampled to its grid."""
+        head also receives sg[F] upsampled to its grid; pix (3.7): the splat's pixel atom map."""
         cfg = self.cfg
         if cfg.rgb_coarse_start and low is None:
             if a0 is None:
                 raise ValueError("rgb_coarse_start needs a0 or low")
             low = self.rgb.low_image(a0)
-        return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None)
+        return self.rgb(H if cfg.rgb_from == "hidden" else F, low=low, feat=F if cfg.rgb_in_feat else None, pix=pix)
+
+    @staticmethod
+    def _pix_of(outs: list) -> Optional[torch.Tensor]:
+        """3.7: the pixel atom maps of decoded observations stacked as rgb_of's batch (None without them)."""
+        if not outs or outs[0].get("pix") is None:
+            return None
+        return torch.stack([o["pix"] for o in outs], 1).flatten(0, 1)
 
     # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
     _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
-                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx"}
+                     "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx",
+                     "splat", "amp_pix", "freq_pix", "pix_in", "pix_blocks"}
 
     def new_param_prefixes(self) -> tuple:
         """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):
@@ -418,7 +440,7 @@ class MAVTGrainPrior(nn.Module):
         Fh = torch.stack([o["F_hat"] for o in outs], 1)
         Hh = torch.stack([o["H_hat"] for o in outs], 1)
         A0 = torch.stack([o["a0"] for o in outs], 1)
-        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), A0.flatten(0, 1)).view(
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), A0.flatten(0, 1), pix=self._pix_of(outs)).view(
             Fh.shape[0], Fh.shape[1], 3, self.cfg.image_size, self.cfg.image_size)
         return dict(F=Fh, rgb=rgb * 2 - 1, depth=torch.stack([o["depth_dense"] for o in outs], 1))
 
@@ -524,7 +546,8 @@ class MAVTGrainPrior(nn.Module):
         kappa = kappa_of(zeta)
         z_i = mem(b)
         base = self.decode_obs(S, der, z_i, xi, kappa, M, prev=prev_obs)
-        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"])
+        X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"],
+                             pix=base.get("pix"))
         eF = st["F"] - base["F_base"].detach()
         eX = Xi - X_base.detach()
         r = self.innov(eF, eX, z_i, xi, kappa, M)
@@ -619,7 +642,7 @@ class MAVTGrainPrior(nn.Module):
         low = None
         if cfg.rgb_coarse_start:                                      # 2.3: X~0 of every observation, own loss
             low = self.rgb.low_image(torch.stack([o["a0"] for o in outs], 1).flatten(0, 1))
-        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), low=low).view(B, n, 3, S_img, S_img)
+        rgb = self.rgb_of(Fh.flatten(0, 1), Hh.flatten(0, 1), low=low, pix=self._pix_of(outs)).view(B, n, 3, S_img, S_img)
         Ft = torch.stack([s["F"] for s in st], 1)
         # ---- L_rec on every observation (full), base and initializer on the targets, init also on the anchor
         loss = self._rec(rgb, X01, Fh, Ft, parts, diag, "rec")
@@ -668,6 +691,10 @@ class MAVTGrainPrior(nn.Module):
         lx = (rgb.float() - X01).abs().mean()
         parts[f"{name}_feat"], parts[f"{name}_l1"] = lf.detach(), lx.detach()
         loss = lf + lx
+        if lpips and cfg.w_edge > 0:                                   # 3.8
+            le = edge_loss(rgb.flatten(0, 1), X01.flatten(0, 1))
+            parts["edge"] = le.detach()
+            loss = loss + cfg.w_edge * le
         if lpips and self.lpips is not None:
             a, b = rgb.flatten(0, 1), X01.flatten(0, 1)
             k = cfg.lpips_max_frames

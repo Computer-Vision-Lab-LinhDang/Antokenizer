@@ -663,3 +663,47 @@ def test_explicit_read_in_query_chunks_matches_the_full_read(kw):
         outs.append((y.detach(), a.grad, layer.wk.weight.grad, layer.last_diag["fine_share_q"]))
     for u, v in zip(*outs):
         assert torch.allclose(u, v, atol=1e-5)
+
+
+# ---------------------------------------------------------------- 3.8 edge loss and feature-read stop-gradient on f
+def test_edge_loss_is_zero_on_equal_images_and_positive_on_blur():
+    from mavt.grain_prior.losses import edge_loss
+    torch.manual_seed(0)
+    x = torch.rand(2, 3, 32, 32)
+    assert edge_loss(x, x).item() == 0.0
+    blur = torch.nn.functional.avg_pool2d(x, 3, 1, 1)
+    assert edge_loss(blur, x).item() > 0.0
+    # scale: a vertical unit step has |dx| = 0.5 on the two columns beside it (Sobel rows sum to 4, / 8), dy = 0
+    step = torch.zeros(1, 1, 8, 8); step[..., 4:] = 1.0
+    assert abs(edge_loss(step, torch.zeros_like(step)).item() - 2 * 8 * 0.5 / 64) < 1e-6
+
+
+def test_w_edge_enters_the_image_loss_and_is_off_by_default():
+    from .test_grain_prior import _inputs
+    x, _ = _inputs("image", B=2)
+    torch.manual_seed(0)
+    m0 = MAVTGrainPrior(tiny_config(**LEGACY_CRSR))
+    torch.manual_seed(0)
+    m1 = MAVTGrainPrior(tiny_config(**LEGACY_CRSR, w_edge=1.0))
+    o0, o1 = m0(x, "image"), m1(x, "image")
+    assert "edge" not in o0["parts"] and "edge" in o1["parts"]
+    assert o1["loss"].item() > o0["loss"].item()
+
+
+def test_feat_sg_f_removes_the_feature_loss_gradient_into_the_grain_features():
+    """feat_sg_f: the feature-grid read sees sg[f] (RGB read, L1 / LPIPS unchanged). With the RGB loss terms at 0
+    (w_lpips 0 and an identical L1 target), the only remaining gradient into anchor.w_f is the feature loss: on
+    the flag it must vanish; off it is present. Images: 'image' modality, no records."""
+    from .test_grain_prior import _inputs, _wake
+    x, _ = _inputs("image", B=2)
+    grads = {}
+    for sg in (False, True):
+        torch.manual_seed(0)
+        m = _wake(MAVTGrainPrior(tiny_config(**LEGACY_CRSR, feat_sg_f=sg, w_lpips=0.0)))
+        o = m(x, "image", return_outputs=True)
+        # feature loss alone: recompute it from the outputs (same tensors the model used)
+        from mavt.grain_prior.losses import feat_loss
+        lf = feat_loss(o["outputs"]["F_hat"], o["outputs"]["F"], m.cfg.w_logn)
+        g = torch.autograd.grad(lf, m.anchor.w_f.weight, allow_unused=True)[0]
+        grads[sg] = 0.0 if g is None else g.abs().sum().item()
+    assert grads[False] > 0 and grads[True] == 0.0, grads

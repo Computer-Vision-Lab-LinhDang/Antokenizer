@@ -135,6 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="regional torch.compile (dynamic=False) of each TrunkLayer, CBlock, DBlock, DecoderBlock "
                         "and decoder.rgb_conv; a region that fails to compile runs eagerly")
     p.add_argument("--compile-backend", default="inductor", help="torch.compile backend for --compile")
+    p.add_argument("--compile-regions", default=None,
+                   help="comma list of block class names to compile (default: the model's COMPILE_REGIONS)")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dry-run", action="store_true",
@@ -563,7 +565,8 @@ def mixed_ddp(step_mod: MixedStep, unused: list, device_ids, static_graph: bool)
                  f"buffer sync={bufs} ignored params={len(unused)}")
 
 
-def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, conv_head: bool = True) -> list:
+def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, conv_head: bool = True,
+                  regions: Optional[tuple] = None) -> list:
     """Regional torch.compile (dynamic=False) of the repeated blocks: every TrunkLayer, CBlock, DBlock and
     DecoderBlock, plus decoder.rgb_conv when present (conv_head=False leaves it eager: a profiling knob,
     see scripts/profile_dino_v0.py). Each region compiles in place (Module.compile) in try / except; a region
@@ -572,7 +575,8 @@ def apply_compile(model: torch.nn.Module, backend: str = "inductor", log=print, 
     import torch._dynamo
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)   # shapes per modality
-    regions = getattr(model, "COMPILE_REGIONS", COMPILE_REGIONS)      # another model may name its own blocks
+    if regions is None:
+        regions = getattr(model, "COMPILE_REGIONS", COMPILE_REGIONS)  # another model may name its own blocks
     targets = [(n, m) for n, m in model.named_modules() if type(m).__name__ in regions]
     conv = getattr(getattr(model, "decoder", None), "rgb_conv", None)
     if conv_head and isinstance(conv, torch.nn.Module):
@@ -679,7 +683,8 @@ def main(argv=None, config_fn=None, model_fn=None) -> int:
         log(f"mixed step: loss weights {step_mod.weights}; trainable parameters without a gradient "
             f"(DDP ignores them): {unused or 'none'}")
     if args.compile:                                           # after the probe: compile for the real shapes only
-        apply_compile(model, args.compile_backend, log)
+        regions = tuple(r for r in args.compile_regions.split(",") if r) if args.compile_regions else None
+        apply_compile(model, args.compile_backend, log, regions=regions)
     torch.manual_seed(seed + step)                             # per-rank stream (queries, data aug)
     random.seed(seed + step)
 
