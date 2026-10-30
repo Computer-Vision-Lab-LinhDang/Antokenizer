@@ -9,9 +9,12 @@
    w_qj = softmax_j(-|grid (u_q - u^_j)|^2 / (2 sigma_j^2) - d_j / tau_d) (the read's log nu, restricted to the
    window), X_q = sum_j w_qj (e_j + sum_k a_cos_jk cos 2 pi <omega_jk, delta_qj> + a_sin_jk sin(.)),
    delta_qj = grid (u_q - u^_j). Queries are grouped by stratum so each group shares its window (two matmuls).
-The output W_out X_q joins the read's initial state a0; the existing RGB head is the local refiner. The window is
-indexed by the anchor stratum of each grain: exact on images and static anchors; transported grains (video) that
-leave their stratum's neighbourhood are read only inside it.
+The output W_out X_q joins the read's initial state a0; the existing RGB head is the local refiner.
+Window indexing (cfg.splat_index): `anchor` uses the stratum each grain came from on the anchor (a fixed table:
+exact on images, but a transported grain that leaves its neighbourhood is read only there, and a query whose
+neighbourhood emptied reads nothing); `projected` buckets the grains by the stratum they project INTO on the decoded
+observation (`bucket_index`, at most splat_cap per stratum, the rest dropped and counted in `last_dropped_frac`), so
+the window follows camera and object motion. Both coincide when no grain leaves its stratum.
 4. splat_pix_feat > 0 (3.7): a second set of atoms (splat_pix_atoms, splat_pix_wmax, amplitudes zero-init) is
    evaluated at the image pixels with the same window weights, giving a map [B, splat_pix_feat, S, S] that the
    pointwise RGB head adds after its last x2 stage. On the query grid (4 queries per cell) atoms above 2 cycles per
@@ -38,6 +41,35 @@ def window_index(n_side: int, w: int) -> tuple:
     ny, nx = ys.reshape(-1, 1) + dy.reshape(1, -1), xs.reshape(-1, 1) + dx.reshape(1, -1)
     ok = (ny >= 0) & (ny < n_side) & (nx >= 0) & (nx < n_side)
     return ny.clamp(0, n_side - 1) * n_side + nx.clamp(0, n_side - 1), ok
+
+
+def bucket_index(u_hat: torch.Tensor, valid: torch.Tensor, n_side: int, cap: int, widx: torch.Tensor,
+                 wok: torch.Tensor) -> tuple:
+    """splat_index=projected: per-sample window gather from the strata the grains project into.
+    u_hat [B, G, 2] projections, valid [B, G] -> (idx [B, S, W cap] grain ids, ok [B, S, W cap], dropped_frac []):
+    stratum s's window holds, for each of its W neighbouring strata, the first `cap` valid on-screen grains projecting
+    into that stratum (grain order); the share of on-screen grains beyond a bucket's cap is dropped_frac."""
+    B, G = valid.shape
+    S = n_side * n_side
+    dev = valid.device
+    on = valid & torch.isfinite(u_hat).all(-1) & ((u_hat >= 0) & (u_hat <= 1)).all(-1)
+    uf = torch.nan_to_num(u_hat.float()).clamp(0, 1)
+    cell = lambda x: (x * n_side).floor().clamp(0, n_side - 1).long()
+    s = cell(uf[..., 1]) * n_side + cell(uf[..., 0])                                   # [B, G]
+    key = torch.where(on, s, torch.full_like(s, S))                                    # off-screen: dummy bucket S
+    order = torch.sort(key, dim=1, stable=True).indices
+    ks = key.gather(1, order)
+    rank = torch.arange(G, device=dev).unsqueeze(0) - torch.searchsorted(ks, ks)       # position inside its bucket
+    keep = (ks < S) & (rank < cap)
+    dummy = S * cap
+    slot = torch.where(keep, ks * cap + rank, torch.full_like(ks, dummy))
+    table = torch.full((B, dummy + 1), -1, dtype=torch.long, device=dev)
+    table.scatter_(1, slot, torch.where(keep, order, torch.full_like(order, -1)))
+    cols = (widx.unsqueeze(-1) * cap + torch.arange(cap, device=dev)).view(S, -1)      # [S, W cap] table columns
+    idx = table[:, cols]                                                               # [B, S, W cap]
+    ok = wok.repeat_interleave(cap, -1).unsqueeze(0) & (idx >= 0)
+    dropped = ((ks < S) & (rank >= cap)).sum() / on.sum().clamp_min(1)
+    return idx.clamp_min(0), ok, dropped.float()
 
 
 class _CtxBlock(nn.Module):
@@ -75,6 +107,8 @@ class GrainSplat(nn.Module):
         widx, wok = window_index(n, cfg.splat_window)
         self.register_buffer("widx", widx, persistent=False)
         self.register_buffer("wok", wok, persistent=False)
+        self.projected = cfg.splat_index == "projected"
+        self.last_dropped_frac = torch.zeros(())                     # projected: share of on-screen grains over the cap
         perm, inv = self._grouping(cfg.query_grid, n)
         self.register_buffer("perm", perm, persistent=False)
         self.register_buffer("inv", inv, persistent=False)
@@ -111,15 +145,30 @@ class GrainSplat(nn.Module):
         w = torch.where(has, ln, torch.zeros_like(ln)).softmax(-1) * has
         return w.masked_fill(~ok_w.unsqueeze(-2), 0.0), delta
 
+    def window(self, u_hat, valid) -> tuple:
+        """Per-stratum window gather: (idx [B, S, W'] grain ids, ok [B, S, W']); W' = W (anchor) or W cap (projected).
+        Updates last_dropped_frac (0 for the anchor table)."""
+        B = valid.shape[0]
+        if self.projected:
+            idx, ok, dropped = bucket_index(u_hat, valid, self.cfg.n_strata, self.cfg.splat_cap, self.widx, self.wok)
+            self.last_dropped_frac = dropped.detach()
+            return idx, ok
+        self.last_dropped_frac = torch.zeros((), device=valid.device)
+        idx = self.widx.unsqueeze(0).expand(B, -1, -1)
+        bi = torch.arange(B, device=valid.device).view(-1, 1, 1)
+        return idx, self.wok.unsqueeze(0) & valid[bi, idx]
+
     def weights(self, uq, u_hat, sigma, depth, valid):
         """Per-query window weights for arbitrary queries uq [B, Q, 2] (tests / diagnostics) -> (w, idx, ok)."""
         n = self.cfg.n_strata
         s = (uq.float() * n).floor().clamp(0, n - 1).long()
         s = s[..., 1] * n + s[..., 0]                                                    # [B, Q]
-        idx, wok = self.widx[s], self.wok[s]                                             # [B, Q, W]
+        widx, wok = self.window(u_hat, valid)                                            # [B, S, W']
         bi = torch.arange(uq.shape[0], device=uq.device).view(-1, 1, 1)
+        idx, ok = torch.gather(widx, 1, s.unsqueeze(-1).expand(-1, -1, widx.shape[-1])), \
+            torch.gather(wok, 1, s.unsqueeze(-1).expand(-1, -1, wok.shape[-1]))        # [B, Q, W']
         take = lambda t: t[bi, idx]
-        ok = wok & take(valid)
+        ok = ok & take(valid)
         w, _ = self._logits(uq.unsqueeze(-2), take(u_hat), take(sigma), take(depth.float()), ok)
         return w.squeeze(-2), idx, ok
 
@@ -157,11 +206,11 @@ class GrainSplat(nn.Module):
         e = self.feat(hg)                                                                # [B, G, C]
         A = self.amp(hg).view(B, G, K, 2, C)
         om = cfg.splat_wmax * torch.tanh(self.freq(hg).float()).view(B, G, K, 2)          # cycles per cell
-        n2, W = self.widx.shape
+        widx, ok = self.window(u_hat, valid)                                              # [B, S, W']
+        n2, W = widx.shape[1:]
         uq_g = uq[:, self.perm].view(B, n2, -1, 2)                                       # [B, S, m, 2]
-        wi = self.widx.view(-1)
-        pick = lambda t: t[:, wi].view(B, n2, W, *t.shape[2:])
-        ok = self.wok.unsqueeze(0) & pick(valid)
+        bi = torch.arange(B, device=uq.device).view(-1, 1, 1)
+        pick = lambda t: t[bi, widx]                                                     # [B, S, W', ...]
         w, delta = self._logits(uq_g, pick(u_hat), pick(sigma), pick(dd), ok)              # [B, S, m, W], [.., 2]
         X = w.to(e.dtype) @ pick(e)                                                      # [B, S, m, C]
         if K:

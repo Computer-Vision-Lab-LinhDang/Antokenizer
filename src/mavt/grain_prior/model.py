@@ -822,6 +822,8 @@ class MAVTGrainPrior(nn.Module):
         diag["numbers"] = sc.payload(cfg, S).float().mean()
         diag["fov_deg"] = torch.rad2deg(2 * torch.atan(0.5 / S["kappa0"][:, 0].clamp_min(1e-6))).mean()
         diag["sigma_mean"] = S["sigma"].mean()
+        if cfg.rgb_decoder == "splat":                                # projected window: grains over a bucket's cap
+            diag["splat_dropped_frac"] = self.splat.last_dropped_frac
         if kind != "image":
             diag["rho_std"] = S["rho"].std(-1).mean()
         if getattr(self, "diag_read", True):

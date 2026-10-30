@@ -127,6 +127,10 @@ class GrainPriorConfig(CD32Config):
     splat_atoms: int = 6                  # splat: LTE-style frequency atoms per grain (0: none)
     splat_window: int = 2                 # splat: a query reads the grains of the (2 w + 1)^2 strata around its own
     splat_wmax: float = 8.0               # splat: largest atom frequency, cycles per cell
+    splat_index: str = "anchor"           # splat window of a query: anchor = grains whose ANCHOR stratum is near the
+                                          #   query's (fixed table) | projected = grains projecting INTO the strata near
+                                          #   the query on the decoded observation (bucketed per sample, splat_cap each)
+    splat_cap: int = 4                    # splat_index=projected: grains kept per stratum bucket (the rest are dropped)
     splat_pix_feat: int = 0               # 3.7 (> 0): atoms also evaluated at the image pixels (no aliasing above the
     splat_pix_atoms: int = 6              #   query-grid Nyquist), width of that map; their count and
     splat_pix_wmax: float = 8.0           #   largest frequency (cycles per cell; pixel Nyquist = patch / 2)
@@ -291,6 +295,8 @@ class GrainPriorConfig(CD32Config):
                                             or self.query_grid % self.n_strata or self.splat_atoms < 0
                                             or self.splat_layers < 0 or self.splat_window < 0):
             raise ValueError("rgb_decoder=splat: legacy readout, query_grid divisible by n_strata, sizes >= 0")
+        if self.splat_index not in ("anchor", "projected") or self.splat_cap < 1:
+            raise ValueError("splat_index: anchor | projected; splat_cap >= 1")
         if self.w_edge < 0:
             raise ValueError("w_edge >= 0")
         if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:
