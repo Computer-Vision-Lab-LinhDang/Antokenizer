@@ -115,6 +115,10 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
                 dl = model.decode(Sl)
             acc.add(f"L={L}", _scores(dl["rgb"][:, 1:], tgt, lp))
             acc.add(f"L={L}/numbers", {"n": sc.payload(cfg, Sl).float().mean()})
+            if L == 0 and cfg.grain_df_k:                      # 3.13: the same without the grain feature update
+                Sn = dict(Sl, recs=[dict(r, dfc=torch.zeros_like(r["dfc"])) for r in recs])
+                with ev._autocast(dev, amp):
+                    acc.add("L=0/no_df", _scores(model.decode(Sn)["rgb"][:, 1:], tgt, lp))
         for k in DIAG:
             v = out["diag"].get(k)
             if v is not None and torch.isfinite(v):
@@ -128,6 +132,8 @@ def eval_clips(model, loader, modality: str, dev, amp: bool, limit: int, L_list:
     L0 = res.get("L=0")
     gates = dict(L0_minus_copy_last_db=(L0["psnr"] - res["copy_last"]["psnr"]) if L0 else None,
                  nvs_minus_copy_db=res["nvs"]["psnr"] - res["copy"]["psnr"])
+    if "L=0/no_df" in res:                                     # 3.13: gate 1 read without the grain feature update
+        gates["L0_no_df_minus_copy_last_db"] = res["L=0/no_df"]["psnr"] - res["copy_last"]["psnr"]
     return dict(n_clips=seen, n_frames=T, anchor=res["anchor"], target=res["target"], copy=res["copy"],
                 copy_last=res["copy_last"], nvs=res["nvs"], target_by_record=[res[f"rec{j}"] for j in range(q)],
                 gates=gates, curve=curve, payload=pay.mean, diag={k: m.mean for k, m in dg.items()},

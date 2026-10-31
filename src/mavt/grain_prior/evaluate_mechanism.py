@@ -57,13 +57,14 @@ def _targets(model, S, der, zs, stage: str, L: Optional[int] = None) -> list:
             args = (c0, zero_xi, S["kappa0"], zero_M, None, None)
         elif stage == "C+xi":
             args = (c0, rec["xi"], rec["kappa"], zero_M, None, None)
-        elif stage == "C+xi+M":
+        elif stage in ("C+xi+M", "C+xi+M+df"):
             args = (z, rec["xi"], rec["kappa"], rec["M"], None, None)
         else:
             r = rec["r"].clone()
             r[:, L:] = 0
             args = (z, rec["xi"], rec["kappa"], rec["M"], r, torch.minimum(rec["L"], torch.full_like(rec["L"], L)))
-        o = model.decode_obs(S, der, *args, prev=prev)
+        df = model.record_df(rec) if stage not in ("C", "C+xi", "C+xi+M") else None    # 3.13: from C+xi+M+df on
+        o = model.decode_obs(S, der, *args, prev=prev, df=df)
         prev = model._prev_of(o) if cfg.read_prev_frame else None
         outs.append(o)
     return outs
@@ -94,7 +95,7 @@ def mechanism_batch(model, batch: dict, modality: str, L_list: list, k_list: lis
         res["full/psnr_target"] = psnr(full["rgb"][:, 1:].flatten(0, 1), gt[:, 1:].flatten(0, 1)).item()
         res["full/feat_cos_target"] = _cos(full["F"][:, 1:], Ft[:, 1:])
         # ---- CD3 curve (its first stage is CD1)
-        stages = ["C", "C+xi", "C+xi+M"] + [f"C+xi+M+r(L={L})" for L in L_list]
+        stages = ["C", "C+xi", "C+xi+M"] + (["C+xi+M+df"] if cfg.grain_df_k else []) + [f"C+xi+M+r(L={L})" for L in L_list]
         for st in stages:
             L = int(st.split("L=")[1][:-1]) if "L=" in st else None
             outs = _targets(model, S, der, zs, st, L)

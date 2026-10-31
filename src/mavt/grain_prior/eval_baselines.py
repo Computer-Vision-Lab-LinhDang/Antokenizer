@@ -25,8 +25,10 @@ def copy_last(frames: torch.Tensor, q: int) -> torch.Tensor:
 
 
 def strip_target_posterior(cfg, S: dict) -> dict:
-    """A copy of S whose records carry no innovation (r = 0, L = 0; the header lengths follow). S is untouched."""
+    """A copy of S whose records carry no innovation (r = 0, L = 0; the header lengths follow) and no grain feature
+    update (dfc = 0, 3.13: read from the target, so a target-free decode must not see it). S is untouched."""
     recs = [dict(r, L=torch.zeros_like(r["L"]), r=torch.zeros_like(r["r"])) for r in S["recs"]]
+    recs = [dict(r, dfc=torch.zeros_like(r["dfc"])) if "dfc" in r else r for r in recs]
     h = S["h"].clone()
     h[:, sc.H_LEN:sc.H_LEN + cfg.queue] = 0
     return dict(S, recs=recs, h=h)

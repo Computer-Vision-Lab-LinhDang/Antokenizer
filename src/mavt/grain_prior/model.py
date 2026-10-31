@@ -28,6 +28,7 @@ from ..cd32.depth import cell_log_inv_depth
 from ..cd32.losses import psnr
 from . import geometry as g
 from . import schema as sc
+from .delta import GrainDelta
 from .anchor import AnchorHeads, SemanticHead, Stems, StreamC
 from .config import GrainPriorConfig
 from .innovation import InnovationEncoder
@@ -90,6 +91,8 @@ class MAVTGrainPrior(nn.Module):
         if cfg.rgb_decoder == "splat":                                # RGB state by context + atoms + splat
             self.splat = GrainSplat(cfg)
         self.innov = InnovationEncoder(cfg, Dt)
+        if cfg.grain_df_k:                                            # 3.13: per-grain feature update per record
+            self.gdelta = GrainDelta(cfg, Dt)
         self.prior = CausalPrior(cfg)
         if cfg.sem_target:                                            # 2.5: head on c_0; the teacher is not a module
             self.sem_head = SemanticHead(cfg)
@@ -219,15 +222,18 @@ class MAVTGrainPrior(nn.Module):
     def decode_obs(self, S: dict, der: dict, z: torch.Tensor, xi: torch.Tensor, kappa: torch.Tensor,
                    M: torch.Tensor, r: Optional[torch.Tensor] = None, L: Optional[torch.Tensor] = None,
                    R_t: Optional[tuple] = None, rgb: bool = True, grain_keep: Optional[torch.Tensor] = None,
-                   prev: Optional[dict] = None) -> dict:
+                   prev: Optional[dict] = None, df: Optional[torch.Tensor] = None) -> dict:
         """Observation with record (xi, kappa, M[, r, L]) and memory z -> dict(base, F_hat, ...). With
         cfg.query_grid (and rgb), a second read on that grid gives the RGB state H_hat (a_rgb, pe_rgb).
         grain_keep [B, G] bool (evaluation only): grains read as if invalid where False.
         prev (1.5, read_prev_frame): dict(F, u, valid) of the previously decoded observation (`_prev_of`); its
-        read joins a (and a_rgb) before the innovation, F_base = W_out a; static views ignore it."""
+        read joins a (and a_rgb) before the innovation, F_base = W_out a; static views ignore it.
+        df [B, G, d_f] (3.13): the record's grain feature update, added to the grains read at this observation."""
         cfg = self.cfg
         R, t = g.se3_exp(xi) if R_t is None else R_t
         f_t = self.appear(S["f"].float(), S["u"], z, S["c0"]) if cfg.memory else S["f"].float()
+        if df is not None:
+            f_t = f_t + df.to(f_t.dtype)
         tr = g.transport_grains(der["P"], der["beta"], M, R, t, kappa, cfg.z_eps)
         pg = pool_geom(xi, kappa, S["kappa0"], S["rho"], M, tr["valid"])
         sigma = S["sigma"]
@@ -312,7 +318,7 @@ class MAVTGrainPrior(nn.Module):
     # 2026-10 flags: name segments of the modules they add (state_dict keys absent from checkpoints without them)
     _NEW_SEGMENTS = {"prev_read", "coarse_kv_tok", "coarse_kv_pe", "nk_c", "nv_c", "wk_c", "wv_c", "tau_c", "beta_c",
                      "wv_rel", "alpha_raw", "last_x", "in_feat", "pw", "w_mid", "norm_mid", "sem_head", "disc", "ctx",
-                     "splat", "amp_pix", "freq_pix", "pix_in", "pix_blocks"}
+                     "splat", "amp_pix", "freq_pix", "pix_in", "pix_blocks", "gdelta"}
 
     def new_param_prefixes(self) -> tuple:
         """state_dict keys of the modules the enabled 2026-10 flags add (exact keys; `startswith` matches them):
@@ -425,6 +431,10 @@ class MAVTGrainPrior(nn.Module):
         return self.decode_obs(S, der, S["c0"].float(), torch.zeros(B, 6, device=dev), S["kappa0"],
                                torch.zeros(B, self.cfg.n_motion, 3, device=dev))
 
+    def record_df(self, rec: dict) -> Optional[torch.Tensor]:
+        """3.13: the grain feature update [B, G, d_f] of a record (None without the channel)."""
+        return self.gdelta.expand(rec["dfc"]) if self.cfg.grain_df_k and "dfc" in rec else None
+
     def decode(self, S: dict) -> dict:
         """Public decoding of a closed state: anchor and every record in the queue (replayed memory, own r).
         -> dict(F [B, 1 + n_rec, N, D_t], rgb [B, 1 + n_rec, 3, H, W] in [-1, 1],
@@ -437,7 +447,8 @@ class MAVTGrainPrior(nn.Module):
             # 1.5: the previous decoded observation in the queue (the anchor for the first record: the encoder
             # read the same one as long as no record was folded into z_b)
             prev = self._prev_of(outs[-1]) if self.cfg.read_prev_frame else None
-            outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"], prev=prev))
+            outs.append(self.decode_obs(S, der, z, rec["xi"], rec["kappa"], rec["M"], rec["r"], rec["L"], prev=prev,
+                                        df=self.record_df(rec)))
         Fh = torch.stack([o["F_hat"] for o in outs], 1)
         Hh = torch.stack([o["H_hat"] for o in outs], 1)
         A0 = torch.stack([o["a0"] for o in outs], 1)
@@ -546,7 +557,15 @@ class MAVTGrainPrior(nn.Module):
             xi = torch.where(known.view(B, 1), cam_i[0].float(), xi)
         kappa = kappa_of(zeta)
         z_i = mem(b)
-        base = self.decode_obs(S, der, z_i, xi, kappa, M, prev=prev_obs)
+        dfc = df = None
+        if cfg.grain_df_k:                                          # 3.13: code read at the transported grains
+            Rk, tk = g.se3_exp(xi)
+            trk = g.transport_grains(der["P"], der["beta"], M, Rk, tk, kappa, cfg.z_eps)
+            f_now = self.appear(S["f"].float(), S["u"], z_i, S["c0"]) if cfg.memory else S["f"].float()
+            eF_last = st["F"] - passes[-1]["F_base"].detach() if passes else st["F"]
+            dfc = self.gdelta.encode(st["F"], eF_last, Xi, f_now, trk["u"], trk["valid"])
+            df = self.gdelta.expand(dfc)
+        base = self.decode_obs(S, der, z_i, xi, kappa, M, prev=prev_obs, df=df)
         X_base = self.rgb_of(base["F_base"], base["a_rgb"] if cfg.query_grid else base["a"], base["a0"],
                              pix=base.get("pix"))
         eF = st["F"] - base["F_base"].detach()
@@ -562,6 +581,8 @@ class MAVTGrainPrior(nn.Module):
         F_hat = F_b + dF
         H_hat = self._rgb_state(base, r, L, sg if cfg.innov_stopgrad_base else None) if cfg.query_grid else a_in + dH
         rec = dict(xi=xi, M=M, kappa=kappa, b=b, r=r, L=L)
+        if dfc is not None:
+            rec["dfc"] = dfc
         return dict(rec=rec, z=z_i, base=base, X_base=X_base, F_hat=F_hat, H_hat=H_hat, passes=passes,
                     est0=(xi0, est["M"]))
 
@@ -897,7 +918,10 @@ class MAVTGrainPrior(nn.Module):
         r = torch.cat([torch.sigmoid(rr[..., :2]), cfg.rho_lo + (cfg.rho_hi - cfg.rho_lo) * torch.sigmoid(rr[..., 2:3]),
                        cfg.sigma_min + cfg.sigma_span * torch.sigmoid(rr[..., 3:4]), rr[..., 4:]], -1)
         L = torch.full((B,), cfg.n_slots, dtype=torch.long, device=r.device)
-        return dict(xi=xi, M=M, kappa=kappa, b=o["b"], r=r, L=L, prov=torch.ones(B, device=r.device))
+        rec = dict(xi=xi, M=M, kappa=kappa, b=o["b"], r=r, L=L, prov=torch.ones(B, device=r.device))
+        if cfg.grain_df_k:                                          # the prior predicts no grain update (3.13)
+            rec["dfc"] = torch.zeros(B, cfg.n_grains, cfg.grain_df_k, device=r.device)
+        return rec
 
     def _prior_segment(self, frames, kind, cam, parts, diag) -> tuple:
         """Posterior states of the prefix (frozen tokenizer, no grad), then a free rollout of P_psi; the loss

@@ -177,6 +177,7 @@ class GrainPriorConfig(CD32Config):
     w_warp_flow: float = 0.0              # 3.12: pull of the transported grains to their DINO match (losses.warp_flow_loss)
     warp_radius: int = 3                  # 3.12: match search window, cells (Chebyshev) around the anchor position
     warp_tau: float = 0.05                # 3.12: soft-argmax temperature of the match (cosine units)
+    grain_df_k: int = 0                   # 3.13: per-grain feature update in each target record, k scalars per grain (0 off)
     w_code: float = 1e-4
     depth_delta: float = 0.1              # Huber delta of the log-depth loss
     depth_loss: str = "huber"             # 3.11: huber (absolute) | silog (per-sample zero-mean log depth) | ordinal (depth order)
@@ -211,7 +212,7 @@ class GrainPriorConfig(CD32Config):
         return self.n_grains * self.d_grain + self.n_coarse * self.d_coarse + 4
 
     def target_numbers(self, L: int) -> int:
-        return 6 + 3 * self.n_motion + 4 + self.n_memb + L * self.d_r
+        return 6 + 3 * self.n_motion + 4 + self.n_memb + self.n_grains * self.grain_df_k + L * self.d_r
 
     def state_numbers(self, Ls=()) -> int:
         """Scalars of a state with target records of lengths Ls (image: Ls empty)."""
@@ -307,6 +308,10 @@ class GrainPriorConfig(CD32Config):
             raise ValueError("w_edge, w_warp >= 0")
         if self.w_warp_flow < 0 or self.warp_radius < 1 or self.warp_tau <= 0:
             raise ValueError("w_warp_flow >= 0, warp_radius >= 1, warp_tau > 0")
+        if not 0 <= self.grain_df_k <= self.d_f:
+            raise ValueError("grain_df_k in 0..d_f")
+        if self.grain_df_k and self.readout_version != "legacy":
+            raise ValueError("grain_df_k needs the legacy readout (the shared readouts do not read the record code)")
         if self.depth_loss not in ("huber", "silog", "ordinal") or self.depth_bg_far < 0:
             raise ValueError("depth_loss: huber | silog | ordinal; depth_bg_far >= 0")
         if self.splat_pix_feat < 0 or self.splat_pix_atoms < 0 or self.rgb_pix_blocks < 0 or self.rgb_pix_width < 1:

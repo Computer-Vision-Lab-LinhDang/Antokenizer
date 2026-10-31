@@ -6,7 +6,8 @@ A state S is a dict of batched tensors:
     c0      [B, 16, d_coarse], kappa0 [B, 4]
     zb      [B, 16, d_coarse]               boundary memory (serialized only when the state holds a target)
     recs    list (<= queue) of dict(xi [B, 6], M [B, n_m, 3], kappa [B, 4], b [B, 16 x d_b] as [B, n_memb],
-            r [B, n_slots, d_r], L [B] long), oldest first; only r[:, :L] is valid and serialized
+            r [B, n_slots, d_r], L [B] long[, dfc [B, G, grain_df_k] when grain_df_k > 0]), oldest first; only
+            r[:, :L] is valid and serialized
 
 Header layout (index: field): 0 version, 1 mode, 2 n_targets, 3 coordinate_mode (0 anchor median gauge,
 1 metric), 4 camera_mode (0 estimated, 1 given), 5 anchor time (s, episode), 6 boundary offset t_b - t_0,
@@ -39,7 +40,7 @@ def new_header(cfg: GrainPriorConfig, B: int, mode: torch.Tensor, coord: torch.T
 
 
 def record_numbers(cfg: GrainPriorConfig, rec: dict) -> torch.Tensor:
-    return 6 + 3 * cfg.n_motion + 4 + cfg.n_memb + rec["L"] * cfg.d_r
+    return 6 + 3 * cfg.n_motion + 4 + cfg.n_memb + cfg.n_grains * cfg.grain_df_k + rec["L"] * cfg.d_r
 
 
 def payload(cfg: GrainPriorConfig, S: dict) -> torch.Tensor:
@@ -62,7 +63,10 @@ def serialize(cfg: GrainPriorConfig, S: dict) -> list:
             parts.append(S["zb"][b])
         for rec in S["recs"]:
             L = int(rec["L"][b])
-            parts += [rec["xi"][b], rec["M"][b], rec["kappa"][b], rec["b"][b], rec["r"][b, :L]]
+            parts += [rec["xi"][b], rec["M"][b], rec["kappa"][b], rec["b"][b]]
+            if cfg.grain_df_k:
+                parts.append(rec["dfc"][b])
+            parts.append(rec["r"][b, :L])
         out.append(torch.cat([p.detach().float().reshape(-1) for p in parts]))
     return out
 
@@ -115,6 +119,8 @@ def deserialize(cfg: GrainPriorConfig, flats: list) -> dict:
             L = int(h[H_LEN + j])
             rec = dict(xi=take(6), M=take(3 * cfg.n_motion).view(cfg.n_motion, 3), kappa=take(4),
                        b=take(cfg.n_memb), L=torch.tensor(L, device=x.device))
+            if cfg.grain_df_k:
+                rec["dfc"] = take(G * cfg.grain_df_k).view(G, cfg.grain_df_k)
             r = torch.zeros(cfg.n_slots, cfg.d_r, device=x.device)
             r[:L] = take(L * cfg.d_r).view(L, cfg.d_r)
             rec["r"] = r
