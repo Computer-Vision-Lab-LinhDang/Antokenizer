@@ -66,6 +66,19 @@ def read_coarse(tokens: torch.Tensor, u: torch.Tensor, side: int) -> torch.Tenso
     return out.to(tokens.dtype)
 
 
+def gather_rows(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """t [B, G, ...], idx [B, ...] long in [0, G) -> t[b, idx[b]] [B, *idx.shape[1:], ...], computed as a one-hot
+    bmm in t's dtype (autocast off): the backward is a matmul instead of index_put_ with accumulate (atomic adds,
+    a fifth of a training step on ROCm). Exact: each output row is one value times 1 plus zeros. Non-finite values
+    of t are read as 0, so a row that is not selected cannot spread them through the zeros of the one-hot."""
+    B, G = t.shape[:2]
+    flat = torch.nan_to_num(t.reshape(B, G, -1), nan=0.0, posinf=0.0, neginf=0.0)
+    with torch.autocast(t.device.type, enabled=False):
+        oh = flat.new_zeros(B, idx[0].numel(), G).scatter_(-1, idx.reshape(B, -1, 1), 1.0)
+        out = torch.bmm(oh, flat)
+    return out.view(B, *idx.shape[1:], *t.shape[2:])
+
+
 # ---------------------------------------------------------------------------------- intrinsics
 def focal_bounds(fov_min: float, fov_max: float) -> tuple[float, float]:
     """(log f_lo, log f_hi) of normalised focal length from the FOV bounds (degrees)."""

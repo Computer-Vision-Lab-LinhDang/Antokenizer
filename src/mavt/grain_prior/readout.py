@@ -386,10 +386,10 @@ class PrevRead(nn.Module):
     def forward(self, F_prev, u_q, u_now, u_prev, valid_now, valid_prev, sigma) -> torch.Tensor:
         B, N, _ = F_prev.shape
         c = self.centres(u_q, u_now, u_prev, valid_now, valid_prev, sigma)
-        img = self.proj(F_prev.detach().to(self.proj.weight.dtype)).transpose(1, 2).reshape(B, -1, self.grid, self.grid)
-        pts = (c.unsqueeze(2) + self.offsets) * 2 - 1                                # [B, Q, 9, 2]
-        taps = F.grid_sample(img.float(), pts, mode="bilinear", padding_mode="border", align_corners=False)
-        return self.mix(taps.permute(0, 2, 3, 1).flatten(2).to(self.mix.weight.dtype))
+        tok = self.proj(F_prev.detach().to(self.proj.weight.dtype))                  # [B, grid^2, dim]
+        pts = (c.unsqueeze(2) + self.offsets).flatten(1, 2)                          # [B, Q 9, 2]
+        taps = g.read_coarse(tok.float(), pts, self.grid).view(B, c.shape[1], -1)    # grid_sample, bmm backward
+        return self.mix(taps.to(self.mix.weight.dtype))
 
 
 class PointLN(nn.Module):

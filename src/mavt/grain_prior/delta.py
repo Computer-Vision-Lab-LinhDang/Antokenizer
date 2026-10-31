@@ -2,7 +2,8 @@
 
 For each anchor grain transported to the target, a code dfc [B, G, k] is read from the target at the grain's
 transported position u_t:
-    in  = [LN(F_t(u_t)) ; LN(e^F(u_t)) ; RGB_t footprint (8 x 8 samples over the grain's stratum window) ; f_t]
+    in  = [LN(F_t(u_t)) ; LN(e^F(u_t)) ; RGB_t footprint (8 x 8 samples over the grain's stratum window, read at a
+           detached u_t: grid_sample's backward is slow on ROCm and the feature reads already train u_t) ; f_t]
     dfc = MLP(in) * valid
 and the decoder reads the grain with f_t + dfc W (W: k -> d_f). W starts at zero: until it moves, a record with a
 code decodes exactly as one without (the channel is an identity at initialisation of a pretrained model).
@@ -47,7 +48,7 @@ class GrainDelta(nn.Module):
         uc = u.float().clamp(0, 1)
         x = torch.cat([self.n_F(g.read_coarse(F_t.float(), uc, self.grid)),
                        self.n_e(g.read_coarse(eF.float(), uc, self.grid)),
-                       self.footprint(X, uc), f.float()], -1)
+                       self.footprint(X, uc.detach()), f.float()], -1)   # no grid_sampler backward
         return self.out(self.mlp(self.inp(x))) * valid.float().unsqueeze(-1)
 
     def expand(self, dfc: torch.Tensor) -> torch.Tensor:
