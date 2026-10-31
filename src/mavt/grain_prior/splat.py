@@ -210,7 +210,12 @@ class GrainSplat(nn.Module):
         n2, W = widx.shape[1:]
         uq_g = uq[:, self.perm].view(B, n2, -1, 2)                                       # [B, S, m, 2]
         bi = torch.arange(B, device=uq.device).view(-1, 1, 1)
-        pick = lambda t: g.gather_rows(t, widx)                                          # [B, S, W', ...]
+        ohs = {}                                                                         # one one-hot per dtype
+
+        def pick(t):                                                                     # t[bi, widx]: [B, S, W', ...]
+            if t.dtype not in ohs:
+                ohs[t.dtype] = g.onehot_rows(widx, G, t.dtype)
+            return g.gather_onehot(ohs[t.dtype], t, tuple(widx.shape[1:]))
         w, delta = self._logits(uq_g, pick(u_hat), pick(sigma), pick(dd), ok)              # [B, S, m, W], [.., 2]
         X = w.to(e.dtype) @ pick(e)                                                      # [B, S, m, C]
         if K:

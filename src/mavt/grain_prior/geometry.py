@@ -66,17 +66,28 @@ def read_coarse(tokens: torch.Tensor, u: torch.Tensor, side: int) -> torch.Tenso
     return out.to(tokens.dtype)
 
 
-def gather_rows(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """t [B, G, ...], idx [B, ...] long in [0, G) -> t[b, idx[b]] [B, *idx.shape[1:], ...], computed as a one-hot
-    bmm in t's dtype (autocast off): the backward is a matmul instead of index_put_ with accumulate (atomic adds,
-    a fifth of a training step on ROCm). Exact: each output row is one value times 1 plus zeros. Non-finite values
-    of t are read as 0, so a row that is not selected cannot spread them through the zeros of the one-hot."""
+def onehot_rows(idx: torch.Tensor, G: int, dtype) -> torch.Tensor:
+    """idx [B, ...] long in [0, G) -> one-hot [B, N, G] (N = idx[0].numel()) in dtype, for gather_onehot."""
+    B = idx.shape[0]
+    return torch.zeros(B, idx[0].numel(), G, device=idx.device, dtype=dtype).scatter_(-1, idx.reshape(B, -1, 1), 1.0)
+
+
+def gather_onehot(oh: torch.Tensor, t: torch.Tensor, shape: tuple) -> torch.Tensor:
+    """oh = onehot_rows(idx, G, t.dtype), t [B, G, ...] -> t[b, idx[b]] with idx[0].shape = shape, as a bmm (autocast
+    off): the backward is a matmul instead of index_put_ with accumulate (atomic adds, a fifth of a training step on
+    ROCm). Exact: each output row is one value times 1 plus zeros. Non-finite values of t are read as 0, so a row
+    that is not selected cannot spread them through the zeros of the one-hot. Share oh between gathers by the same
+    idx: the bmm saves it for the backward."""
     B, G = t.shape[:2]
     flat = torch.nan_to_num(t.reshape(B, G, -1), nan=0.0, posinf=0.0, neginf=0.0)
     with torch.autocast(t.device.type, enabled=False):
-        oh = flat.new_zeros(B, idx[0].numel(), G).scatter_(-1, idx.reshape(B, -1, 1), 1.0)
         out = torch.bmm(oh, flat)
-    return out.view(B, *idx.shape[1:], *t.shape[2:])
+    return out.view(B, *shape, *t.shape[2:])
+
+
+def gather_rows(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """t [B, G, ...], idx [B, ...] long in [0, G) -> t[b, idx[b]] [B, *idx.shape[1:], ...] (gather_onehot)."""
+    return gather_onehot(onehot_rows(idx, t.shape[1], t.dtype), t, tuple(idx.shape[1:]))
 
 
 # ---------------------------------------------------------------------------------- intrinsics

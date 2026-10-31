@@ -40,10 +40,10 @@ def test_gather_rows_keeps_a_non_finite_row_to_itself():
     assert torch.equal(g.gather_rows(t, idx), t[0, idx[0]].unsqueeze(0))       # row 2 is not read: no NaN spread
 
 
-def test_splat_reads_its_windows_through_gather_rows(monkeypatch):
+def test_splat_reads_its_windows_through_the_onehot_gather(monkeypatch):
     calls = []
-    real = g.gather_rows
-    monkeypatch.setattr(g, "gather_rows", lambda t, idx: calls.append(1) or real(t, idx))
+    real = g.gather_onehot
+    monkeypatch.setattr(g, "gather_onehot", lambda oh, t, shape: calls.append(1) or real(oh, t, shape))
     sp = _splat()
     cfg = sp.cfg
     u, sigma, depth, valid = _grains(cfg, shift=0.3)
@@ -101,3 +101,18 @@ def test_grain_delta_footprint_sample_is_detached_from_the_grain_position(monkey
     assert seen == [False]
     code.sum().backward()
     assert u.grad is not None and u.grad.abs().sum() > 0                 # the bilinear feature reads still train u
+
+
+def test_splat_builds_one_onehot_per_dtype(monkeypatch):
+    """The window one-hot is shared by every gather of one splat call (one per dtype): the bmm saves it for the
+    backward, so a copy per gathered tensor multiplies the activation memory."""
+    built = []
+    real = g.onehot_rows
+    monkeypatch.setattr(g, "onehot_rows", lambda idx, G, dtype: built.append(dtype) or real(idx, G, dtype))
+    sp = _splat()
+    cfg = sp.cfg
+    u, sigma, depth, valid = _grains(cfg, shift=0.3)
+    B, G = u.shape[:2]
+    sp(torch.randn(B, G, cfg.d_f), u, depth, sigma, valid, torch.ones(B), torch.randn(B, cfg.n_coarse, cfg.d_coarse),
+       torch.randn(B, cfg.n_coarse, cfg.d_coarse), g.cell_centres(cfg.query_grid).unsqueeze(0).expand(B, -1, -1))
+    assert built and len(built) == len(set(built))
